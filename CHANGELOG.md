@@ -11,6 +11,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.0] - 2026-05-08
+
+### Changed
+
+- **Minimum Zig version: 0.15.0 → 0.16.0.** zig 0.16 reorganised most of
+  `std`: `std.net`, much of `std.fs`, the high-level socket helpers in
+  `std.posix`, `std.crypto.random`, and `std.time.milliTimestamp` were
+  removed or relocated behind the new `std.Io` abstraction. zquic owns
+  its own UDP event loop and does not need `std.Io`'s async machinery,
+  so this release introduces `src/compat.zig` — a thin shim that
+  reinstates the pre-0.16 surface (Address, fs.File, socket / bind /
+  sendto / recvfrom / close, getAddressList, milliTimestamp, an
+  OS-CSPRNG-backed `std.Random`) by dispatching directly to the platform
+  syscall layer.
+- **Pure-Zig restored.** `compat.zig` calls `std.os.linux.*` raw
+  syscalls on Linux; the build links no libc on Linux, so
+  `zig-out/bin/server` is a statically-linked ELF with zero C
+  dependencies. Apple targets (macOS / iOS / tvOS / watchOS / visionOS)
+  link Apple's `libSystem` because Darwin does not expose a stable
+  syscall ABI — every other QUIC implementation does the same. The Zig
+  source contains no third-party C dependencies on either platform.
+- **Pure-Zig DNS resolver.** `getAddressList` parses IP literals first,
+  then `/etc/hosts`, falling through to `getaddrinfo` only on Darwin.
+  Linux without libc never calls libc DNS code.
+- **`std.process.argsAlloc` → `std.process.Args.Iterator`.**
+  `cmd/server` and `cmd/client` now take `std.process.Init.Minimal`.
+- **`std.heap.GeneralPurposeAllocator` → `std.heap.DebugAllocator`.**
+- **`X25519.KeyPair.generate()`** (now requires an `Io` instance) is
+  replaced by `generateDeterministic(seed)` seeded from the compat
+  CSPRNG.
+
+### Fixed
+
+- **Vendored `tls.zig` lifetime errors.** Four
+  "returning address of expired local variable" failures in
+  `vendor/tls/src/transcript.zig` (`pskBinder`,
+  `serverFinishedTls13`, `clientFinishedTls13`, and the standalone
+  `pskBinder_` helper) — now back the slices with scratch buffers on
+  the inner Self struct.
+- **`mmsghdr_const` alias removed in 0.16.** `transport/batch_io.zig`
+  uses `mmsghdr` for both send and recv paths (identical layout).
+
+### Limitations
+
+- **`benchmarks/throughput_bench.zig` is stubbed** until
+  `std.process.Child` (now Io-driven) is migrated. The bench-e2e CI
+  step still runs (and exits 0) so the build chain stays green.
+- **Vendored TLS** `Bundle.fromFilePath*` and `key_log.fileWrite` are
+  stubbed out (`error.UnsupportedOnZig016`) — zquic does not consume
+  them. Re-enable when porting to `std.Io.Dir`.
+- **DPLPMTUD probing** still TODO (pre-existing).
+
+### Tests
+
+- 165/165 unit tests pass.
+- 13/13 quic-interop-runner tests pass on the Linux pure-Zig build.
+
+---
+
 ## [v1.5.0] - 2026-04-16
 
 ### Security
@@ -260,7 +319,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.0...HEAD
+[v1.6.0]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...v1.6.0
 [v1.5.0]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...v1.5.0
 [v1.4.0]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...v1.4.0
 [v1.3.0]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...v1.3.0
