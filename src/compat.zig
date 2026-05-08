@@ -193,8 +193,9 @@ pub fn close(sock: posix.socket_t) void {
 // `getrandom(2)` on Linux and `getentropy(3)` elsewhere via libc.
 
 fn osRandomBytes(buf: []u8) void {
-    if (builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux) {
         // getrandom(2) is the kernel's CSPRNG; never blocks once seeded.
+        // Raw syscall — no libc dependency.
         var off: usize = 0;
         while (off < buf.len) {
             const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
@@ -207,15 +208,11 @@ fn osRandomBytes(buf: []u8) void {
                 @panic("getrandom failed");
             }
         }
-        return;
-    }
-    // macOS / iOS / *BSD / illumos / Solaris: arc4random_buf is always
-    // available and never fails.
-    if (@hasDecl(std.c, "arc4random_buf")) {
+    } else {
+        // Darwin (and other libc-linked targets) — `arc4random_buf` is always
+        // available, never fails, and is the recommended CSPRNG on macOS.
         std.c.arc4random_buf(buf.ptr, buf.len);
-        return;
     }
-    @panic("no OS random source available for this target");
 }
 
 const RandomSrc = struct {
@@ -231,22 +228,28 @@ pub const random: std.Random = std.Random.init(&random_src, RandomSrc.fill);
 
 // ── Wall-clock helpers ──────────────────────────────────────────────────────
 //
-// `std.time.milliTimestamp` was removed in 0.16; the replacement (`Io.Timestamp`)
-// requires an Io instance.  zquic only needs a coarse millisecond timestamp
-// for idle timers / RTT estimation, so call libc gettimeofday directly.
-
-/// Returns the current wall-clock time in milliseconds since the Unix epoch.
-pub fn milliTimestamp() i64 {
-    var tv: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&tv, null);
-    return @as(i64, tv.sec) * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
-}
+// `std.time.milliTimestamp` was removed in 0.16; the replacement
+// (`Io.Timestamp`) requires an `Io` instance.  zquic only needs a coarse
+// timestamp for idle timers and RTT estimation, so we call clock_gettime
+// directly: a raw kernel syscall on Linux (no libc), libc on Darwin (no
+// stable syscall ABI).
 
 /// Returns the current wall-clock time in nanoseconds since the Unix epoch.
 pub fn nanoTimestamp() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    if (comptime builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.REALTIME, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    }
+}
+
+/// Returns the current wall-clock time in milliseconds since the Unix epoch.
+pub fn milliTimestamp() i64 {
+    return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
 }
 
 // ── Address shim ────────────────────────────────────────────────────────────
@@ -347,51 +350,101 @@ pub const AddressList = struct {
     addrs: []Address,
 
     pub fn deinit(self: *AddressList) void {
-        const allocator = self.arena.child_allocator;
         var arena = self.arena;
         arena.deinit();
-        _ = allocator;
     }
 };
 
+/// Resolve `host` → list of `Address`.  Pure-Zig path: tries the IP literal
+/// parser first, then `/etc/hosts`, then (when libc is linked, i.e. Darwin)
+/// falls back to `getaddrinfo` for full DNS.  On Linux without libc, only
+/// IP literals and `/etc/hosts` entries resolve — that covers loopback,
+/// "localhost", and the interop runner's docker-network names which are
+/// always written to `/etc/hosts` inside the test containers.
 pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const host_c = try a.dupeZ(u8, host);
-    var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.UNSPEC;
-    hints.socktype = posix.SOCK.DGRAM;
-
-    var result: ?*std.c.addrinfo = null;
-    const rc = std.c.getaddrinfo(host_c.ptr, port_str.ptr, &hints, &result);
-    if (rc != @as(@TypeOf(rc), @enumFromInt(0))) return error.UnknownHostName;
-    const head = result orelse return error.UnknownHostName;
-    defer std.c.freeaddrinfo(head);
-
     var list: std.ArrayList(Address) = .empty;
-    var it: ?*std.c.addrinfo = result;
-    while (it) |info| : (it = info.next) {
-        const sa_opt = info.addr;
-        const sa = sa_opt orelse continue;
-        switch (sa.family) {
-            posix.AF.INET => {
-                const in_ptr: *const posix.sockaddr.in = @ptrCast(@alignCast(sa));
-                try list.append(a, Address{ .in = in_ptr.* });
-            },
-            posix.AF.INET6 => {
-                const in6_ptr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(sa));
-                try list.append(a, Address{ .in6 = in6_ptr.* });
-            },
-            else => {},
+
+    // 1. IP literal — handles "127.0.0.1", "192.168.1.1", etc.
+    if (Address.parseIp4(host, port)) |ip| {
+        try list.append(a, ip);
+        return .{ .arena = arena, .addrs = list.items };
+    } else |_| {}
+
+    // 2. /etc/hosts lookup.
+    if (resolveFromHostsFile(a, host, port)) |found| {
+        if (found) |addr| {
+            try list.append(a, addr);
+            return .{ .arena = arena, .addrs = list.items };
+        }
+    } else |_| {}
+
+    // 3. libc getaddrinfo — Darwin only (where libc is mandatory).  On
+    //    Linux without libc we restrict resolution to IP literals and
+    //    /etc/hosts to keep the build pure-Zig.
+    if (comptime builtin.link_libc and builtin.os.tag != .linux) {
+        const host_c = try a.dupeZ(u8, host);
+        var port_buf: [8]u8 = undefined;
+        const port_str = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+
+        var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+        hints.family = posix.AF.UNSPEC;
+        hints.socktype = posix.SOCK.DGRAM;
+
+        var result: ?*std.c.addrinfo = null;
+        const rc = std.c.getaddrinfo(host_c.ptr, port_str.ptr, &hints, &result);
+        if (rc != @as(@TypeOf(rc), @enumFromInt(0))) return error.UnknownHostName;
+        const head = result orelse return error.UnknownHostName;
+        defer std.c.freeaddrinfo(head);
+
+        var it: ?*std.c.addrinfo = result;
+        while (it) |info| : (it = info.next) {
+            const sa = info.addr orelse continue;
+            switch (sa.family) {
+                posix.AF.INET => {
+                    const in_ptr: *const posix.sockaddr.in = @ptrCast(@alignCast(sa));
+                    try list.append(a, Address{ .in = in_ptr.* });
+                },
+                posix.AF.INET6 => {
+                    const in6_ptr: *const posix.sockaddr.in6 = @ptrCast(@alignCast(sa));
+                    try list.append(a, Address{ .in6 = in6_ptr.* });
+                },
+                else => {},
+            }
+        }
+        if (list.items.len > 0) {
+            return .{ .arena = arena, .addrs = list.items };
         }
     }
 
-    return .{ .arena = arena, .addrs = list.items };
+    return error.UnknownHostName;
+}
+
+/// Open `/etc/hosts` and return the first `Address` whose hostname column
+/// (or any of its aliases) matches `name` exactly.  Returns `null` when the
+/// file is missing or no match is found.
+fn resolveFromHostsFile(a: std.mem.Allocator, name: []const u8, port: u16) !?Address {
+    const file = fs.openFileAbsolute("/etc/hosts", .{}) catch return null;
+    defer file.close();
+    const max_hosts_size: usize = 1 << 20; // 1 MiB
+    const contents = file.readToEndAlloc(a, max_hosts_size) catch return null;
+    defer a.free(contents);
+
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        // Strip comments (everything from first '#').
+        const line = if (std.mem.indexOfScalar(u8, raw_line, '#')) |i| raw_line[0..i] else raw_line;
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const ip_str = fields.next() orelse continue;
+        const addr = Address.parseIp4(ip_str, port) catch continue;
+        while (fields.next()) |alias| {
+            if (std.mem.eql(u8, alias, name)) return addr;
+        }
+    }
+    return null;
 }
 
 // ── fs shim ─────────────────────────────────────────────────────────────────
@@ -510,9 +563,9 @@ pub const fs = struct {
         mode: posix.mode_t = 0o644,
     };
 
-    fn openZ(path: [*:0]const u8, oflag: u32, mode: posix.mode_t) !posix.fd_t {
+    fn openZ(path: [*:0]const u8, flags: posix.O, mode: posix.mode_t) !posix.fd_t {
         while (true) {
-            const rc = system.open(path, @bitCast(oflag), mode);
+            const rc = system.open(path, flags, mode);
             switch (checkRc(rc)) {
                 .SUCCESS => return @intCast(rc),
                 .INTR => continue,
@@ -531,37 +584,34 @@ pub const fs = struct {
         }
     }
 
+    fn nullTerminate(path: []const u8, buf: *[4096]u8) ![*:0]const u8 {
+        if (path.len >= buf.len) return error.NameTooLong;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        return @ptrCast(buf);
+    }
+
     pub fn openFileAbsolute(path: []const u8, flags: OpenFlags) !File {
         var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const c_path: [*:0]const u8 = @ptrCast(&path_buf);
-        const oflag: u32 = switch (flags.mode) {
-            .read_only => 0, // O_RDONLY
-            .write_only => 1, // O_WRONLY
-            .read_write => 2, // O_RDWR
+        const c_path = try nullTerminate(path, &path_buf);
+        const access: posix.ACCMODE = switch (flags.mode) {
+            .read_only => .RDONLY,
+            .write_only => .WRONLY,
+            .read_write => .RDWR,
         };
-        const fd = try openZ(c_path, oflag, 0);
+        const fd = try openZ(c_path, .{ .ACCMODE = access }, 0);
         return .{ .handle = fd };
     }
 
     pub fn createFileAbsolute(path: []const u8, flags: CreateFlags) !File {
         var path_buf: [4096]u8 = undefined;
-        if (path.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-        const c_path: [*:0]const u8 = @ptrCast(&path_buf);
-        // O_CREAT (0x40 linux / 0x200 darwin), but rather than guess, use the
-        // posix-side O bitfield by constructing it.  Fall back to numeric
-        // values per platform.
-        const O_CREAT: u32 = if (builtin.os.tag == .linux) 0o100 else 0x200;
-        const O_TRUNC: u32 = if (builtin.os.tag == .linux) 0o1000 else 0x400;
-        const O_EXCL: u32 = if (builtin.os.tag == .linux) 0o200 else 0x800;
-        var oflag: u32 = if (flags.read) 2 else 1;
-        oflag |= O_CREAT;
-        if (flags.truncate) oflag |= O_TRUNC;
-        if (flags.exclusive) oflag |= O_EXCL;
+        const c_path = try nullTerminate(path, &path_buf);
+        const oflag: posix.O = .{
+            .ACCMODE = if (flags.read) .RDWR else .WRONLY,
+            .CREAT = true,
+            .TRUNC = flags.truncate,
+            .EXCL = flags.exclusive,
+        };
         const fd = try openZ(c_path, oflag, flags.mode);
         return .{ .handle = fd };
     }
