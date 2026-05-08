@@ -87,7 +87,9 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
 
     // One iovec per message (each datagram is a single contiguous buffer).
     var iovecs: [BATCH_SIZE]std.posix.iovec_const = undefined;
-    var msgs: [BATCH_SIZE]linux.mmsghdr_const = undefined;
+    // 0.16 dropped the `mmsghdr_const` alias; the layout is identical to
+    // `mmsghdr` so we reuse that for the send path.
+    var msgs: [BATCH_SIZE]linux.mmsghdr = undefined;
 
     var sent: usize = 0;
     while (sent < entries.len) {
