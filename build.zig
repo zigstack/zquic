@@ -5,6 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const verbose = b.option(bool, "verbose", "Enable verbose debug output") orelse false;
 
+    // src/compat.zig restores the std-library bits that 0.16 deleted by
+    // dispatching directly to raw syscalls on Linux (no libc) and to libc on
+    // Darwin (where there is no stable kernel ABI).  Apple platforms must
+    // therefore link libc; Linux deliberately does not, keeping zquic a
+    // pure-Zig binary on that target.
+    const tag = target.result.os.tag;
+    const needs_libc: bool = switch (tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit => true,
+        else => false,
+    };
+
     // Build-options module (verbose flag accessible as @import("build_options").verbose)
     const opts = b.addOptions();
     opts.addOption(bool, "verbose", verbose);
@@ -20,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("vendor/tls/src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = needs_libc,
     });
 
     // Main library module (exposed as `zquic` for `build.zig.zon` dependents).
@@ -28,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = needs_libc,
     });
     zquic_mod.addImport("tls", tls_mod);
     zquic_mod.addOptions("build_options", opts);
@@ -45,7 +56,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cmd/server.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = needs_libc,
     });
     server_mod.addImport("zquic", zquic_mod);
     server_mod.addImport("tls", tls_mod);
@@ -61,7 +72,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cmd/client.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = needs_libc,
     });
     client_mod.addImport("zquic", zquic_mod);
     client_mod.addImport("tls", tls_mod);
@@ -90,7 +101,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/crypto_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
         });
         const exe = b.addExecutable(.{ .name = "crypto_bench", .root_module = m });
         const run = b.addRunArtifact(exe);
@@ -103,7 +114,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/throughput_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
         });
         // Compat shim (Address, fs, milliTimestamp, …) for std calls
         // removed in 0.16.  Imported as `compat` from the bench source.
@@ -111,7 +122,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/compat.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
         });
         m.addImport("compat", compat_mod);
         const exe = b.addExecutable(.{ .name = "throughput_bench", .root_module = m });
@@ -130,7 +141,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/qpack_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
         });
         m.addImport("zquic", zquic_mod);
         const exe = b.addExecutable(.{ .name = "qpack_bench", .root_module = m });
@@ -152,7 +163,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(src),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
         });
         ex_mod.addImport("zquic", zquic_mod);
         const ex = b.addExecutable(.{

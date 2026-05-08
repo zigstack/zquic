@@ -62,7 +62,8 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 
 - **Version negotiation:** Incoming Version Negotiation packets are handled in `Connection.handleVersionNegotiation` (client must see QUIC v1 in the list). Compatible upgrade to QUIC v2 is implemented in the transport I/O layer when the server’s Initial uses v2 (see `io.zig` and `connection.zig` tests).
 - **Demo `Endpoint` (`src/transport/endpoint.zig`) and `Server` (`src/transport/io.zig`):** `max_connections` (8) and `MAX_CONNECTIONS` (16) are small fixed arrays so the structs stay stack-friendly for samples, tests, and interop. These are **not protocol caps** — production embedders use `Server.initFromSocket` + `feedPacket` with their own heap-allocated connection map sized to their workload (see "Embedder guide" below).
-- **Random bytes:** Connection IDs, stateless reset tokens, and path challenge data use the OS-backed CSPRNG (`std.crypto.random`), not time-seeded PRNGs.
+- **Random bytes:** Connection IDs, stateless reset tokens, and path challenge data use the OS-backed CSPRNG via `compat.random` (Linux: `getrandom(2)` raw syscall; Darwin: `arc4random_buf`), not time-seeded PRNGs.
+- **Pure-Zig binary on Linux:** `src/compat.zig` calls Linux syscalls (`std.os.linux.*`) directly so the build links no libc on Linux — `file zig-out/bin/server` reports a statically-linked ELF. Hostname resolution is handled in pure Zig via `/etc/hosts` plus IP literals; full DNS resolution falls back to libc `getaddrinfo` only on Darwin (where libc is mandatory because macOS does not expose a stable syscall ABI).
 - **Path MTU (RFC 9000 §14):** DPLPMTUD probing is not implemented. You can set `max_udp_payload` on `ServerConfig` / `ClientConfig`; the stack clamps it to \[1200, 65527\] bytes and sizes HTTP/0.9 and HTTP/3 STREAM chunks from that limit (see `transport/path_mtu.zig`).
 
 ## Performance
