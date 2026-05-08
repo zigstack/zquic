@@ -105,6 +105,15 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
             .link_libc = true,
         });
+        // Compat shim (Address, fs, milliTimestamp, …) for std calls
+        // removed in 0.16.  Imported as `compat` from the bench source.
+        const compat_mod = b.createModule(.{
+            .root_source_file = b.path("src/compat.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .link_libc = true,
+        });
+        m.addImport("compat", compat_mod);
         const exe = b.addExecutable(.{ .name = "throughput_bench", .root_module = m });
         const run = b.addRunArtifact(exe);
         if (b.args) |a| run.addArgs(a);

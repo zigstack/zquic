@@ -475,12 +475,18 @@ pub const fs = struct {
         }
 
         pub fn getEndPos(self: File) !u64 {
-            var st: system.Stat = undefined;
-            const rc = system.fstat(self.handle, &st);
-            switch (checkRc(rc)) {
-                .SUCCESS => return @intCast(st.size),
+            // Use lseek(fd, 0, SEEK_END) to obtain file size without
+            // needing the platform-specific Stat type — `system.fstat` is
+            // `{}` on Linux+libc in zig 0.16, which would not compile.
+            const end = system.lseek(self.handle, 0, 2); // SEEK_END
+            switch (checkRc(end)) {
+                .SUCCESS => {},
                 else => |err| return posix.unexpectedErrno(err),
             }
+            // Restore position so callers that read the file after asking
+            // for size are not surprised.
+            _ = system.lseek(self.handle, 0, 0); // SEEK_SET
+            return @intCast(end);
         }
 
         pub fn readToEndAlloc(self: File, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
