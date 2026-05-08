@@ -17,6 +17,7 @@
 //! can switch between controllers via a tagged union.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const nr = @import("congestion.zig");
 
 pub const mss: u64 = nr.mss;
@@ -79,7 +80,7 @@ pub const Cubic = struct {
     }
 
     fn updateCubic(self: *Cubic, bytes_acked: u64) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
 
         // Start a new epoch if needed.
         if (self.epoch_start_ms == null) {

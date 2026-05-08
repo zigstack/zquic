@@ -18,7 +18,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.2"
+          version: "0.16.0"
 
       - name: Run unit tests
         run: zig build test --summary all
@@ -36,7 +36,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.2"
+          version: "0.16.0"
 
       - name: Build release binaries (linux/amd64)
         run: |

@@ -27,6 +27,7 @@
 // cache ensures correct RFC compliance for non-idempotent future extensions.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const crypto_keys = @import("keys.zig");
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -299,7 +300,7 @@ pub const NonceCache = struct {
     /// Returns `true` (new) if the key is fresh and inserts it.
     /// Returns `false` (replay) if the key already exists and is not expired.
     pub fn checkAndInsert(self: *NonceCache, key: [8]u8) bool {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         return self.checkAndInsertAt(key, now_ms);
     }
 

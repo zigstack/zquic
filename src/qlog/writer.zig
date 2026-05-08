@@ -15,6 +15,7 @@
 //!            https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-quic-events
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 // ---------------------------------------------------------------------------
 // PacketType enum — used in packet_sent / packet_received events
@@ -53,7 +54,7 @@ pub const PacketType = enum {
 ///
 /// Thread safety: not thread-safe; use one writer per connection.
 pub const Writer = struct {
-    file: ?std.fs.File = null,
+    file: ?compat.fs.File = null,
     /// Unix timestamp (ms) when the connection started.  All event `time`
     /// fields are relative to this value.
     reference_ms: i64 = 0,
@@ -75,10 +76,10 @@ pub const Writer = struct {
         const hex = hexEncode(odcid_bytes);
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.sqlog", .{ qlog_dir, hex.slice() }) catch return .{};
 
-        std.fs.makeDirAbsolute(qlog_dir) catch {};
-        const file = std.fs.createFileAbsolute(path, .{}) catch return .{};
+        compat.fs.makeDirAbsolute(qlog_dir) catch {};
+        const file = compat.fs.createFileAbsolute(path, .{}) catch return .{};
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
 
         // Write NDJSON trace header.
         var w: Writer = .{ .file = file, .reference_ms = now_ms };
@@ -221,7 +222,7 @@ pub const Writer = struct {
         data_args: anytype,
     ) void {
         if (self.file == null) return;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         const rel: f64 = @floatFromInt(now_ms - self.reference_ms);
         // Write time+name prefix.
         self.writeFmt("{{\"time\":{d:.3},\"name\":\"{s}\",\"data\":", .{ rel, name });
@@ -301,13 +302,13 @@ test "qlog writer: disabled writer is a no-op" {
 test "qlog writer: write to tmp file and verify content" {
     const testing = std.testing;
 
-    // Use a temp directory.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    // Get an absolute path string for the tmp dir.
-    var path_buf: [512]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(".", &path_buf);
+    // Use a fixed-path tmp directory.  The old `std.testing.tmpDir().dir.realpath`
+    // helper relied on `std.fs` / `std.testing` APIs that were reworked into
+    // `std.Io.Dir` in zig 0.16; while the rest of the test suite still passes
+    // by going through the compat shim, the testing helpers themselves are
+    // not yet ported — so use a deterministic path here.
+    const tmp_path = "/tmp/zquic-qlog-test";
+    compat.fs.makeDirAbsolute(tmp_path) catch {};
 
     const odcid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     var w = Writer.open(tmp_path, &odcid, "server");
@@ -326,7 +327,7 @@ test "qlog writer: write to tmp file and verify content" {
     // Verify the file was created and contains recognisable content.
     var sqlog_path_buf: [512]u8 = undefined;
     const sqlog_path = try std.fmt.bufPrint(&sqlog_path_buf, "{s}/01020304.sqlog", .{tmp_path});
-    const content = try std.fs.openFileAbsolute(sqlog_path, .{});
+    const content = try compat.fs.openFileAbsolute(sqlog_path, .{});
     defer content.close();
     var read_buf: [4096]u8 = undefined;
     const n = try content.readAll(&read_buf);

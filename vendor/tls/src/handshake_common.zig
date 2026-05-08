@@ -46,20 +46,23 @@ pub const CertKeyPair = struct {
     /// bundle.
     key: PrivateKey,
 
+    /// Convenience cert-and-key loader from an open directory handle.
+    ///
+    /// In zig 0.16 the underlying `std.crypto.Certificate.Bundle` API was
+    /// reworked to require an `Io` instance and `Io.Dir`, so this overload
+    /// now refuses to compile when invoked.  Callers should load PEM bytes
+    /// themselves and use `PrivateKey.parsePem` plus the new Bundle API.
     pub fn fromFilePath(
         allocator: mem.Allocator,
-        dir: std.fs.Dir,
+        dir: anytype,
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
-        var bundle: cert.Bundle = .{};
-        try bundle.addCertsFromFilePath(allocator, dir, cert_path);
-
-        const key_file = try dir.openFile(key_path, .{});
-        defer key_file.close();
-        const key = try PrivateKey.fromFile(allocator, key_file);
-
-        return .{ .bundle = bundle, .key = key };
+        _ = allocator;
+        _ = dir;
+        _ = cert_path;
+        _ = key_path;
+        return error.UnsupportedOnZig016;
     }
 
     pub fn fromFilePathAbsolute(
@@ -67,14 +70,10 @@ pub const CertKeyPair = struct {
         cert_path: []const u8,
         key_path: []const u8,
     ) !CertKeyPair {
-        var bundle: cert.Bundle = .{};
-        try bundle.addCertsFromFilePathAbsolute(allocator, cert_path);
-
-        const key_file = try std.fs.openFileAbsolute(key_path, .{});
-        defer key_file.close();
-        const key = try PrivateKey.fromFile(allocator, key_file);
-
-        return .{ .bundle = bundle, .key = key };
+        _ = allocator;
+        _ = cert_path;
+        _ = key_path;
+        return error.UnsupportedOnZig016;
     }
 
     pub fn deinit(c: *CertKeyPair, allocator: mem.Allocator) void {
@@ -89,22 +88,26 @@ pub const cert = struct {
     // forms valid trust chain.
     pub const Bundle = crypto.Certificate.Bundle;
 
-    pub fn fromFilePath(allocator: mem.Allocator, dir: std.fs.Dir, path: []const u8) !Bundle {
-        var bundle: Bundle = .{};
-        try bundle.addCertsFromFilePath(allocator, dir, path);
-        return bundle;
+    /// Bundle convenience loaders.  The underlying
+    /// `std.crypto.Certificate.Bundle.addCertsFrom*` API now requires an
+    /// `Io` instance (zig 0.16); these convenience wrappers return an error
+    /// until the caller migrates to the new Bundle signature.
+    pub fn fromFilePath(allocator: mem.Allocator, dir: anytype, path: []const u8) !Bundle {
+        _ = allocator;
+        _ = dir;
+        _ = path;
+        return error.UnsupportedOnZig016;
     }
 
     pub fn fromFilePathAbsolute(allocator: mem.Allocator, path: []const u8) !Bundle {
-        var bundle: Bundle = .{};
-        try bundle.addCertsFromFilePathAbsolute(allocator, path);
-        return bundle;
+        _ = allocator;
+        _ = path;
+        return error.UnsupportedOnZig016;
     }
 
     pub fn fromSystem(allocator: mem.Allocator) !Bundle {
-        var bundle: Bundle = .{};
-        try bundle.rescan(allocator);
-        return bundle;
+        _ = allocator;
+        return error.UnsupportedOnZig016;
     }
 };
 

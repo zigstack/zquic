@@ -17,7 +17,10 @@ key: union {
 
 const PrivateKey = @This();
 
-pub fn fromFile(gpa: Allocator, file: std.fs.File) !PrivateKey {
+/// Read the entire PEM bundle from `file` (must expose `readToEndAlloc`)
+/// and parse a private key from it.  Kept generic so this module can be
+/// reused with the compat fs shim in zig 0.16 (where `std.fs.File` is gone).
+pub fn fromFile(gpa: Allocator, file: anytype) !PrivateKey {
     const buf = try file.readToEndAlloc(gpa, 1024 * 1024);
     defer gpa.free(buf);
     return try parsePem(buf);

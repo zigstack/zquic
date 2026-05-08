@@ -24,6 +24,7 @@
 //!  - `PreferredAddress`: server-advertised preferred address.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 // ---------------------------------------------------------------------------
 // Path challenge data (8 random bytes, RFC 9000 §19.17)
@@ -34,7 +35,7 @@ pub const ChallengeData = [8]u8;
 /// Generate cryptographically random PATH_CHALLENGE data.
 pub fn randomChallenge() ChallengeData {
     var data: ChallengeData = undefined;
-    std.crypto.random.bytes(&data);
+    compat.random.bytes(&data);
     return data;
 }
 

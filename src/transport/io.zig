@@ -13,6 +13,7 @@
 //!   1-RTT      – AES-128-GCM with keys derived from TLS application_secret
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const log = std.log.scoped(.zquic);
 const packet_mod = @import("../packet/packet.zig");
 const header_mod = @import("../packet/header.zig");
@@ -208,7 +209,7 @@ fn hexEncode(dst: []u8, src: []const u8) void {
 /// Write TLS secrets to a keylog file in NSS key log format.
 /// Enables Wireshark/tshark to decrypt captured QUIC traffic.
 fn writeKeylog(path: []const u8, client_random: [32]u8, secrets: *const tls_hs.TrafficSecrets) void {
-    const file = std.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
+    const file = compat.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
     defer file.close();
     file.seekFromEnd(0) catch return;
 
@@ -388,16 +389,9 @@ pub fn build0RttPacket(
 }
 
 /// Build a 1-RTT (Short Header) packet.
-/// Compare two `std.net.Address` values for equality (address + port).
-fn addressEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        std.posix.AF.INET => a.in.sa.port == b.in.sa.port and
-            a.in.sa.addr == b.in.sa.addr,
-        std.posix.AF.INET6 => a.in6.sa.port == b.in6.sa.port and
-            std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr),
-        else => false,
-    };
+/// Compare two `compat.Address` values for equality (address + port).
+fn addressEqual(a: compat.Address, b: compat.Address) bool {
+    return a.eql(b);
 }
 
 pub fn build1RttPacket(
@@ -566,7 +560,7 @@ pub fn decryptLongPacket(
 
 /// Load the first DER certificate from a PEM file (heap-allocated).
 pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const pem = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const pem = compat.fs.openFileAbsolute(path, .{}) catch |err| {
         dbg("io: cannot open cert {s}: {}\n", .{ path, err });
         return err;
     };
@@ -601,7 +595,7 @@ pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// Load a PrivateKey from a PEM file using tls.zig's parser.
 pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendor.config.PrivateKey {
-    const f = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const f = compat.fs.openFileAbsolute(path, .{}) catch |err| {
         dbg("io: cannot open key {s}: {}\n", .{ path, err });
         return err;
     };
@@ -615,7 +609,7 @@ pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendo
 const Http09OutSlot = struct {
     active: bool = false,
     stream_id: u64 = 0,
-    file: std.fs.File = undefined,
+    file: compat.fs.File = undefined,
     stream_offset: u64 = 0,
     file_end: u64 = 0,
     /// Absolute filesystem path, stored so we can reopen the file for
@@ -651,7 +645,7 @@ const Http09OutSlot = struct {
 const Http3OutSlot = struct {
     active: bool = false,
     stream_id: u64 = 0,
-    file: std.fs.File = undefined,
+    file: compat.fs.File = undefined,
     /// Byte offset in the QUIC stream (includes the HEADERS frame already sent).
     stream_offset: u64 = 0,
     file_end: u64 = 0,
@@ -698,7 +692,7 @@ pub const RawAppStreamSlot = struct {
     stream_id: u64 = 0,
     /// Next contiguous byte offset expected; bytes [0..next_offset) are in `buf`.
     next_offset: u64 = 0,
-    buf: std.ArrayListUnmanaged(u8) = .{},
+    buf: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
         self.buf.deinit(allocator);
@@ -803,7 +797,7 @@ pub const ConnState = struct {
     next_remote_cid: ?ConnectionId = null,
 
     // Peer UDP address
-    peer: std.net.Address,
+    peer: compat.Address,
 
     /// Clamped UDP payload limit for this path (RFC 9000 §14). Drives `app_stream_chunk`.
     max_udp_payload: u16 = default_conn_path_mtu.max_udp_payload,
@@ -1200,12 +1194,12 @@ pub const Server = struct {
         };
 
         // Create UDP socket (IPv4)
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        errdefer std.posix.close(sock);
+        const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer compat.close(sock);
 
         // Bind to port on all interfaces
-        const addr = try std.net.Address.parseIp4("0.0.0.0", config.port);
-        try std.posix.bind(sock, &addr.any, addr.getOsSockLen());
+        const addr = try compat.Address.parseIp4("0.0.0.0", config.port);
+        try compat.bind(sock, &addr.any, addr.getOsSockLen());
 
         // Large buffers help bulk HTTP/0.9 transfers: without them, a tight send
         // loop in handleHttp09Stream can fill the default SNDBUF and drop packets
@@ -1221,7 +1215,7 @@ pub const Server = struct {
         // Diagnostic raw socket: capture all incoming UDP at IP level.
         // If this sees packets that the main socket doesn't, it indicates
         // a kernel-level filter is blocking delivery to port 443.
-        const raw_sock = std.posix.socket(
+        const raw_sock = compat.socket(
             std.posix.AF.INET,
             std.posix.SOCK.RAW,
             17, // IPPROTO_UDP
@@ -1235,7 +1229,7 @@ pub const Server = struct {
 
         // Generate a random Retry token secret for this server lifetime
         var retry_secret: [32]u8 = undefined;
-        std.crypto.random.bytes(&retry_secret);
+        compat.random.bytes(&retry_secret);
 
         self.* = .{
             .allocator = allocator,
@@ -1245,7 +1239,7 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
-            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
+            .retry_secret_last_rotate_ms = compat.milliTimestamp(),
             .owns_socket = true,
         };
         return self;
@@ -1281,7 +1275,7 @@ pub const Server = struct {
         setupEcnSocket(sock);
 
         var retry_secret: [32]u8 = undefined;
-        std.crypto.random.bytes(&retry_secret);
+        compat.random.bytes(&retry_secret);
 
         self.* = .{
             .allocator = allocator,
@@ -1291,14 +1285,14 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
-            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
+            .retry_secret_last_rotate_ms = compat.milliTimestamp(),
             .owns_socket = take_ownership,
         };
         return self;
     }
 
     /// Inject a UDP payload as if it had been received on `recvfrom` (shared-socket / embedder recv loops).
-    pub fn feedPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+    pub fn feedPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         self.processPacket(buf, src);
     }
 
@@ -1344,15 +1338,15 @@ pub const Server = struct {
                 conn.qlog.close();
             }
         }
-        if (self.owns_socket) std.posix.close(self.sock);
-        if (self.raw_sock) |rs| std.posix.close(rs);
+        if (self.owns_socket) compat.close(self.sock);
+        if (self.raw_sock) |rs| compat.close(rs);
         self.allocator.free(self.cert_der);
         self.allocator.destroy(self);
     }
 
     /// Free connection slots that have completed their draining period (RFC 9000 §10.2.2).
     fn reapDrainedConnections(self: *Server) void {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         const idle_timeout_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
@@ -1449,7 +1443,7 @@ pub const Server = struct {
                 var raw_buf: [2048]u8 = undefined;
                 var raw_src: std.posix.sockaddr.storage = undefined;
                 var raw_src_len: std.posix.socklen_t = @sizeOf(@TypeOf(raw_src));
-                const rn = std.posix.recvfrom(
+                const rn = compat.recvfrom(
                     self.raw_sock.?,
                     &raw_buf,
                     0,
@@ -1495,7 +1489,7 @@ pub const Server = struct {
     }
 
     /// Dispatch a received UDP datagram.
-    fn processPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+    fn processPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         const src_ip = src.any.data[2..6];
         dbg("io: server recv {} bytes first_byte=0x{x:0>2} src_ip={}.{}.{}.{}\n", .{
             buf.len,   if (buf.len > 0) buf[0] else 0,
@@ -1560,7 +1554,7 @@ pub const Server = struct {
     }
 
     /// Find an existing connection by the peer's UDP address (for retransmit detection).
-    fn findConnByPeer(self: *Server, peer: std.net.Address) ?*ConnState {
+    fn findConnByPeer(self: *Server, peer: compat.Address) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.*) |*c| {
                 // Compare family, port, and IP address bytes
@@ -1588,10 +1582,10 @@ pub const Server = struct {
     }
 
     /// Create a new server-side connection.
-    fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address, is_v2: bool) ?*ConnState {
+    fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: compat.Address, is_v2: bool) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.* == null) {
-                const local_cid = ConnectionId.random(std.crypto.random, 8);
+                const local_cid = ConnectionId.random(compat.random, 8);
                 slot.* = ConnState{
                     .local_cid = local_cid,
                     .remote_cid = scid,
@@ -1626,7 +1620,7 @@ pub const Server = struct {
     fn processInitialPacket(
         self: *Server,
         buf: []const u8,
-        src: std.net.Address,
+        src: compat.Address,
     ) void {
         const ip = packet_mod.parseInitial(buf) catch return;
         // Detect QUIC version from raw packet (already validated in processPacket).
@@ -1746,7 +1740,7 @@ pub const Server = struct {
 
     /// Process a 0-RTT Long Header packet.  Decrypts with the connection's
     /// early keys (if available) and dispatches STREAM frames to handleStreamData.
-    fn process0RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+    fn process0RttPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         const lh = header_mod.parseLong(buf) catch return;
         // 0-RTT packets carry the client's original Initial DCID, not the server's
         // local_cid (which is assigned randomly after the Initial arrives).
@@ -1837,11 +1831,11 @@ pub const Server = struct {
     /// The previous secret is retained so tokens minted just before rotation
     /// stay valid for one more TTL window.
     fn maybeRotateRetrySecret(self: *Server) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         if (now_ms - self.retry_secret_last_rotate_ms < retry_secret_rotate_ms) return;
         self.retry_secret_prev = self.retry_secret;
         self.retry_secret_prev_valid = self.retry_secret_last_rotate_ms > 0;
-        std.crypto.random.bytes(&self.retry_secret);
+        compat.random.bytes(&self.retry_secret);
         self.retry_secret_last_rotate_ms = now_ms;
         dbg("io: rotated retry_secret (prev_valid={})\n", .{self.retry_secret_prev_valid});
     }
@@ -1871,7 +1865,7 @@ pub const Server = struct {
         out[0] = @intCast(odcid.len);
         @memcpy(out[1..][0..odcid.len], odcid);
         const ts_offset = 1 + odcid.len;
-        const ts_ms: i64 = std.time.milliTimestamp();
+        const ts_ms: i64 = compat.milliTimestamp();
         std.mem.writeInt(i64, out[ts_offset..][0..8], ts_ms, .big);
         const mac = retryHmac(&self.retry_secret, odcid, out[ts_offset..][0..8]);
         @memcpy(out[ts_offset + 8 ..][0..32], &mac);
@@ -1905,7 +1899,7 @@ pub const Server = struct {
 
         // Check freshness: reject tokens older than retry_token_ttl_ms.
         const minted_ms = std.mem.readInt(i64, ts_bytes, .big);
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         const age_ms = now_ms - minted_ms;
         if (age_ms < 0 or age_ms > retry_token_ttl_ms) return null;
 
@@ -1917,20 +1911,20 @@ pub const Server = struct {
     /// `client_scid` and `client_dcid` are from the client's packet; the VN
     /// packet echoes them back swapped (server DCID = client SCID, server SCID
     /// = client DCID) so the client can match the response.
-    fn sendVersionNegotiation(self: *Server, client_scid: []const u8, client_dcid: []const u8, dst: std.net.Address) void {
+    fn sendVersionNegotiation(self: *Server, client_scid: []const u8, client_dcid: []const u8, dst: compat.Address) void {
         var buf: [64]u8 = undefined;
         // Advertise both v1 and v2 so clients can upgrade or fall back.
         const n = version_neg_mod.build(&buf, client_scid, client_dcid, &[_]u32{
             version_neg_mod.QUIC_V1,
             version_neg_mod.QUIC_V2,
         }) catch return;
-        _ = std.posix.sendto(self.sock, buf[0..n], 0, &dst.any, dst.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, buf[0..n], 0, &dst.any, dst.getOsSockLen()) catch {};
     }
 
-    fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: std.net.Address, version: u32) void {
+    fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: compat.Address, version: u32) void {
         // New server SCID for the connection after Retry
         var new_scid: [8]u8 = undefined;
-        std.crypto.random.bytes(&new_scid);
+        compat.random.bytes(&new_scid);
 
         // Token encodes odcid + timestamp + HMAC (max 61 bytes: 1 + 20 + 8 + 32)
         var token_buf: [61]u8 = undefined;
@@ -1946,7 +1940,7 @@ pub const Server = struct {
             odcid,
         ) catch return;
 
-        _ = std.posix.sendto(self.sock, buf[0..n], 0, &src.any, src.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, buf[0..n], 0, &src.any, src.getOsSockLen()) catch {};
         dbg("io: sent Retry to client\n", .{});
     }
 
@@ -1955,7 +1949,7 @@ pub const Server = struct {
         conn: *ConnState,
         data: []const u8,
         offset: u64,
-        src: std.net.Address,
+        src: compat.Address,
     ) void {
         // In-order reassembly with reorder buffering (RFC 9001 §4.1.3).
         // If data arrives out-of-order, buffer it and wait for the missing prefix.
@@ -2042,7 +2036,7 @@ pub const Server = struct {
     /// Called after in-order delivery in `handleInitialCrypto`.
     /// Segments are re-fed into `handleInitialCrypto` so that a fragmented
     /// ClientHello (or any follow-on Initial CRYPTO data) is fully processed.
-    fn drainInitCryptoReorder(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn drainInitCryptoReorder(self: *Server, conn: *ConnState, src: compat.Address) void {
         var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
         while (true) {
             const n = conn.init_crypto_reorder.take(conn.init_crypto_offset, &drain_buf);
@@ -2052,7 +2046,7 @@ pub const Server = struct {
         }
     }
 
-    fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
         // Build server transport parameters into a separate scratch buffer.
         // Append original_destination_connection_id (id=0x00) when a Retry was
         // accepted — RFC 9000 §7.3 requires it so the client can verify.
@@ -2101,7 +2095,7 @@ pub const Server = struct {
     /// (ServerHello) plus as many Handshake CRYPTO chunks as fit within
     /// MAX_DATAGRAM_SIZE.  Any remaining Handshake chunks are sent as
     /// separate datagrams via sendHandshakeServerFlight.
-    fn sendCoalescedServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendCoalescedServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
         var coalesced_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         var coalesced_len: usize = 0;
 
@@ -2176,7 +2170,7 @@ pub const Server = struct {
 
             // Flush the coalesced datagram.
             if (coalesced_len > 0) {
-                _ = std.posix.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+                _ = compat.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                     dbg("io: sendto coalesced flight failed: {}\n", .{err});
                 };
             }
@@ -2188,14 +2182,14 @@ pub const Server = struct {
         } else {
             // No handshake keys yet — just send the Initial packet alone.
             if (coalesced_len > 0) {
-                _ = std.posix.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+                _ = compat.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                     dbg("io: sendto Initial failed: {}\n", .{err});
                 };
             }
         }
     }
 
-    fn sendInitialServerHello(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendInitialServerHello(self: *Server, conn: *ConnState, src: compat.Address) void {
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         var frames_buf: [1024]u8 = undefined;
         var fp: usize = 0;
@@ -2231,18 +2225,18 @@ pub const Server = struct {
         conn.init_pn += 1;
         conn.anti_amp_bytes_sent += pkt_len;
 
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
             dbg("io: sendto Initial failed: {}\n", .{err});
         };
     }
 
-    fn sendHandshakeServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendHandshakeServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
         self.sendHandshakeServerFlightFrom(conn, src, 0);
     }
 
     /// Send Handshake CRYPTO frames starting from `start_offset` in the
     /// server flight buffer, one packet per UDP datagram.
-    fn sendHandshakeServerFlightFrom(self: *Server, conn: *ConnState, src: std.net.Address, start_offset: usize) void {
+    fn sendHandshakeServerFlightFrom(self: *Server, conn: *ConnState, src: compat.Address, start_offset: usize) void {
         if (!conn.has_hs_keys) return;
 
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -2281,7 +2275,7 @@ pub const Server = struct {
             conn.hs_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
 
-            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                 dbg("io: sendto Handshake failed: {}\n", .{err});
             };
 
@@ -2292,7 +2286,7 @@ pub const Server = struct {
     fn processHandshakePacket(
         self: *Server,
         buf: []const u8,
-        src: std.net.Address,
+        src: compat.Address,
     ) void {
         // Re-parse long header to get DCID and consumed bytes
         const lh = header_mod.parseLong(buf) catch return;
@@ -2379,7 +2373,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleHandshakeCrypto(self: *Server, conn: *ConnState, data: []const u8, src: std.net.Address) void {
+    fn handleHandshakeCrypto(self: *Server, conn: *ConnState, data: []const u8, src: compat.Address) void {
         if (data.len < 4 or data[0] != tls_hs.MSG_FINISHED) return;
 
         conn.tls.processClientFinished(data) catch |err| {
@@ -2414,7 +2408,7 @@ pub const Server = struct {
         }
     }
 
-    fn sendHandshakeAck(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendHandshakeAck(self: *Server, conn: *ConnState, src: compat.Address) void {
         if (!conn.has_hs_keys) return;
         const pn = conn.hs_recv_pn orelse return;
 
@@ -2433,10 +2427,10 @@ pub const Server = struct {
         ) catch return;
         conn.hs_pn += 1;
 
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
     }
 
-    fn sendHandshakeDone(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendHandshakeDone(self: *Server, conn: *ConnState, src: compat.Address) void {
         if (!conn.has_app_keys) return;
 
         var frames_buf: [2048]u8 = undefined;
@@ -2478,7 +2472,7 @@ pub const Server = struct {
         // NEW_CONNECTION_ID frame (RFC 9000 §19.15) — give the client an
         // alternative CID to use when it migrates (--migrate mode only).
         if (self.config.migrate) {
-            const new_cid = ConnectionId.random(std.crypto.random, 8);
+            const new_cid = ConnectionId.random(compat.random, 8);
             conn.alt_local_cid = new_cid;
             if (fp + 28 <= frames_buf.len) {
                 frames_buf[fp] = 0x18;
@@ -2494,7 +2488,7 @@ pub const Server = struct {
                 // Generate a random stateless reset token (RFC 9000 §10.3) once
                 // per connection and include it with the NEW_CONNECTION_ID frame.
                 if (!conn.stateless_reset_token_set) {
-                    std.crypto.random.bytes(&conn.stateless_reset_token);
+                    compat.random.bytes(&conn.stateless_reset_token);
                     conn.stateless_reset_token_set = true;
                 }
                 @memcpy(frames_buf[fp .. fp + 16], &conn.stateless_reset_token);
@@ -2515,7 +2509,7 @@ pub const Server = struct {
         self.send1Rtt(conn, frames_buf[0..fp], src);
     }
 
-    fn process1RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+    fn process1RttPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         dbg("io: process1RttPacket buf_len={}\n", .{buf.len});
         // Find connection by scanning CID prefix
         for (&self.conns) |*slot| {
@@ -2635,7 +2629,7 @@ pub const Server = struct {
     /// Trigger a local key update: rotate send keys and emit a packet with
     /// the new key phase bit set.  Called after handshake when key_update
     /// is enabled (quic-interop-runner "keyupdate" test case).
-    fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: compat.Address) void {
         // Rotate to next generation keys (version-appropriate label).
         conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
         conn.key_phase_bit = !conn.key_phase_bit;
@@ -2646,12 +2640,12 @@ pub const Server = struct {
         self.send1Rtt(conn, &ping_frame, src);
     }
 
-    fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
+    fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: compat.Address) void {
         dbg("io: processAppFrames called: {} bytes\n", .{frames.len});
         conn.qlog.packetReceived(.one_rtt, conn.app_recv_pn orelse 0, frames.len);
         // RFC 9000 §10.2.2: silently discard all frames while draining.
         if (conn.draining) return;
-        conn.last_recv_ms = std.time.milliTimestamp();
+        conn.last_recv_ms = compat.milliTimestamp();
         // Detect address change (connection migration / port rebinding, RFC 9000 §9).
         // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
         // the server sees packets from a new src port.  We must:
@@ -2666,7 +2660,7 @@ pub const Server = struct {
         // rebind, causing a download stall and eventual 60 s timeout.
         if (!addressEqual(conn.peer, src)) {
             var challenge: [8]u8 = undefined;
-            std.crypto.random.bytes(&challenge);
+            compat.random.bytes(&challenge);
             // Overwrite any pending challenge — a fresh one is needed for the new path.
             conn.path_challenge_data = challenge;
             // Eagerly update peer so all subsequent sends reach the new address.
@@ -2703,7 +2697,7 @@ pub const Server = struct {
                         (slot.fin_pkt_pn - REWIND_BYTES / chunk) * chunk
                     else
                         0;
-                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                    if (compat.fs.openFileAbsolute(fp, .{})) |f| {
                         f.seekTo(rewind_to) catch {
                             f.close();
                             continue;
@@ -2786,7 +2780,7 @@ pub const Server = struct {
                     largest_ack,
                     first_ack_range,
                     ack_delay,
-                    @intCast(std.time.milliTimestamp()),
+                    @intCast(compat.milliTimestamp()),
                     &conn.rtt,
                     &lost_buf,
                 ) catch {
@@ -2835,7 +2829,7 @@ pub const Server = struct {
                                 // activate the slot so flushPendingHttp09Responses
                                 // will retransmit the missing data.
                                 const fp = slot.file_path[0..slot.file_path_len];
-                                if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                if (compat.fs.openFileAbsolute(fp, .{})) |f| {
                                     f.seekTo(lp.stream_offset) catch {
                                         f.close();
                                         break;
@@ -2873,7 +2867,7 @@ pub const Server = struct {
                                     dbg("io: retransmit h3 stream_id={} rewind quic_off={} file_pos={}\n", .{ lp.stream_id, lp.stream_offset, file_pos });
                                 } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
                                     const fp = slot.file_path[0..slot.file_path_len];
-                                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                    if (compat.fs.openFileAbsolute(fp, .{})) |f| {
                                         f.seekTo(file_pos) catch {
                                             f.close();
                                             break;
@@ -2894,7 +2888,7 @@ pub const Server = struct {
                 }
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
-                conn.last_ack_ms = std.time.milliTimestamp();
+                conn.last_ack_ms = compat.milliTimestamp();
                 conn.pto_count = 0;
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
@@ -3005,7 +2999,7 @@ pub const Server = struct {
                 dbg("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
                 conn.draining = true;
                 const pto2 = conn.rtt.pto_ms(25, 0);
-                conn.draining_deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(3 * pto2));
+                conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto2));
                 continue;
             }
             if (ft == 0x1a) {
@@ -3114,7 +3108,7 @@ pub const Server = struct {
     }
 
     /// Send a RESET_STREAM frame to cancel a stream (RFC 9000 §19.4).
-    fn sendResetStream(self: *Server, conn: *ConnState, stream_id: u64, error_code: u64, dst: std.net.Address) void {
+    fn sendResetStream(self: *Server, conn: *ConnState, stream_id: u64, error_code: u64, dst: compat.Address) void {
         const frame = transport_frames.ResetStream{
             .stream_id = stream_id,
             .application_protocol_error_code = error_code,
@@ -3127,7 +3121,7 @@ pub const Server = struct {
     }
 
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
-    fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: std.net.Address) void {
+    fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: compat.Address) void {
         // RFC 9000 §10.2.3: do not send any frames while draining (only
         // CONNECTION_CLOSE copies are allowed, handled via sendConnectionClose).
         if (conn.draining) return;
@@ -3181,7 +3175,7 @@ pub const Server = struct {
         // Loss detection: record this packet.
         conn.ld.onPacketSent(.{
             .pn = conn.app_pn - 1,
-            .send_time_ms = @intCast(std.time.milliTimestamp()),
+            .send_time_ms = @intCast(compat.milliTimestamp()),
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
@@ -3265,7 +3259,7 @@ pub const Server = struct {
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
             slot.fin_frame_len = frame_len;
             slot.fin_pkt_pn = fin_pn;
-            slot.fin_last_sent_ms = std.time.milliTimestamp();
+            slot.fin_last_sent_ms = compat.milliTimestamp();
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
             // Close the file — we no longer need to read from it.
@@ -3329,7 +3323,7 @@ pub const Server = struct {
     ///
     /// The pto_count field provides exponential back-off (PTO doubles each probe).
     fn checkPto(self: *Server) void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
             const conn = if (cslot.*) |*c| c else continue;
             if (!conn.has_app_keys) continue;
@@ -3366,7 +3360,7 @@ pub const Server = struct {
     ///     processAppFrames), or
     ///   • MAX_FIN_RETRANSMITS re-sends have been attempted.
     fn http09RetransmitPendingFins(self: *Server) void {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         // Rate-limit: at most one retransmit pass every 50ms.
         if (now - self.http09_retransmit_last_ms < 50) return;
         self.http09_retransmit_last_ms = now;
@@ -3398,14 +3392,14 @@ pub const Server = struct {
     }
 
     /// Send a PATH_CHALLENGE frame to validate a new peer address.
-    fn sendPathChallenge(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
+    fn sendPathChallenge(self: *Server, conn: *ConnState, data: [8]u8, dst: compat.Address) void {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathChallenge.serialize(.{ .data = data }, &frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], dst);
     }
 
     /// Send a PATH_RESPONSE echoing the challenge data back to the sender.
-    fn sendPathResponse(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
+    fn sendPathResponse(self: *Server, conn: *ConnState, data: [8]u8, dst: compat.Address) void {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], dst);
@@ -3415,7 +3409,7 @@ pub const Server = struct {
     /// RFC 9000 §10.2.3: after sending CONNECTION_CLOSE the endpoint enters the
     /// draining state and MUST NOT send any further packets except for additional
     /// CONNECTION_CLOSE copies to handle packet loss.
-    fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: std.net.Address) void {
+    fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: compat.Address) void {
         if (conn.conn_close_sent) return;
         conn.conn_close_sent = true;
         const frame = transport_frames.ConnectionClose{
@@ -3432,13 +3426,13 @@ pub const Server = struct {
         conn.draining = true;
         // RFC 9000 §10.2.2: stay in draining state for at least 3×PTO.
         const pto = conn.rtt.pto_ms(25, 0);
-        conn.draining_deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(3 * pto));
+        conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
     }
 
     /// Send a MAX_DATA frame to extend the peer's connection-level send window.
     /// Called when we have consumed ≥50% of the advertised receive window so the
     /// peer is not forced to stall.  We double the window each time.
-    fn sendMaxData(self: *Server, conn: *ConnState, dst: std.net.Address) void {
+    fn sendMaxData(self: *Server, conn: *ConnState, dst: compat.Address) void {
         conn.fc_recv_max = conn.fc_bytes_recv + 64 * 1024 * 1024;
         var buf: [16]u8 = undefined;
         buf[0] = 0x10; // MAX_DATA frame type
@@ -3448,7 +3442,7 @@ pub const Server = struct {
     }
 
     /// Send a MAX_STREAM_DATA frame to extend the peer's send window on one stream.
-    fn sendMaxStreamData(self: *Server, conn: *ConnState, stream_id: u64, dst: std.net.Address) void {
+    fn sendMaxStreamData(self: *Server, conn: *ConnState, stream_id: u64, dst: compat.Address) void {
         const new_max: u64 = conn.fc_bytes_recv + 64 * 1024 * 1024;
         var buf: [32]u8 = undefined;
         buf[0] = 0x11; // MAX_STREAM_DATA frame type
@@ -3462,8 +3456,8 @@ pub const Server = struct {
     }
 
     /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
-    fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: std.net.Address) void {
-        const new_cid = ConnectionId.random(std.crypto.random, 8);
+    fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: compat.Address) void {
+        const new_cid = ConnectionId.random(compat.random, 8);
         conn.alt_local_cid = new_cid;
         conn.alt_local_cid_seq = seq;
         var buf: [32]u8 = undefined;
@@ -3479,7 +3473,7 @@ pub const Server = struct {
         @memcpy(buf[pos .. pos + 8], new_cid.slice());
         pos += 8;
         if (!conn.stateless_reset_token_set) {
-            std.crypto.random.bytes(&conn.stateless_reset_token);
+            compat.random.bytes(&conn.stateless_reset_token);
             conn.stateless_reset_token_set = true;
         }
         @memcpy(buf[pos .. pos + 16], &conn.stateless_reset_token);
@@ -3489,7 +3483,7 @@ pub const Server = struct {
     }
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
-    fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: std.net.Address) void {
+    fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
         // Raise the limit by 100 streams each time we receive STREAMS_BLOCKED.
         const new_limit: u64 = if (bidi)
             conn.max_streams_bidi_recv + 100
@@ -3512,7 +3506,7 @@ pub const Server = struct {
     /// Initiate a server-side key update (RFC 9001 §6).
     /// Rotates app_server_km and flips key_phase_bit, then sends a PING
     /// so the client sees the new Key Phase bit and can rotate its keys.
-    fn initiateServerKeyUpdate(self: *Server, conn: *ConnState, dst: std.net.Address) void {
+    fn initiateServerKeyUpdate(self: *Server, conn: *ConnState, dst: compat.Address) void {
         conn.app_server_km = if (conn.use_v2)
             conn.app_server_km.nextGenV2()
         else
@@ -3530,7 +3524,7 @@ pub const Server = struct {
     /// RFC 9114 §5.2: the Push ID or stream ID in the GOAWAY payload is the
     /// largest stream ID the server will process.  Clients MUST NOT send new
     /// requests on stream IDs ≥ this value.
-    fn sendGoaway(self: *Server, conn: *ConnState, last_stream_id: u64, dst: std.net.Address) void {
+    fn sendGoaway(self: *Server, conn: *ConnState, last_stream_id: u64, dst: compat.Address) void {
         if (conn.goaway_sent) return;
         conn.goaway_sent = true;
         // GOAWAY is an HTTP/3 frame sent on the server control stream (stream 3).
@@ -3552,7 +3546,7 @@ pub const Server = struct {
         dbg("io: sent GOAWAY last_stream_id={}\n", .{last_stream_id});
     }
 
-    fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+    fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         // RFC 9000 §4.5: record final size on FIN and validate against any
         // previously-established final size (from an earlier STREAM+FIN or
         // RESET_STREAM).  Mismatch → FINAL_SIZE_ERROR (0x06).
@@ -3580,7 +3574,7 @@ pub const Server = struct {
         self: *Server,
         conn: *ConnState,
         sf: *const stream_frame_mod.StreamFrame,
-        src: std.net.Address,
+        src: compat.Address,
     ) void {
         _ = src;
         var slot_ptr: ?*RawAppStreamSlot = null;
@@ -3597,7 +3591,7 @@ pub const Server = struct {
                         .active = true,
                         .stream_id = sf.stream_id,
                         .next_offset = 0,
-                        .buf = .{},
+                        .buf = .empty,
                     };
                     slot_ptr = slot;
                     break;
@@ -3623,7 +3617,7 @@ pub const Server = struct {
         slot.next_offset = frame_end;
     }
 
-    fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+    fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         _ = src;
         dbg("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
         // Only unidirectional client-initiated streams carry HTTP/0.9 requests
@@ -3657,7 +3651,7 @@ pub const Server = struct {
             return;
         };
 
-        const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
             dbg("io: file not found: {s}\n", .{fs_path});
             return;
         };
@@ -3688,7 +3682,7 @@ pub const Server = struct {
         file.close();
     }
 
-    fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+    fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         // Stream ID classification (RFC 9000 §2.1):
         //   %4==0  client-initiated bidirectional  → HTTP/3 request streams
         //   %4==2  client-initiated unidirectional → control / QPACK encoder / decoder
@@ -3772,7 +3766,7 @@ pub const Server = struct {
         var fs_path_buf: [512]u8 = undefined;
         const fs_path = http09_server.resolvePath(self.config.www_dir, path, &fs_path_buf) catch return;
 
-        const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
             self.sendH3Response(conn, sf.stream_id, 404, &.{}, src);
             return;
         };
@@ -3838,7 +3832,7 @@ pub const Server = struct {
     /// The first byte of the stream payload is the stream type; subsequent bytes
     /// are the stream body.  We only dispatch on the first STREAM frame per stream
     /// (offset == 0); later frames for the same stream continue the same body.
-    fn handleH3ClientUniStream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, sf_src: std.net.Address) void {
+    fn handleH3ClientUniStream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, sf_src: compat.Address) void {
         if (sf.data.len == 0) return;
 
         // The stream type byte is present only in the first frame (offset == 0).
@@ -3927,7 +3921,7 @@ pub const Server = struct {
     /// instructions, attempt to decode every buffered (blocked) HEADERS block.
     /// Streams that can now be decoded are dispatched as normal HTTP/3 requests;
     /// streams that are still blocked remain in the buffer.
-    fn retryBlockedH3Streams(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn retryBlockedH3Streams(self: *Server, conn: *ConnState, src: compat.Address) void {
         for (&conn.qpack_blocked) |*slot| {
             if (!slot.active) continue;
 
@@ -3975,7 +3969,7 @@ pub const Server = struct {
 
             var fs_path_buf: [512]u8 = undefined;
             const fs_path = http09_server.resolvePath(self.config.www_dir, path, &fs_path_buf) catch continue;
-            const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+            const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
                 self.sendH3Response(conn, stream_id, 404, &.{}, src);
                 continue;
             };
@@ -4026,7 +4020,7 @@ pub const Server = struct {
         }
     }
 
-    fn sendH3ControlStream(self: *Server, conn: *ConnState, src: std.net.Address) void {
+    fn sendH3ControlStream(self: *Server, conn: *ConnState, src: compat.Address) void {
         // Server control stream: stream_id=3 (server-initiated unidirectional).
         // First byte identifies stream type: 0x00 = control stream.
         var buf: [256]u8 = undefined;
@@ -4087,7 +4081,7 @@ pub const Server = struct {
     /// QPACK decoder stream (server-initiated unidirectional, stream_id = 11).
     /// The first call also sends the stream type byte (0x03).
     /// RFC 9204 §4.4.1.
-    fn sendQpackDecoderInstruction(self: *Server, conn: *ConnState, request_stream_id: u64, src: std.net.Address) void {
+    fn sendQpackDecoderInstruction(self: *Server, conn: *ConnState, request_stream_id: u64, src: compat.Address) void {
         var buf: [16]u8 = undefined;
         var pos: usize = 0;
         if (conn.qpack_dec_stream_off == 0) {
@@ -4121,7 +4115,7 @@ pub const Server = struct {
         static_name_idx: usize,
         value: []const u8,
         name: []const u8,
-        src: std.net.Address,
+        src: compat.Address,
     ) void {
         if (conn.qpack_enc_stream_off == 0) return; // encoder stream not yet initialised
         var ins_buf: [256]u8 = undefined;
@@ -4141,7 +4135,7 @@ pub const Server = struct {
         dbg("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
     }
 
-    fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
+    fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: compat.Address) void {
         var status_buf: [4]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch "500";
 
@@ -4163,7 +4157,7 @@ pub const Server = struct {
         self.sendStreamData(conn, stream_id, out[0..out_len], true, src);
     }
 
-    fn sendStreamData(self: *Server, conn: *ConnState, stream_id: u64, data: []const u8, fin: bool, src: std.net.Address) void {
+    fn sendStreamData(self: *Server, conn: *ConnState, stream_id: u64, data: []const u8, fin: bool, src: compat.Address) void {
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = 0,
@@ -4178,7 +4172,7 @@ pub const Server = struct {
 
     /// Like sendStreamData but with an explicit QUIC stream offset.
     /// Required for HTTP/3 DATA frames that follow the HEADERS frame on the same stream.
-    fn sendStreamDataH3(self: *Server, conn: *ConnState, stream_id: u64, offset: u64, data: []const u8, fin: bool, src: std.net.Address) void {
+    fn sendStreamDataH3(self: *Server, conn: *ConnState, stream_id: u64, offset: u64, data: []const u8, fin: bool, src: compat.Address) void {
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -4249,7 +4243,7 @@ pub const Server = struct {
             @memcpy(slot.fin_frame[0..fin_len], fin_buf[0..fin_len]);
             slot.fin_frame_len = fin_len;
             slot.fin_pkt_pn = fin_pn;
-            slot.fin_last_sent_ms = std.time.milliTimestamp();
+            slot.fin_last_sent_ms = compat.milliTimestamp();
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
             slot.file.close();
@@ -4333,7 +4327,7 @@ pub const Server = struct {
 
     /// Retransmit HTTP/3 FIN frames not yet ACKed (same 200ms retry pattern as HTTP/0.9).
     fn http3RetransmitPendingFins(self: *Server) void {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
             if (cslot.*) |*conn| {
                 for (&conn.http3_slots) |*slot| {
@@ -4452,7 +4446,7 @@ const MAX_STREAMS = 2000;
 
 const StreamDownload = struct {
     stream_id: u64,
-    file: std.fs.File,
+    file: compat.fs.File,
     active: bool,
     /// HTTP/3 only: have we already seen and skipped the HEADERS frame?
     h3_headers_received: bool = false,
@@ -4529,8 +4523,8 @@ pub const Client = struct {
     client_hello_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        errdefer std.posix.close(sock);
+        const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer compat.close(sock);
 
         var sk_buf: i32 = 8 * 1024 * 1024;
         const sk_opt = std.mem.asBytes(&sk_buf);
@@ -4538,8 +4532,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
 
-        const dcid = ConnectionId.random(std.crypto.random, 8);
-        const scid = ConnectionId.random(std.crypto.random, 8);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -4597,8 +4591,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
 
-        const dcid = ConnectionId.random(std.crypto.random, 8);
-        const scid = ConnectionId.random(std.crypto.random, 8);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -4644,7 +4638,7 @@ pub const Client = struct {
         freeConnStateRawAppBuffers(&self.conn, self.allocator);
         self.conn.qlog.connectionClosed("client_shutdown");
         self.conn.qlog.close();
-        if (self.owns_socket) std.posix.close(self.sock);
+        if (self.owns_socket) compat.close(self.sock);
     }
 
     /// Inject a UDP payload as if it had been received on `recvfrom`.
@@ -4653,8 +4647,8 @@ pub const Client = struct {
     }
 
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
-    pub fn processPendingWork(self: *Client, server_addr: std.net.Address) void {
-        const now = std.time.milliTimestamp();
+    pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
+        const now = compat.milliTimestamp();
         if (self.conn.phase == .initial and self.initial_pkt_len > 0 and
             now - self.last_initial_retransmit_ms >= 500)
         {
@@ -4663,7 +4657,7 @@ pub const Client = struct {
         if (self.conn.has_hs_keys and self.conn.phase != .connected and
             self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
         {
-            _ = std.posix.sendto(
+            _ = compat.sendto(
                 self.sock,
                 self.conn.finished_pkt[0..self.conn.finished_pkt_len],
                 0,
@@ -4703,7 +4697,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
     }
 
     /// Opaque receive buffer for an inbound raw-application stream on a **client**.
@@ -4718,7 +4712,7 @@ pub const Client = struct {
 
     /// Send the Initial (ClientHello) and begin the handshake. Use with an external UDP
     /// recv loop: `feedPacket`, `processPendingWork`, and polling the peer endpoint.
-    pub fn startHandshake(self: *Client, server_addr: std.net.Address) !void {
+    pub fn startHandshake(self: *Client, server_addr: compat.Address) !void {
         self.conn.peer = server_addr;
         try self.sendClientHello(server_addr);
     }
@@ -4731,7 +4725,7 @@ pub const Client = struct {
     /// extension) and downloads the remaining URLs.
     pub fn run(self: *Client) !void {
         // Resolve server address (try IPv4 first, then DNS)
-        const server_addr = std.net.Address.parseIp4(self.config.host, self.config.port) catch
+        const server_addr = compat.Address.parseIp4(self.config.host, self.config.port) catch
             try resolveAddress(self.allocator, self.config.host, self.config.port);
         self.conn.peer = server_addr;
         dbg("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
@@ -4747,15 +4741,15 @@ pub const Client = struct {
             // RFC 8446 §4.6.1: the server sends the ticket after the handshake.
             if (self.ticket_store.isEmpty()) {
                 dbg("io: waiting up to 2s for session ticket...\n", .{});
-                const ticket_deadline = std.time.milliTimestamp() + 2_000;
+                const ticket_deadline = compat.milliTimestamp() + 2_000;
                 var recv_buf2: [MAX_DATAGRAM_SIZE]u8 = undefined;
-                while (std.time.milliTimestamp() < ticket_deadline and self.ticket_store.isEmpty()) {
+                while (compat.milliTimestamp() < ticket_deadline and self.ticket_store.isEmpty()) {
                     var fds2 = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
                     const rdy = std.posix.poll(&fds2, 200) catch 0;
                     if (rdy > 0 and fds2[0].revents & std.posix.POLL.IN != 0) {
                         var sa: std.posix.sockaddr.storage = undefined;
                         var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
-                        const nb = std.posix.recvfrom(self.sock, &recv_buf2, 0, @ptrCast(&sa), &sl) catch continue;
+                        const nb = compat.recvfrom(self.sock, &recv_buf2, 0, @ptrCast(&sa), &sl) catch continue;
                         self.processPacket(recv_buf2[0..nb]);
                     }
                 }
@@ -4779,12 +4773,12 @@ pub const Client = struct {
 
     /// Reset connection state for a new QUIC connection to the same server.
     /// Preserves the ticket_store so the second connection can use PSK.
-    fn resetForReconnect(self: *Client, server_addr: std.net.Address) !void {
+    fn resetForReconnect(self: *Client, server_addr: compat.Address) !void {
         // Close old socket and open a fresh one (new local port = new connection
         // identity from the network's perspective).
-        std.posix.close(self.sock);
-        const new_sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        errdefer std.posix.close(new_sock);
+        compat.close(self.sock);
+        const new_sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer compat.close(new_sock);
         self.sock = new_sock;
 
         var sk_buf: i32 = 8 * 1024 * 1024;
@@ -4793,8 +4787,8 @@ pub const Client = struct {
         std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
 
         // New random connection IDs.
-        const dcid = ConnectionId.random(std.crypto.random, 8);
-        const scid = ConnectionId.random(std.crypto.random, 8);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);
@@ -4843,17 +4837,17 @@ pub const Client = struct {
     }
 
     /// Inner event loop: send ClientHello, wait for handshake, download URLs.
-    fn runEventLoop(self: *Client, server_addr: std.net.Address) !void {
+    fn runEventLoop(self: *Client, server_addr: compat.Address) !void {
         // Send ClientHello Initial packet
         try self.sendClientHello(server_addr);
-        var last_initial_ms = std.time.milliTimestamp();
+        var last_initial_ms = compat.milliTimestamp();
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        var deadline = std.time.milliTimestamp() + 60_000; // 60 second timeout for transfer
+        var deadline = compat.milliTimestamp() + 60_000; // 60 second timeout for transfer
 
-        while (std.time.milliTimestamp() < deadline) {
-            const now = std.time.milliTimestamp();
+        while (compat.milliTimestamp() < deadline) {
+            const now = compat.milliTimestamp();
             const remaining = deadline - now;
             if (remaining < 0) {
                 dbg("io: client deadline exceeded, {} ms remaining\n", .{remaining});
@@ -4884,7 +4878,7 @@ pub const Client = struct {
             if (self.conn.has_hs_keys and self.conn.phase != .connected and
                 self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
             {
-                _ = std.posix.sendto(
+                _ = compat.sendto(
                     self.sock,
                     self.conn.finished_pkt[0..self.conn.finished_pkt_len],
                     0,
@@ -4903,7 +4897,7 @@ pub const Client = struct {
                 var dummy: [MAX_DATAGRAM_SIZE]u8 = undefined;
                 var dummy_addr: std.posix.sockaddr.storage = undefined;
                 var dummy_len: std.posix.socklen_t = @sizeOf(@TypeOf(dummy_addr));
-                _ = std.posix.recvfrom(self.sock, &dummy, 0, @ptrCast(&dummy_addr), &dummy_len) catch {};
+                _ = compat.recvfrom(self.sock, &dummy, 0, @ptrCast(&dummy_addr), &dummy_len) catch {};
                 continue;
             }
 
@@ -4911,7 +4905,7 @@ pub const Client = struct {
 
             var src_addr: std.posix.sockaddr.storage = undefined;
             var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-            const n = std.posix.recvfrom(
+            const n = compat.recvfrom(
                 self.sock,
                 &recv_buf,
                 0,
@@ -4972,7 +4966,7 @@ pub const Client = struct {
                 break;
             }
 
-            deadline = std.time.milliTimestamp() + 10_000; // reset on activity
+            deadline = compat.milliTimestamp() + 10_000; // reset on activity
         }
 
         if (self.conn.phase != .connected) {
@@ -4983,19 +4977,19 @@ pub const Client = struct {
         dbg("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
     }
 
-    fn sendClientHello(self: *Client, server: std.net.Address) !void {
+    fn sendClientHello(self: *Client, server: compat.Address) !void {
         // Retransmit: resend the already-built packet without touching the
         // TLS transcript. buildClientHelloMsg updates the transcript hash;
         // calling it again would corrupt the handshake keys.
         if (self.initial_pkt_len > 0) {
-            _ = try std.posix.sendto(
+            _ = try compat.sendto(
                 self.sock,
                 self.initial_pkt[0..self.initial_pkt_len],
                 0,
                 &server.any,
                 server.getOsSockLen(),
             );
-            self.last_initial_retransmit_ms = std.time.milliTimestamp();
+            self.last_initial_retransmit_ms = compat.milliTimestamp();
             return;
         }
 
@@ -5015,7 +5009,7 @@ pub const Client = struct {
             const quic_tp = try buildClientTransportParams(&quic_tp_buf);
 
             // Choose ClientHello variant based on flags.
-            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            const now_ms: u64 = @intCast(compat.milliTimestamp());
             const len = if (self.config.early_data) ed_blk: {
                 // 0-RTT: PSK + early_data extension
                 if (self.ticket_store.get(now_ms)) |ticket| {
@@ -5116,8 +5110,8 @@ pub const Client = struct {
         self.conn.init_pn += 1;
         self.initial_pkt_len = pkt_len;
 
-        _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
-        self.last_initial_retransmit_ms = std.time.milliTimestamp();
+        _ = try compat.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
+        self.last_initial_retransmit_ms = compat.milliTimestamp();
 
         // If early keys were derived, send first batch of 0-RTT GETs (up to 20).
         // 1 Initial + 20 0-RTT = 21 packets ≤ NS3 queue limit of 25.
@@ -5144,7 +5138,7 @@ pub const Client = struct {
     ///
     /// All GETs are 0-RTT so the interop checker sees 0-RTT size ≥ 1-RTT size.
     /// downloadUrls skips re-registering these streams (zerortt_count guard).
-    fn send0RttRequests(self: *Client, server: std.net.Address) !void {
+    fn send0RttRequests(self: *Client, server: compat.Address) !void {
         const km = self.early_km orelse return;
         const MAX_ZERORTT_BATCH: usize = 20;
         const start = self.zerortt_count;
@@ -5152,7 +5146,7 @@ pub const Client = struct {
         if (start >= limit) return; // nothing left to send
         dbg("io: client sending 0-RTT batch [{}-{}) of {} total\n", .{ start, limit, self.active_urls.len });
 
-        std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+        compat.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
         for (self.active_urls[start..limit], start..) |url, i| {
             // Extract path from URL.
@@ -5171,7 +5165,7 @@ pub const Client = struct {
             // Open output file.
             var dl_path_buf: [512]u8 = undefined;
             const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
-            const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+            const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
                 dbg("io: 0-RTT cannot create {s}\n", .{dl_path});
                 continue;
             };
@@ -5215,7 +5209,7 @@ pub const Client = struct {
                 self.conn.quicVersion(),
             ) catch continue;
             self.zerortt_pn += 1;
-            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
             dbg("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
             self.zerortt_count = i + 1;
         }
@@ -5496,9 +5490,9 @@ pub const Client = struct {
         ) catch return;
         self.conn.hs_pn += 1;
         self.conn.finished_pkt_len = pkt_len;
-        self.conn.finished_sent_ms = std.time.milliTimestamp();
+        self.conn.finished_sent_ms = compat.milliTimestamp();
 
-        _ = std.posix.sendto(
+        _ = compat.sendto(
             self.sock,
             self.conn.finished_pkt[0..pkt_len],
             0,
@@ -5586,7 +5580,7 @@ pub const Client = struct {
 
         // ECN: count this 1-RTT packet as ECT(0).
         self.conn.ecn_ect0_recv += 1;
-        self.conn.last_recv_ms = std.time.milliTimestamp();
+        self.conn.last_recv_ms = compat.milliTimestamp();
 
         self.conn.peer_key_phase = incoming_phase;
         self.conn.key_update_pending = false;
@@ -5841,7 +5835,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(
+        _ = compat.sendto(
             self.sock,
             send_buf[0..pkt_len],
             0,
@@ -5895,7 +5889,7 @@ pub const Client = struct {
             .resumption_secret = rs_arr,
             .resumption_secret_len = @intCast(rs_len),
             .max_early_data_size = 16384,
-            .received_at_ms = @intCast(std.time.milliTimestamp()),
+            .received_at_ms = @intCast(compat.milliTimestamp()),
         };
         self.ticket_store.store(ticket);
         dbg("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
@@ -5932,7 +5926,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
         dbg("io: client initiated key update → key_phase={}\n", .{self.conn.key_phase_bit});
     }
 
@@ -5950,7 +5944,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
     }
 
     fn handleRawApplicationStreamClient(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
@@ -5968,7 +5962,7 @@ pub const Client = struct {
                         .active = true,
                         .stream_id = sf.stream_id,
                         .next_offset = 0,
-                        .buf = .{},
+                        .buf = .empty,
                     };
                     slot_ptr = slot;
                     break;
@@ -6181,8 +6175,8 @@ pub const Client = struct {
     /// processAppFrames handler responds with PATH_RESPONSE; the server validates
     /// and updates conn.peer to the new address.  Subsequent STREAM responses then
     /// arrive at our new socket (RFC 9000 §9.2).
-    fn rebindMigrateSocket(self: *Client, server: std.net.Address) void {
-        const new_sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch |err| {
+    fn rebindMigrateSocket(self: *Client, server: compat.Address) void {
+        const new_sock = compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch |err| {
             dbg("io: migrate: new socket failed: {}\n", .{err});
             return;
         };
@@ -6192,7 +6186,7 @@ pub const Client = struct {
         std.posix.setsockopt(new_sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(new_sock);
 
-        std.posix.close(self.sock);
+        compat.close(self.sock);
         self.sock = new_sock;
 
         // Send a PING (frame type 0x01) on the new socket.  The server detects the
@@ -6220,7 +6214,7 @@ pub const Client = struct {
         if (self.conn.next_remote_cid != null) {
             self.conn.remote_cid = migration_dcid;
         }
-        _ = std.posix.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
+        _ = compat.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
             dbg("io: migrate: PING send failed: {}\n", .{err});
             return;
         };
@@ -6229,7 +6223,7 @@ pub const Client = struct {
 
     /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional)
     /// and the QPACK encoder stream (stream_id=6).
-    fn sendH3ClientControlStream(self: *Client, server: std.net.Address) void {
+    fn sendH3ClientControlStream(self: *Client, server: compat.Address) void {
         // Control stream (stream_id=2): stream type 0x00 + SETTINGS frame.
         // Advertise non-zero QPACK_MAX_TABLE_CAPACITY so the server knows it may
         // insert entries into our dynamic table (RFC 9204 §3.2.3).
@@ -6262,7 +6256,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         dbg("io: h3 client control stream sent\n", .{});
 
         // QPACK encoder stream (stream_id=6, next client-initiated unidirectional).
@@ -6310,7 +6304,7 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         dbg("io: h3 client QPACK encoder stream sent\n", .{});
     }
 
@@ -6349,16 +6343,16 @@ pub const Client = struct {
             self.conn.use_chacha20,
         ) catch return;
         self.conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         self.conn.qpack_dec_stream_off += pos;
         dbg("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
-    fn downloadUrls(self: *Client, server: std.net.Address) !void {
+    fn downloadUrls(self: *Client, server: compat.Address) !void {
         dbg("io: sending {} {s} requests\n", .{ self.active_urls.len, if (self.config.http3) @as([]const u8, "HTTP/3") else @as([]const u8, "HTTP/0.9") });
 
         // Ensure output directory exists
-        std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+        compat.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
         // HTTP/3: send client control stream once before any requests.
         if (self.config.http3 and !self.h3_client_control_sent) {
@@ -6409,7 +6403,7 @@ pub const Client = struct {
                 // Open output file
                 var dl_path_buf: [512]u8 = undefined;
                 const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
-                const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+                const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
                     dbg("io: cannot create {s}\n", .{dl_path});
                     continue;
                 };
@@ -6482,17 +6476,17 @@ pub const Client = struct {
                 ) catch continue;
                 self.conn.app_pn += 1;
 
-                _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+                _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
             }
 
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
             dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
-            const dl_deadline = std.time.milliTimestamp() + 60_000;
+            const dl_deadline = compat.milliTimestamp() + 60_000;
             var dl_iter: u32 = 0;
             while (true) {
                 dl_iter += 1;
-                const now = std.time.milliTimestamp();
+                const now = compat.milliTimestamp();
                 const remaining = dl_deadline - now;
 
                 if (remaining <= 0) {
@@ -6536,7 +6530,7 @@ pub const Client = struct {
                             self.conn.use_chacha20,
                         )) |pkt_len| {
                             self.conn.app_pn += 1;
-                            _ = std.posix.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                            _ = compat.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
                             dbg("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
                         } else |err| {
                             dbg("io: downloadUrls PING build failed: {}\n", .{err});
@@ -6599,8 +6593,8 @@ fn extractPacketNumber(buf: []const u8, pn_start: usize) ?u64 {
 /// IPv4 UDP sockets).  The connectionmigration test uses the dual-stack hostname
 /// "server46" which returns both IPv4 and IPv6 addresses; without the preference
 /// the first address is often IPv6 and sendto() silently fails on our IPv4 socket.
-fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
-    const list = try std.net.getAddressList(allocator, host, port);
+fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !compat.Address {
+    var list = try compat.getAddressList(allocator, host, port);
     defer list.deinit();
     if (list.addrs.len == 0) return error.HostNotFound;
     // Prefer IPv4 — our sockets are AF.INET only.

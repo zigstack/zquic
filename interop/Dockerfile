@@ -12,18 +12,16 @@
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates xz-utils \
+        curl ca-certificates xz-utils python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Fetch the latest 0.15.x dev tarball URL from the official JSON index so
-# we do not hardcode a version path that may not exist yet.
+# Fetch the 0.16.0 release tarball URL from the official JSON index.  The
+# JSON is an object whose top-level keys are version names; we read the
+# "0.16.0" entry's "x86_64-linux" tarball.
 RUN set -eux; \
     INDEX=$(curl -fsSL https://ziglang.org/download/index.json); \
     ZIG_URL=$(echo "$INDEX" \
-        | grep -o '"x86_64-linux":[^}]*' \
-        | grep -o '"tarball":"[^"]*"' \
-        | head -1 \
-        | sed 's/"tarball":"//;s/"//g'); \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["0.16.0"]["x86_64-linux"]["tarball"])'); \
     echo "Downloading Zig from: ${ZIG_URL}"; \
     curl -fsSL "${ZIG_URL}" -o /tmp/zig.tar.xz; \
     mkdir -p /usr/local/zig; \

@@ -98,7 +98,7 @@ SIZE_MB=100 RUNS=5 bash bench/local_compare.sh zquic quiche ngtcp2
 
 ## Requirements
 
-- Zig **0.15.x**
+- Zig **0.16.x**
 
 ## Building
 
@@ -238,7 +238,7 @@ src/
   cmd/
     server.zig            QUIC server binary
     client.zig            QUIC client binary
-vendor/tls/               ianic/tls.zig @ 34248f38c189 (Zig 0.15 compatible)
+vendor/tls/               ianic/tls.zig @ 34248f38c189 (locally patched for Zig 0.16)
 interop/
   Dockerfile              Self-contained local build
   Dockerfile.prebuilt     CI-optimised image from pre-built binaries

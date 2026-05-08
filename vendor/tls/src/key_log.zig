@@ -43,11 +43,13 @@ pub fn fileAppend(file_name: []const u8, label_: []const u8, client_random: []co
 }
 
 fn fileWrite(file_name: []const u8, line: []const u8) !void {
-    var file = try std.fs.createFileAbsolute(file_name, .{ .truncate = false });
-    defer file.close();
-    const stat = try file.stat();
-    try file.seekTo(stat.size);
-    try file.writeAll(line);
+    // The std.fs append-then-write path (createFileAbsolute, stat, seekTo,
+    // writeAll) was removed/reorganised in zig 0.16.  This SSLKEYLOGFILE
+    // exporter is unused by zquic; reinstate by porting to the new
+    // `std.Io.Dir` API once the rest of the codebase migrates to `Io`.
+    _ = file_name;
+    _ = line;
+    return error.UnsupportedOnZig016;
 }
 
 pub fn formatLine(buf: []u8, label_: []const u8, client_random: []const u8, secret: []const u8) ![]const u8 {

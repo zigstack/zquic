@@ -6,7 +6,7 @@
 # loopback throughput tests.  Ideal for fast iteration on macOS/Linux.
 #
 # Prerequisites:
-#   - zquic: Zig 0.15+
+#   - zquic: Zig 0.16+
 #   - quiche: Rust toolchain (cargo)
 #   - ngtcp2: cmake, autoconf, automake, libtool, pkg-config
 #   - openssl (for cert generation)
