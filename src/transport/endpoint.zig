@@ -12,6 +12,7 @@
 //! whatever capacity and eviction policy they need.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const types = @import("../types.zig");
 const connection = @import("connection.zig");
 const packet = @import("../packet/packet.zig");
@@ -43,9 +44,9 @@ pub const Endpoint = struct {
     conn_count: usize = 0,
 
     /// Local UDP address.
-    local_addr: std.net.Address,
+    local_addr: compat.Address,
 
-    pub fn init(role: connection.Role, addr: std.net.Address) Endpoint {
+    pub fn init(role: connection.Role, addr: compat.Address) Endpoint {
         return .{ .role = role, .local_addr = addr };
     }
 
@@ -105,7 +106,7 @@ pub const Endpoint = struct {
 
             // Server: create new connection on Initial packet
             if (self.role == .server and lh.header.packet_type == .initial) {
-                const local_cid = ConnectionId.random(std.crypto.random, 8);
+                const local_cid = ConnectionId.random(compat.random, 8);
                 var new_conn = Connection.init(.server, local_cid, dcid);
                 new_conn.deriveInitialKeys(dcid);
                 _ = self.addConnection(new_conn) catch return .discarded;
@@ -135,7 +136,7 @@ pub const Endpoint = struct {
 test "endpoint: add and find connection" {
     const testing = std.testing;
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
+    const addr = try compat.Address.parseIp4("127.0.0.1", 4433);
     var ep = Endpoint.init(.server, addr);
 
     const lcid = try ConnectionId.fromSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
@@ -153,7 +154,7 @@ test "endpoint: add and find connection" {
 }
 
 test "endpoint: discard short unknown packet" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
+    const addr = try compat.Address.parseIp4("127.0.0.1", 4433);
     var ep = Endpoint.init(.server, addr);
 
     // A short header packet with unknown CID
@@ -163,7 +164,7 @@ test "endpoint: discard short unknown packet" {
 }
 
 test "endpoint: version negotiation discarded" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 4433);
+    const addr = try compat.Address.parseIp4("127.0.0.1", 4433);
     var ep = Endpoint.init(.server, addr);
 
     var vn_buf: [32]u8 = undefined;

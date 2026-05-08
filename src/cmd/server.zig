@@ -101,13 +101,24 @@ fn parseArgs(args: []const []const u8) !Config {
     return cfg;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Collect CLI args from the new 0.16 Args iterator into a []const []const u8
+    // slice so the existing parseArgs signature does not have to change.
+    var arg_it = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+    defer arg_it.deinit();
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (args_list.items) |s| allocator.free(s);
+        args_list.deinit(allocator);
+    }
+    while (arg_it.next()) |a| {
+        try args_list.append(allocator, try allocator.dupe(u8, a));
+    }
+    const args = args_list.items;
 
     const cfg = parseArgs(args) catch |err| {
         std.debug.print("Argument parse error: {}\n", .{err});

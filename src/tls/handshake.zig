@@ -19,6 +19,7 @@
 //!   quic_hp  = HKDF-Expand-Label(traffic_secret, "quic hp",  "", key_len)
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const crypto = std.crypto;
 const keys_mod = @import("../crypto/keys.zig");
 const quic_tls = @import("../crypto/quic_tls.zig");
@@ -334,7 +335,7 @@ pub fn buildServerHello(
     // Body: version(2) + random(32) + sid_len(1) + sid + cs(2) + comp(1) + exts
     const server_random = blk: {
         var r: [32]u8 = undefined;
-        crypto.random.bytes(&r);
+        compat.random.bytes(&r);
         break :blk r;
     };
 
@@ -643,7 +644,7 @@ pub fn buildClientHelloWithPsk(
     include_early_data: bool,
 ) !usize {
     var client_random: [32]u8 = undefined;
-    crypto.random.bytes(&client_random);
+    compat.random.bytes(&client_random);
 
     // Build all extensions except pre_shared_key into ext_buf.
     var ext_buf: [2048]u8 = undefined;
@@ -832,7 +833,7 @@ fn buildClientHelloInner(
     prefer_chacha20: bool,
 ) !usize {
     var client_random: [32]u8 = undefined;
-    crypto.random.bytes(&client_random);
+    compat.random.bytes(&client_random);
 
     // Build extensions
     var ext_buf: [2048]u8 = undefined;
@@ -974,7 +975,11 @@ pub const ServerHandshake = struct {
 
     pub fn init() ServerHandshake {
         return .{
-            .kp = X25519.KeyPair.generate(),
+            .kp = blk: {
+                var seed: [X25519.seed_length]u8 = undefined;
+                compat.random.bytes(&seed);
+                break :blk X25519.KeyPair.generateDeterministic(seed) catch unreachable;
+            },
             .transcript = Sha256.init(.{}),
             .secrets = .{},
             .handshake_secret = [_]u8{0} ** 32,
@@ -1132,7 +1137,11 @@ pub const ClientHandshake = struct {
 
     pub fn init() ClientHandshake {
         return .{
-            .kp = X25519.KeyPair.generate(),
+            .kp = blk: {
+                var seed: [X25519.seed_length]u8 = undefined;
+                compat.random.bytes(&seed);
+                break :blk X25519.KeyPair.generateDeterministic(seed) catch unreachable;
+            },
             .transcript = Sha256.init(.{}),
             .secrets = .{},
             .handshake_secret = [_]u8{0} ** 32,

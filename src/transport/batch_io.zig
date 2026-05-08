@@ -18,6 +18,7 @@
 //!   for (rb.entries[0..n]) |*e| processPacket(e.buf[0..e.len], e.addr);
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const types = @import("../types.zig");
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
@@ -39,7 +40,7 @@ pub const BATCH_SIZE: usize = 64;
 pub const SendEntry = struct {
     buf: [MAX_DATAGRAM_SIZE]u8 = undefined,
     len: usize = 0,
-    addr: std.net.Address = undefined,
+    addr: compat.Address = undefined,
 };
 
 /// Accumulate outgoing UDP datagrams and flush them in a single syscall.
@@ -49,7 +50,7 @@ pub const SendBatch = struct {
 
     /// Enqueue one datagram.  Returns true when the batch is full; the caller
     /// should then call flush() before enqueuing more.
-    pub fn enqueue(self: *SendBatch, buf: []const u8, addr: std.net.Address) bool {
+    pub fn enqueue(self: *SendBatch, buf: []const u8, addr: compat.Address) bool {
         if (self.count >= BATCH_SIZE) return true;
         const e = &self.entries[self.count];
         const n = @min(buf.len, MAX_DATAGRAM_SIZE);
@@ -71,7 +72,7 @@ pub const SendBatch = struct {
             flushLinux(sock, self.entries[0..cnt]);
         } else {
             for (self.entries[0..cnt]) |*e| {
-                _ = std.posix.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
             }
         }
     }
@@ -86,7 +87,9 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
 
     // One iovec per message (each datagram is a single contiguous buffer).
     var iovecs: [BATCH_SIZE]std.posix.iovec_const = undefined;
-    var msgs: [BATCH_SIZE]linux.mmsghdr_const = undefined;
+    // 0.16 dropped the `mmsghdr_const` alias; the layout is identical to
+    // `mmsghdr` so we reuse that for the send path.
+    var msgs: [BATCH_SIZE]linux.mmsghdr = undefined;
 
     var sent: usize = 0;
     while (sent < entries.len) {
@@ -120,7 +123,7 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
 pub const RecvEntry = struct {
     buf: [MAX_DATAGRAM_SIZE]u8 = undefined,
     len: usize = 0,
-    addr: std.net.Address = undefined,
+    addr: compat.Address = undefined,
 };
 
 /// Receive up to BATCH_SIZE UDP datagrams in a single syscall.
@@ -192,7 +195,7 @@ fn recvPortable(rb: *RecvBatch, sock: std.posix.socket_t, blocking_first: bool) 
         var src_addr: std.posix.sockaddr.storage = undefined;
         var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
         const flags: u32 = if (count == 0 and blocking_first) 0 else MSG_DONTWAIT;
-        const n = std.posix.recvfrom(
+        const n = compat.recvfrom(
             sock,
             &rb.entries[count].buf,
             flags,

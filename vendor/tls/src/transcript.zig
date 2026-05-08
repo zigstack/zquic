@@ -198,6 +198,13 @@ fn TranscriptT(comptime Hash: type) type {
         handshake_secret: ?[Hmac.mac_length]u8 = null,
         server_finished_key: [Hmac.key_length]u8 = undefined,
         client_finished_key: [Hmac.key_length]u8 = undefined,
+        // Scratch buffers backing slices returned by pskBinder /
+        // serverFinishedTls13 / clientFinishedTls13.  Storing on Self gives
+        // them stable storage tied to the caller-held pointer (zig 0.16
+        // rejects `return &local_array`).
+        psk_binder_buf: [Hash.digest_length]u8 = undefined,
+        server_fin_buf: [mac_length]u8 = undefined,
+        client_fin_buf: [mac_length]u8 = undefined,
 
         const Self = @This();
 
@@ -353,22 +360,19 @@ fn TranscriptT(comptime Hash: type) type {
 
             const prk = hkdfExpandLabel(Hkdf, secret, "res binder", &tls.emptyHash(Hash), Hash.digest_length);
             const expanded = hkdfExpandLabel(Hkdf, prk, "finished", "", Hash.digest_length);
-            var out: [Hash.digest_length]u8 = undefined;
-            Hmac.create(&out, &self.hash.peek(), &expanded);
-            return &out;
+            Hmac.create(&self.psk_binder_buf, &self.hash.peek(), &expanded);
+            return &self.psk_binder_buf;
         }
 
         inline fn serverFinishedTls13(self: *Self) []const u8 {
-            var buf: [mac_length]u8 = undefined;
-            Hmac.create(&buf, &self.hash.peek(), &self.server_finished_key);
-            return &buf;
+            Hmac.create(&self.server_fin_buf, &self.hash.peek(), &self.server_finished_key);
+            return &self.server_fin_buf;
         }
 
         // client finished message with header
         inline fn clientFinishedTls13(self: *Self) []const u8 {
-            var buf: [mac_length]u8 = undefined;
-            Hmac.create(&buf, &self.hash.peek(), &self.client_finished_key);
-            return &buf;
+            Hmac.create(&self.client_fin_buf, &self.hash.peek(), &self.client_finished_key);
+            return &self.client_fin_buf;
         }
     };
 }
@@ -381,7 +385,7 @@ inline fn pskBinder_(
     resumption_master_secret: [Hash.digest_length]u8,
     binder_hash: [Hash.digest_length]u8,
     ticket_nonce: []const u8,
-) []const u8 {
+) [Hash.digest_length]u8 {
     const Hmac = crypto.auth.hmac.Hmac(Hash);
     const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
 
@@ -391,7 +395,7 @@ inline fn pskBinder_(
     const expanded = hkdfExpandLabel(Hkdf, prk, "finished", "", Hash.digest_length);
     var binder: [Hash.digest_length]u8 = undefined;
     Hmac.create(&binder, &binder_hash, &expanded);
-    return &binder;
+    return binder;
 }
 
 // Example from: https://datatracker.ietf.org/doc/html/rfc8448#autoid-4
@@ -433,9 +437,6 @@ test pskBinder_ {
     try testing.expectEqualSlices(u8, &expected_binder, &binder);
 
     // test pskBinder function
-    try testing.expectEqualSlices(
-        u8,
-        &expected_binder,
-        pskBinder_(Hash, resumption_master_secret, binder_hash, &ticket_nonce),
-    );
+    const computed_binder = pskBinder_(Hash, resumption_master_secret, binder_hash, &ticket_nonce);
+    try testing.expectEqualSlices(u8, &expected_binder, &computed_binder);
 }
