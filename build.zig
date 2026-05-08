@@ -9,11 +9,18 @@ pub fn build(b: *std.Build) void {
     const opts = b.addOptions();
     opts.addOption(bool, "verbose", verbose);
 
+    // src/compat.zig calls libc directly (getaddrinfo, gettimeofday,
+    // arc4random_buf/getrandom, …) for the std-library replacements that were
+    // removed in zig 0.16.  macOS links libc by default, but on Linux zig
+    // builds without libc unless we ask, so every module that pulls in compat
+    // (or transitively pulls it via the zquic / tls modules) sets this.
+
     // tls module (vendored)
     const tls_mod = b.createModule(.{
         .root_source_file = b.path("vendor/tls/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Main library module (exposed as `zquic` for `build.zig.zon` dependents).
@@ -21,6 +28,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     zquic_mod.addImport("tls", tls_mod);
     zquic_mod.addOptions("build_options", opts);
@@ -37,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cmd/server.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     server_mod.addImport("zquic", zquic_mod);
     server_mod.addImport("tls", tls_mod);
@@ -52,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cmd/client.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     client_mod.addImport("zquic", zquic_mod);
     client_mod.addImport("tls", tls_mod);
@@ -80,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/crypto_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .link_libc = true,
         });
         const exe = b.addExecutable(.{ .name = "crypto_bench", .root_module = m });
         const run = b.addRunArtifact(exe);
@@ -92,6 +103,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/throughput_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .link_libc = true,
         });
         const exe = b.addExecutable(.{ .name = "throughput_bench", .root_module = m });
         const run = b.addRunArtifact(exe);
@@ -109,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/qpack_bench.zig"),
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .link_libc = true,
         });
         m.addImport("zquic", zquic_mod);
         const exe = b.addExecutable(.{ .name = "qpack_bench", .root_module = m });
@@ -130,6 +143,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(src),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         ex_mod.addImport("zquic", zquic_mod);
         const ex = b.addExecutable(.{

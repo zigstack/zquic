@@ -65,8 +65,8 @@ fn ensureCert() !void {
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -76,7 +76,7 @@ pub fn main() !void {
     var server_bin: []const u8 = "./zig-out/bin/server";
     var client_bin: []const u8 = "./zig-out/bin/client";
 
-    var args = try std.process.argsWithAllocator(alloc);
+    var args = try std.process.Args.Iterator.initAllocator(init.args, alloc);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
     while (args.next()) |arg| {
