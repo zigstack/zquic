@@ -495,6 +495,36 @@ pub fn buildCertificate(out: []u8, cert_der: []const u8) !usize {
     return pos;
 }
 
+fn readTlsHandshakeU24Cert(buf: []const u8, pos: usize) error{MalformedCertificate}!struct { v: u32, next: usize } {
+    if (pos + 3 > buf.len) return error.MalformedCertificate;
+    const v = (@as(u32, buf[pos]) << 16) | (@as(u32, buf[pos + 1]) << 8) | @as(u32, buf[pos + 2]);
+    return .{ .v = v, .next = pos + 3 };
+}
+
+/// First certificate entry DER from a TLS 1.3 `Certificate` handshake message (type `0x0b`).
+/// `message` is the full message: type (1) + length (3) + body.
+pub fn leafCertificateDerFromCertificateHandshakeMessage(message: []const u8) error{MalformedCertificate}![]const u8 {
+    if (message.len < 4) return error.MalformedCertificate;
+    if (message[0] != MSG_CERTIFICATE) return error.MalformedCertificate;
+    const lh = try readTlsHandshakeU24Cert(message, 1);
+    const body_end = lh.next + lh.v;
+    if (body_end > message.len) return error.MalformedCertificate;
+    const body = message[lh.next..body_end];
+    if (body.len < 1) return error.MalformedCertificate;
+    const ctx_len = body[0];
+    const after_ctx = 1 + ctx_len;
+    if (after_ctx > body.len) return error.MalformedCertificate;
+    const list_h = try readTlsHandshakeU24Cert(body, after_ctx);
+    const list_end = list_h.next + list_h.v;
+    if (list_end > body.len) return error.MalformedCertificate;
+    const list = body[list_h.next..list_end];
+    if (list.len < 3) return error.MalformedCertificate;
+    const cert_len_h = try readTlsHandshakeU24Cert(list, 0);
+    const cert_end = cert_len_h.next + cert_len_h.v;
+    if (cert_end > list.len) return error.MalformedCertificate;
+    return list[cert_len_h.next..cert_end];
+}
+
 // ── CertificateVerify builder ─────────────────────────────────────────────────
 
 /// TLS 1.3 CertificateVerify content prefix: 64 spaces + context string + 0x00.
@@ -1123,6 +1153,9 @@ pub const ServerHandshake = struct {
 
 // ── Client handshake state machine ───────────────────────────────────────────
 
+/// Upper bound for the captured server leaf certificate on [`ClientHandshake`] (libp2p TLS identity).
+pub const max_peer_leaf_cert_bytes: usize = 16384;
+
 /// Client-side TLS 1.3 handshake state for QUIC.
 pub const ClientHandshake = struct {
     kp: X25519.KeyPair,
@@ -1134,6 +1167,9 @@ pub const ClientHandshake = struct {
     cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
     /// The 32-byte random value from ClientHello (needed for NSS keylog format).
     client_random: [32]u8 = [_]u8{0} ** 32,
+    /// Server leaf certificate (DER) from the first `Certificate` message in the server flight.
+    peer_leaf_cert_der: [max_peer_leaf_cert_bytes]u8 = undefined,
+    peer_leaf_cert_der_len: u16 = 0,
 
     pub fn init() ClientHandshake {
         return .{
@@ -1296,8 +1332,17 @@ pub const ClientHandshake = struct {
 
             const msg = hs_bytes[p..msg_end];
             switch (msg_type) {
-                MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE, MSG_CERTIFICATE_VERIFY => {
+                MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE_VERIFY => {
                     self.transcript.update(msg);
+                },
+                MSG_CERTIFICATE => {
+                    self.transcript.update(msg);
+                    if (self.peer_leaf_cert_der_len == 0) {
+                        const leaf = try leafCertificateDerFromCertificateHandshakeMessage(msg);
+                        if (leaf.len > max_peer_leaf_cert_bytes) return error.PeerLeafCertificateTooLarge;
+                        @memcpy(self.peer_leaf_cert_der[0..leaf.len], leaf);
+                        self.peer_leaf_cert_der_len = @intCast(leaf.len);
+                    }
                 },
                 MSG_FINISHED => {
                     // Verify server Finished
@@ -1443,6 +1488,15 @@ test "handshake: build and parse ServerHello" {
     const n = try buildServerHello(&buf, &session_id, TLS_AES_128_GCM_SHA256, &pub_key, false);
     try testing.expect(n > 4);
     try testing.expectEqual(MSG_SERVER_HELLO, buf[0]);
+}
+
+test "leafCertificateDerFromCertificateHandshakeMessage round trip" {
+    const testing = std.testing;
+    const der_in = [_]u8{ 0x30, 0x05, 0x30, 0x03, 0x01, 0x02, 0x03 };
+    var buf: [256]u8 = undefined;
+    const n = try buildCertificate(&buf, &der_in);
+    const leaf = try leafCertificateDerFromCertificateHandshakeMessage(buf[0..n]);
+    try testing.expectEqualSlices(u8, &der_in, leaf);
 }
 
 test "handshake: client-server secrets are mirrored" {

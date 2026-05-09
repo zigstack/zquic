@@ -4691,6 +4691,14 @@ pub const Client = struct {
         self.processPacket(buf);
     }
 
+    /// Server leaf certificate (DER) from the TLS handshake, if the server sent a `Certificate` message.
+    /// Populated after the handshake completes (same timing as `conn.phase == .connected`).
+    pub fn peerLeafCertificateDer(self: *const Client) ?[]const u8 {
+        const n = self.tls.peer_leaf_cert_der_len;
+        if (n == 0) return null;
+        return self.tls.peer_leaf_cert_der[0..n];
+    }
+
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
     pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
         const now = compat.milliTimestamp();
