@@ -685,6 +685,56 @@ const Http3OutSlot = struct {
     }
 };
 
+/// One out-of-order STREAM chunk waiting until `next_offset` reaches `off`.
+const RawAppPendingFrame = struct {
+    off: u64,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *RawAppPendingFrame, allocator: std.mem.Allocator) void {
+        self.data.deinit(allocator);
+    }
+};
+
+/// Append stream bytes and splice any buffered gaps that become contiguous.
+fn rawAppStreamReceiveFrame(allocator: std.mem.Allocator, slot: *RawAppStreamSlot, o: u64, d: []const u8) std.mem.Allocator.Error!void {
+    const frame_end = o + @as(u64, @intCast(d.len));
+    if (frame_end <= slot.next_offset) return;
+
+    if (o > slot.next_offset) {
+        for (slot.out_of_order.items) |p| {
+            if (p.off == o) return;
+        }
+        var copy = std.ArrayListUnmanaged(u8).empty;
+        try copy.appendSlice(allocator, d);
+        try slot.out_of_order.append(allocator, .{ .off = o, .data = copy });
+        try rawAppStreamFlushPending(allocator, slot);
+        return;
+    }
+
+    const start: usize = @intCast(slot.next_offset - o);
+    try slot.buf.appendSlice(allocator, d[start..]);
+    slot.next_offset = frame_end;
+    try rawAppStreamFlushPending(allocator, slot);
+}
+
+/// Merge pending chunks whose start offset matches `next_offset` (may chain).
+fn rawAppStreamFlushPending(allocator: std.mem.Allocator, slot: *RawAppStreamSlot) std.mem.Allocator.Error!void {
+    while (true) {
+        var found: ?usize = null;
+        for (slot.out_of_order.items, 0..) |p, i| {
+            if (p.off == slot.next_offset) {
+                found = i;
+                break;
+            }
+        }
+        const idx = found orelse return;
+        var pending = slot.out_of_order.swapRemove(idx);
+        defer pending.deinit(allocator);
+        try slot.buf.appendSlice(allocator, pending.data.items);
+        slot.next_offset += @as(u64, @intCast(pending.data.items.len));
+    }
+}
+
 /// Receive buffer for one QUIC stream when `ServerConfig.raw_application_streams` /
 /// `ClientConfig.raw_application_streams` is enabled (opaque bytes, no HTTP parsing).
 pub const RawAppStreamSlot = struct {
@@ -693,8 +743,14 @@ pub const RawAppStreamSlot = struct {
     /// Next contiguous byte offset expected; bytes [0..next_offset) are in `buf`.
     next_offset: u64 = 0,
     buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// STREAM frames that arrived ahead of `next_offset` (UDP reordering).
+    out_of_order: std.ArrayListUnmanaged(RawAppPendingFrame) = .empty,
 
     pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
+        for (self.out_of_order.items) |*p| {
+            p.deinit(allocator);
+        }
+        self.out_of_order.deinit(allocator);
         self.buf.deinit(allocator);
         self.* = .{};
     }
@@ -3603,18 +3659,7 @@ pub const Server = struct {
             return;
         };
 
-        const o = sf.offset;
-        const d = sf.data;
-        const frame_end = o + @as(u64, @intCast(d.len));
-        if (frame_end <= slot.next_offset) return;
-        if (o > slot.next_offset) {
-            dbg("io: raw app server gap stream_id={} off={} need={}\n", .{ sf.stream_id, o, slot.next_offset });
-            return;
-        }
-        const start = @as(usize, @intCast(slot.next_offset - o));
-        const to_copy = d[start..];
-        slot.buf.appendSlice(self.allocator, to_copy) catch return;
-        slot.next_offset = frame_end;
+        rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
@@ -5800,7 +5845,11 @@ pub const Client = struct {
     /// last flush.  Called once per recv-drain cycle from downloadUrls so that
     /// the server can clear awaiting_fin_ack slots without flooding the NS3
     /// network simulator queue.
-    fn flushDeferredAck(self: *Client) void {
+    ///
+    /// External recv loops that use [`feedPacket`] instead of [`run`] must call
+    /// this after processing inbound datagrams (typically once per event-loop
+    /// iteration) so the peer receives ACKs and keeps sending application data.
+    pub fn flushDeferredAck(self: *Client) void {
         const largest_pn = self.deferred_ack_pn orelse return;
         self.deferred_ack_pn = null;
         // Compute first_ack_range: covers [min_pn .. largest_pn] assuming all
@@ -5974,18 +6023,7 @@ pub const Client = struct {
             return;
         };
 
-        const o = sf.offset;
-        const d = sf.data;
-        const frame_end = o + @as(u64, @intCast(d.len));
-        if (frame_end <= slot.next_offset) return;
-        if (o > slot.next_offset) {
-            dbg("io: raw app client gap stream_id={} off={} need={}\n", .{ sf.stream_id, o, slot.next_offset });
-            return;
-        }
-        const start = @as(usize, @intCast(slot.next_offset - o));
-        const to_copy = d[start..];
-        slot.buf.appendSlice(self.allocator, to_copy) catch return;
-        slot.next_offset = frame_end;
+        rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
