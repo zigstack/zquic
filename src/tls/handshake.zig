@@ -39,6 +39,7 @@ pub const MSG_SERVER_HELLO: u8 = 0x02;
 pub const MSG_NEW_SESSION_TICKET: u8 = 0x04;
 pub const MSG_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 pub const MSG_CERTIFICATE: u8 = 0x0b;
+pub const MSG_CERTIFICATE_REQUEST: u8 = 0x0d;
 pub const MSG_CERTIFICATE_VERIFY: u8 = 0x0f;
 pub const MSG_FINISHED: u8 = 0x14;
 
@@ -52,6 +53,8 @@ pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = quic_tls.TRANSPORT_PARAMS_EXT_TYPE;
 pub const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 pub const EXT_EARLY_DATA: u16 = 0x002a;
+/// RFC 8446 `signature_algorithms` (required in TLS 1.3 `CertificateRequest`).
+pub const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 
 // TLS cipher suites
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -502,9 +505,10 @@ fn readTlsHandshakeU24Cert(buf: []const u8, pos: usize) error{MalformedCertifica
     return .{ .v = v, .next = pos + 3 };
 }
 
-/// First certificate entry DER from a TLS 1.3 `Certificate` handshake message (type `0x0b`).
+/// First certificate entry DER from a TLS 1.3 `Certificate` handshake message (type `0x0b`), or
+/// `null` when the certificate list is empty (anonymous client after `CertificateRequest`).
 /// `message` is the full message: type (1) + length (3) + body.
-pub fn leafCertificateDerFromCertificateHandshakeMessage(message: []const u8) error{MalformedCertificate}![]const u8 {
+pub fn leafCertificateDerFromCertificateHandshakeMessageOptional(message: []const u8) error{MalformedCertificate}!?[]const u8 {
     if (message.len < 4) return error.MalformedCertificate;
     if (message[0] != MSG_CERTIFICATE) return error.MalformedCertificate;
     const lh = try readTlsHandshakeU24Cert(message, 1);
@@ -519,11 +523,56 @@ pub fn leafCertificateDerFromCertificateHandshakeMessage(message: []const u8) er
     const list_end = list_h.next + list_h.v;
     if (list_end > body.len) return error.MalformedCertificate;
     const list = body[list_h.next..list_end];
+    if (list.len == 0) return null;
     if (list.len < 3) return error.MalformedCertificate;
     const cert_len_h = try readTlsHandshakeU24Cert(list, 0);
     const cert_end = cert_len_h.next + cert_len_h.v;
     if (cert_end > list.len) return error.MalformedCertificate;
     return list[cert_len_h.next..cert_end];
+}
+
+/// First certificate entry DER from a TLS 1.3 `Certificate` handshake message (type `0x0b`).
+/// `message` is the full message: type (1) + length (3) + body.
+pub fn leafCertificateDerFromCertificateHandshakeMessage(message: []const u8) error{MalformedCertificate}![]const u8 {
+    return (try leafCertificateDerFromCertificateHandshakeMessageOptional(message)) orelse error.MalformedCertificate;
+}
+
+/// TLS 1.3 `CertificateRequest` with `signature_algorithms` (ECDSA P-256 / P-384), matching
+/// [`buildClientCertificateVerify`] schemes supported by this stack.
+pub fn buildCertificateRequest(out: []u8) !usize {
+    var ext_buf: [16]u8 = undefined;
+    var ep: usize = 0;
+    writeU16(ext_buf[ep..], EXT_SIGNATURE_ALGORITHMS);
+    ep += 2;
+    const algo_bytes: [4]u8 = .{ 0x04, 0x03, 0x05, 0x03 };
+    writeU16(ext_buf[ep..], algo_bytes.len);
+    ep += 2;
+    @memcpy(ext_buf[ep..][0..algo_bytes.len], &algo_bytes);
+    ep += algo_bytes.len;
+
+    const body_len = 1 + 2 + ep;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CERTIFICATE_REQUEST, body_len);
+    out[pos] = 0;
+    pos += 1;
+    writeU16(out[pos..], @intCast(ep));
+    pos += 2;
+    @memcpy(out[pos..][0..ep], ext_buf[0..ep]);
+    pos += ep;
+    return pos;
+}
+
+/// TLS 1.3 `Certificate` handshake message with an empty certificate list (client has no cert).
+pub fn buildEmptyCertificate(out: []u8) !usize {
+    const body_len = 1 + 3;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CERTIFICATE, body_len);
+    out[pos] = 0;
+    pos += 1;
+    writeU24(out[pos..], 0);
+    pos += 3;
+    return pos;
 }
 
 // ── CertificateVerify builder ─────────────────────────────────────────────────
@@ -1153,6 +1202,7 @@ pub const ServerHandshake = struct {
         private_key: *const tls_vendor.config.PrivateKey,
         quic_tp: []const u8,
         alpn: ?[]const u8,
+        request_client_certificate: bool,
         out: []u8,
     ) !usize {
         var pos: usize = 0;
@@ -1165,6 +1215,11 @@ pub const ServerHandshake = struct {
         // RFC 8446 §4.4: when PSK is in use the server authenticates via the
         // PSK binder, not via a certificate.  Skip Certificate + CertificateVerify.
         if (!self.accept_psk) {
+            if (request_client_certificate) {
+                const cr_len = try buildCertificateRequest(out[pos..]);
+                self.transcript.update(out[pos .. pos + cr_len]);
+                pos += cr_len;
+            }
             // Certificate
             const cert_len = try buildCertificate(out[pos..], cert_der);
             self.transcript.update(out[pos .. pos + cert_len]);
@@ -1214,10 +1269,11 @@ pub const ServerHandshake = struct {
                     MSG_CERTIFICATE => {
                         self.transcript.update(msg);
                         if (self.peer_leaf_cert_der_len == 0) {
-                            const leaf = try leafCertificateDerFromCertificateHandshakeMessage(msg);
-                            if (leaf.len > max_peer_leaf_cert_bytes) return error.PeerLeafCertificateTooLarge;
-                            @memcpy(self.peer_leaf_cert_der[0..leaf.len], leaf);
-                            self.peer_leaf_cert_der_len = @intCast(leaf.len);
+                            if (try leafCertificateDerFromCertificateHandshakeMessageOptional(msg)) |leaf| {
+                                if (leaf.len > max_peer_leaf_cert_bytes) return error.PeerLeafCertificateTooLarge;
+                                @memcpy(self.peer_leaf_cert_der[0..leaf.len], leaf);
+                                self.peer_leaf_cert_der_len = @intCast(leaf.len);
+                            }
                         }
                     },
                     MSG_CERTIFICATE_VERIFY => {
@@ -1439,6 +1495,7 @@ pub const ClientHandshake = struct {
         // Walk through messages
         var p: usize = 0;
         var found_finished = false;
+        var saw_certificate_request = false;
         while (p + 4 <= hs_bytes.len) {
             const msg_type = hs_bytes[p];
             const msg_len = readU24(hs_bytes[p + 1 ..]);
@@ -1447,7 +1504,8 @@ pub const ClientHandshake = struct {
 
             const msg = hs_bytes[p..msg_end];
             switch (msg_type) {
-                MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE_VERIFY => {
+                MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE_VERIFY, MSG_CERTIFICATE_REQUEST => {
+                    if (msg_type == MSG_CERTIFICATE_REQUEST) saw_certificate_request = true;
                     self.transcript.update(msg);
                 },
                 MSG_CERTIFICATE => {
@@ -1496,6 +1554,20 @@ pub const ClientHandshake = struct {
             const cv_len = try buildClientCertificateVerify(out[out_pos..], &cv_hash, m.private_key);
             self.transcript.update(out[out_pos..][0..cv_len]);
             out_pos += cv_len;
+
+            const fin_hash = peekHash(self.transcript);
+            const fin_len = buildFinished(out[out_pos..], self.secrets.client_handshake, &fin_hash);
+            self.transcript.update(out[out_pos..][0..fin_len]);
+            out_pos += fin_len;
+            self.handshake_done = true;
+            return out_pos;
+        }
+
+        if (saw_certificate_request) {
+            var out_pos: usize = 0;
+            const cert_len = try buildEmptyCertificate(out[out_pos..]);
+            self.transcript.update(out[out_pos..][0..cert_len]);
+            out_pos += cert_len;
 
             const fin_hash = peekHash(self.transcript);
             const fin_len = buildFinished(out[out_pos..], self.secrets.client_handshake, &fin_hash);

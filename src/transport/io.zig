@@ -1183,6 +1183,9 @@ pub const ServerConfig = struct {
     /// Deliver incoming STREAM frames to `RawAppStreamSlot` buffers instead of
     /// parsing HTTP/0.9 or HTTP/3. Typically combined with `alpn`.
     raw_application_streams: bool = false,
+    /// Send TLS 1.3 `CertificateRequest` in the server flight (mutual TLS / libp2p-on-QUIC).
+    /// Clients without a client certificate respond with an empty `Certificate` message.
+    request_client_certificate: bool = false,
     /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
     max_udp_payload: ?u16 = null,
 };
@@ -2129,6 +2132,7 @@ pub const Server = struct {
             &self.private_key,
             quic_tp,
             alpn,
+            self.config.request_client_certificate,
             &conn.flight_bytes,
         ) catch |err| {
             dbg("io: buildServerFlight failed: {}\n", .{err});
