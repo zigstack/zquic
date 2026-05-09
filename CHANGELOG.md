@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.2] - 2026-05-09
+
+### Added
+
+- **`Client.peerLeafCertificateDer()`** — exposes the server's leaf
+  certificate as DER bytes after handshake completion (PR #122).
+  Embedders (e.g. a Zig libp2p PeerId derivation layer) can read the
+  raw cert without re-parsing the TLS handshake. Lifetime is the
+  client's; copy if you need it past `deinit`.
+
+### Changed
+
+- **TLS client leaf-cert capture.** `ClientHandshake.processServerFlight`
+  now parses the first DER-encoded certificate from the TLS 1.3
+  `Certificate` handshake message and stores up to 16 KiB on the client
+  state. Existing handshake behaviour is unchanged.
+
+---
+
 ## [v1.6.1] - 2026-05-09
 
 ### Fixed
@@ -341,7 +360,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.2...HEAD
+[v1.6.2]: https://github.com/ch4r10t33r/zquic/compare/v1.6.1...v1.6.2
 [v1.6.1]: https://github.com/ch4r10t33r/zquic/compare/v1.6.0...v1.6.1
 [v1.6.0]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...v1.6.0
 [v1.5.0]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...v1.5.0
