@@ -2430,10 +2430,10 @@ pub const Server = struct {
     }
 
     fn handleHandshakeCrypto(self: *Server, conn: *ConnState, data: []const u8, src: compat.Address) void {
-        if (data.len < 4 or data[0] != tls_hs.MSG_FINISHED) return;
+        if (data.len < 4) return;
 
-        conn.tls.processClientFinished(data) catch |err| {
-            dbg("io: client Finished verify failed: {}\n", .{err});
+        conn.tls.processClientHandshakeInbound(data) catch |err| {
+            dbg("io: client post-handshake TLS failed: {}\n", .{err});
             return;
         };
 
@@ -4423,6 +4423,9 @@ pub const ClientConfig = struct {
     raw_application_streams: bool = false,
     /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
     max_udp_payload: ?u16 = null,
+    /// Non-empty together with [`client_key_path`]: present this cert + key after the server flight (mutual TLS).
+    client_cert_path: []const u8 = "",
+    client_key_path: []const u8 = "",
 };
 
 /// TLS ALPN value for `ClientConfig`.
@@ -4482,6 +4485,13 @@ pub fn rawAppRecvBuffer(conn: *ConnState, stream_id: u64) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Client leaf certificate (DER) on a **server** `ConnState` after mutual TLS.
+pub fn serverConnPeerLeafCertificateDer(conn: *const ConnState) ?[]const u8 {
+    const n = conn.tls.peer_leaf_cert_der_len;
+    if (n == 0) return null;
+    return conn.tls.peer_leaf_cert_der[0..n];
 }
 
 // ── Stream download tracker ───────────────────────────────────────────────────
@@ -4567,6 +4577,14 @@ pub const Client = struct {
     client_hello_bytes: [2048]u8 = [_]u8{0} ** 2048,
     client_hello_len: usize = 0,
 
+    /// TLS payload after the server flight (Finished-only or Certificate+CertificateVerify+Finished), for retransmit.
+    client_hs_tail_buf: [tls_hs.max_peer_leaf_cert_bytes + 512]u8 = undefined,
+    client_hs_tail_len: usize = 0,
+    /// Loaded from [`ClientConfig.client_cert_path`] when mutual TLS is enabled.
+    client_cert_der: []u8 = &.{},
+    client_cert_owned: bool = false,
+    client_private_key: tls_vendor.config.PrivateKey = undefined,
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         errdefer compat.close(sock);
@@ -4612,6 +4630,16 @@ pub const Client = struct {
             conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
         }
 
+        var client_cert_der: []u8 = &.{};
+        var client_cert_owned: bool = false;
+        var client_private_key: tls_vendor.config.PrivateKey = undefined;
+        if (config.client_cert_path.len > 0 and config.client_key_path.len > 0) {
+            client_cert_der = try loadCertDer(allocator, config.client_cert_path);
+            errdefer allocator.free(client_cert_der);
+            client_private_key = try loadPrivateKey(allocator, config.client_key_path);
+            client_cert_owned = true;
+        }
+
         return .{
             .allocator = allocator,
             .config = config,
@@ -4620,6 +4648,9 @@ pub const Client = struct {
             .conn = conn,
             .active_urls = config.urls,
             .owns_socket = true,
+            .client_cert_der = client_cert_der,
+            .client_cert_owned = client_cert_owned,
+            .client_private_key = client_private_key,
         };
     }
 
@@ -4665,6 +4696,16 @@ pub const Client = struct {
             conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
         }
 
+        var client_cert_der: []u8 = &.{};
+        var client_cert_owned: bool = false;
+        var client_private_key: tls_vendor.config.PrivateKey = undefined;
+        if (config.client_cert_path.len > 0 and config.client_key_path.len > 0) {
+            client_cert_der = try loadCertDer(allocator, config.client_cert_path);
+            errdefer allocator.free(client_cert_der);
+            client_private_key = try loadPrivateKey(allocator, config.client_key_path);
+            client_cert_owned = true;
+        }
+
         return .{
             .allocator = allocator,
             .config = config,
@@ -4673,10 +4714,16 @@ pub const Client = struct {
             .conn = conn,
             .active_urls = config.urls,
             .owns_socket = take_ownership,
+            .client_cert_der = client_cert_der,
+            .client_cert_owned = client_cert_owned,
+            .client_private_key = client_private_key,
         };
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.client_cert_owned) {
+            self.allocator.free(self.client_cert_der);
+        }
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);
         }
@@ -4708,15 +4755,9 @@ pub const Client = struct {
             self.sendClientHello(server_addr) catch {};
         }
         if (self.conn.has_hs_keys and self.conn.phase != .connected and
-            self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
+            self.client_hs_tail_len > 0 and now - self.conn.finished_sent_ms >= 500)
         {
-            _ = compat.sendto(
-                self.sock,
-                self.conn.finished_pkt[0..self.conn.finished_pkt_len],
-                0,
-                &server_addr.any,
-                server_addr.getOsSockLen(),
-            ) catch {};
+            self.flushClientHandshakeTailPacketsTo(server_addr);
             self.conn.finished_sent_ms = now;
         }
     }
@@ -4884,6 +4925,7 @@ pub const Client = struct {
         self.initial_pkt_len = 0;
         self.client_hello_bytes = [_]u8{0} ** 2048;
         self.client_hello_len = 0;
+        self.client_hs_tail_len = 0;
         // Clear 0-RTT state so the new connection starts fresh.
         self.early_km = null;
         self.zerortt_pn = 0;
@@ -4929,15 +4971,9 @@ pub const Client = struct {
                 last_initial_ms = now;
             }
             if (self.conn.has_hs_keys and self.conn.phase != .connected and
-                self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
+                self.client_hs_tail_len > 0 and now - self.conn.finished_sent_ms >= 500)
             {
-                _ = compat.sendto(
-                    self.sock,
-                    self.conn.finished_pkt[0..self.conn.finished_pkt_len],
-                    0,
-                    &server_addr.any,
-                    server_addr.getOsSockLen(),
-                ) catch {};
+                self.flushClientHandshakeTailPacketsTo(server_addr);
                 self.conn.finished_sent_ms = now;
             }
 
@@ -5509,8 +5545,12 @@ pub const Client = struct {
             const cdata = plaintext[fpos .. fpos + dlen];
 
             // Process server flight messages
-            var fin_buf: [128]u8 = undefined;
-            const fin_len = self.tls.processServerFlight(cdata, &fin_buf) catch |err| {
+            var flight_buf: [tls_hs.max_peer_leaf_cert_bytes + 512]u8 = undefined;
+            const mutual: ?tls_hs.ClientMutualTlsCredentials = if (self.client_cert_der.len > 0) .{
+                .cert_der = self.client_cert_der,
+                .private_key = &self.client_private_key,
+            } else null;
+            const tail_len = self.tls.processServerFlight(cdata, flight_buf[0..], mutual) catch |err| {
                 if (err != error.NoServerFinished) {
                     dbg("io: processServerFlight error: {}\n", .{err});
                 }
@@ -5520,38 +5560,60 @@ pub const Client = struct {
             // App secrets are now derived; update QUIC 1-RTT keys.
             self.conn.deriveAppKeys(&self.tls.secrets);
 
-            // Send client Finished
-            self.sendClientFinished(fin_buf[0..fin_len]);
+            self.sendClientHandshakeTail(flight_buf[0..tail_len]);
             break;
         }
     }
 
-    fn sendClientFinished(self: *Client, fin_bytes: []const u8) void {
+    fn flushClientHandshakeTailPacketsTo(self: *Client, dst: compat.Address) void {
+        if (!self.conn.has_hs_keys or self.client_hs_tail_len == 0) return;
+
+        const max_crypto_per_pkt = 1100;
+        const flight = self.client_hs_tail_buf[0..self.client_hs_tail_len];
+        var offset: usize = 0;
+        while (offset < flight.len) {
+            var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const chunk_len = @min(flight.len - offset, max_crypto_per_pkt);
+            const crypto_len = buildCryptoFrame(
+                &frame_buf,
+                @intCast(offset),
+                flight[offset .. offset + chunk_len],
+            ) catch return;
+
+            var pkt_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = buildHandshakePacket(
+                &pkt_buf,
+                self.conn.remote_cid,
+                self.conn.local_cid,
+                frame_buf[0..crypto_len],
+                self.conn.hs_pn,
+                &self.conn.hs_client_km,
+                self.conn.quicVersion(),
+            ) catch return;
+            self.conn.hs_pn += 1;
+
+            _ = compat.sendto(
+                self.sock,
+                pkt_buf[0..pkt_len],
+                0,
+                &dst.any,
+                dst.getOsSockLen(),
+            ) catch {};
+
+            offset += chunk_len;
+        }
+    }
+
+    fn sendClientHandshakeTail(self: *Client, hs_bytes: []const u8) void {
         if (!self.conn.has_hs_keys) return;
-
-        var frame_buf: [256]u8 = undefined;
-
-        const crypto_len = buildCryptoFrame(&frame_buf, 0, fin_bytes) catch return;
-        const pkt_len = buildHandshakePacket(
-            &self.conn.finished_pkt,
-            self.conn.remote_cid,
-            self.conn.local_cid,
-            frame_buf[0..crypto_len],
-            self.conn.hs_pn,
-            &self.conn.hs_client_km,
-            self.conn.quicVersion(),
-        ) catch return;
-        self.conn.hs_pn += 1;
-        self.conn.finished_pkt_len = pkt_len;
+        if (hs_bytes.len > self.client_hs_tail_buf.len) {
+            dbg("io: client handshake tail too large ({})\n", .{hs_bytes.len});
+            return;
+        }
+        @memcpy(self.client_hs_tail_buf[0..hs_bytes.len], hs_bytes);
+        self.client_hs_tail_len = hs_bytes.len;
+        self.flushClientHandshakeTailPacketsTo(self.conn.peer);
         self.conn.finished_sent_ms = compat.milliTimestamp();
-
-        _ = compat.sendto(
-            self.sock,
-            self.conn.finished_pkt[0..pkt_len],
-            0,
-            &self.conn.peer.any,
-            self.conn.peer.getOsSockLen(),
-        ) catch {};
     }
 
     fn process1RttPacket(self: *Client, buf: []const u8) void {
