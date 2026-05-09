@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [v1.6.3] - 2026-05-08
+## [v1.6.3] - 2026-05-09
 
 ### Added
 
@@ -380,7 +380,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.2...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.3...HEAD
+[v1.6.3]: https://github.com/ch4r10t33r/zquic/compare/v1.6.2...v1.6.3
 [v1.6.2]: https://github.com/ch4r10t33r/zquic/compare/v1.6.1...v1.6.2
 [v1.6.1]: https://github.com/ch4r10t33r/zquic/compare/v1.6.0...v1.6.1
 [v1.6.0]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...v1.6.0
