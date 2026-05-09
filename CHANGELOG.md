@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.3] - 2026-05-08
+
+### Added
+
+- **Mutual TLS 1.3 on QUIC (client certificate flight).** When `ClientConfig.client_cert_path` and
+  `client_key_path` are both non-empty, the client sends `Certificate` + `CertificateVerify` + `Finished`
+  after the server flight. The server verifies the client `CertificateVerify` and optional `Finished`-only
+  clients remain supported.
+- **`transport.io.serverConnPeerLeafCertificateDer`** — read the captured client leaf DER from a server
+  `ConnState` after handshake completion when mutual TLS was used.
+
+### Changed
+
+- **`ServerHandshake.processClientHandshakeInbound`** replaces Finished-only handling in the QUIC server
+  CRYPTO path (`handleHandshakeCrypto`).
+- **Client handshake tail retransmit** may send multiple Handshake packets (chunked CRYPTO) when the
+  mutual TLS payload exceeds one datagram.
+
+---
+
 ## [v1.6.2] - 2026-05-09
 
 ### Added

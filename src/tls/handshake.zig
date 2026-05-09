@@ -31,6 +31,7 @@ const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const X25519 = crypto.dh.X25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = crypto.sign.ecdsa.EcdsaP384Sha384;
+const Certificate = std.crypto.Certificate;
 
 // TLS 1.3 handshake message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
@@ -538,10 +539,33 @@ pub fn buildCertificateVerify(
     transcript_hash: *const [32]u8,
     private_key: *const tls_vendor.config.PrivateKey,
 ) !usize {
+    return buildCertificateVerifyWithContext(out, transcript_hash, private_key, CV_PREFIX_SERVER);
+}
+
+/// Same as [`buildCertificateVerify`] but uses the client CertificateVerify transcript prefix (RFC 8446 §4.4.3).
+pub fn buildClientCertificateVerify(
+    out: []u8,
+    transcript_hash: *const [32]u8,
+    private_key: *const tls_vendor.config.PrivateKey,
+) !usize {
+    return buildCertificateVerifyWithContext(out, transcript_hash, private_key, CV_PREFIX_CLIENT);
+}
+
+fn buildCertificateVerifyWithContext(
+    out: []u8,
+    transcript_hash: *const [32]u8,
+    private_key: *const tls_vendor.config.PrivateKey,
+    context_prefix: []const u8,
+) !usize {
+    comptime {
+        std.debug.assert(CV_PREFIX_SERVER.len == CV_PREFIX_CLIENT.len);
+    }
+    std.debug.assert(context_prefix.len == CV_PREFIX_SERVER.len);
+
     // Content to sign
     var to_sign: [64 + 34 + 32]u8 = undefined;
-    _ = put(&to_sign, 0, CV_PREFIX_SERVER);
-    @memcpy(to_sign[CV_PREFIX_SERVER.len..], transcript_hash);
+    _ = put(&to_sign, 0, context_prefix);
+    @memcpy(to_sign[context_prefix.len..][0..32], transcript_hash);
 
     // sig_der_buf is 104 bytes — max DER size for P-384 (P-256 is 72).
     var sig_der_buf: [104]u8 = undefined;
@@ -586,6 +610,45 @@ pub fn buildCertificateVerify(
     @memcpy(out[pos .. pos + sig_bytes.len], sig_bytes);
     pos += sig_bytes.len;
     return pos;
+}
+
+/// Verify a TLS 1.3 client `CertificateVerify` handshake message using the leaf SPKI from the preceding `Certificate` message.
+pub fn verifyClientCertificateVerifyMessage(
+    msg: []const u8,
+    leaf_der: []const u8,
+    transcript_hash: *const [32]u8,
+) !void {
+    if (msg.len < 4) return error.TruncatedMessage;
+    if (msg[0] != MSG_CERTIFICATE_VERIFY) return error.BadMessageType;
+    const body_len = readU24(msg[1..4]);
+    if (4 + body_len > msg.len) return error.TruncatedMessage;
+    const body = msg[4 .. 4 + body_len];
+    if (body.len < 4) return error.TruncatedMessage;
+    const sig_scheme = readU16(body);
+    const sig_len = readU16(body[2..]);
+    if (4 + sig_len > body.len) return error.TruncatedMessage;
+    const sig_der = body[4 .. 4 + sig_len];
+
+    var to_sign: [64 + 34 + 32]u8 = undefined;
+    _ = put(&to_sign, 0, CV_PREFIX_CLIENT);
+    @memcpy(to_sign[CV_PREFIX_CLIENT.len..][0..32], transcript_hash);
+
+    const parsed = try (Certificate{ .buffer = leaf_der, .index = 0 }).parse();
+    const spki = parsed.pubKey();
+
+    switch (sig_scheme) {
+        SIG_ECDSA_SECP256R1_SHA256 => {
+            const pk = try EcdsaP256Sha256.PublicKey.fromSec1(spki);
+            const sig = try EcdsaP256Sha256.Signature.fromDer(sig_der);
+            try sig.verify(&to_sign, pk);
+        },
+        SIG_ECDSA_SECP384R1_SHA384 => {
+            const pk = try EcdsaP384Sha384.PublicKey.fromSec1(spki);
+            const sig = try EcdsaP384Sha384.Signature.fromDer(sig_der);
+            try sig.verify(&to_sign, pk);
+        },
+        else => return error.UnsupportedSignatureScheme,
+    }
 }
 
 // ── Finished builder ─────────────────────────────────────────────────────────
@@ -981,6 +1044,9 @@ fn buildClientHelloInner(
 
 // ── Server handshake state machine ───────────────────────────────────────────
 
+/// Upper bound for captured peer leaf certificate (TLS mutual auth / libp2p).
+pub const max_peer_leaf_cert_bytes: usize = 16384;
+
 /// Server-side TLS 1.3 handshake state for QUIC.
 pub const ServerHandshake = struct {
     /// Ephemeral X25519 key pair (one per connection).
@@ -1002,6 +1068,9 @@ pub const ServerHandshake = struct {
     /// in the ServerHello.  When true, buildServerFlight skips Certificate and
     /// CertificateVerify (RFC 8446 §4.2.11 / §4.4).
     accept_psk: bool,
+    /// Client leaf (DER) when the client sends a `Certificate` message (mutual TLS).
+    peer_leaf_cert_der: [max_peer_leaf_cert_bytes]u8 = undefined,
+    peer_leaf_cert_der_len: u16 = 0,
 
     pub fn init() ServerHandshake {
         return .{
@@ -1130,6 +1199,47 @@ pub const ServerHandshake = struct {
         return deriveTrafficSecret(master, "res master", &final_hash);
     }
 
+    /// Process the client's post-server-flight TLS messages: either a single `Finished`
+    /// (HTTP-style zquic clients) or `Certificate` + `CertificateVerify` + `Finished` (mutual TLS).
+    pub fn processClientHandshakeInbound(self: *ServerHandshake, data: []const u8) !void {
+        if (data.len >= 4 and data[0] == MSG_CERTIFICATE) {
+            var p: usize = 0;
+            while (p + 4 <= data.len) {
+                const msg_type = data[p];
+                const msg_len = readU24(data[p + 1 ..]);
+                const msg_end = p + 4 + msg_len;
+                if (msg_end > data.len) return error.TruncatedMessage;
+                const msg = data[p..msg_end];
+                switch (msg_type) {
+                    MSG_CERTIFICATE => {
+                        self.transcript.update(msg);
+                        if (self.peer_leaf_cert_der_len == 0) {
+                            const leaf = try leafCertificateDerFromCertificateHandshakeMessage(msg);
+                            if (leaf.len > max_peer_leaf_cert_bytes) return error.PeerLeafCertificateTooLarge;
+                            @memcpy(self.peer_leaf_cert_der[0..leaf.len], leaf);
+                            self.peer_leaf_cert_der_len = @intCast(leaf.len);
+                        }
+                    },
+                    MSG_CERTIFICATE_VERIFY => {
+                        if (self.peer_leaf_cert_der_len == 0) return error.BadCertificateVerify;
+                        const th = peekHash(self.transcript);
+                        const leaf = self.peer_leaf_cert_der[0..self.peer_leaf_cert_der_len];
+                        try verifyClientCertificateVerifyMessage(msg, leaf, &th);
+                        self.transcript.update(msg);
+                    },
+                    MSG_FINISHED => {
+                        try self.processClientFinished(msg);
+                        return;
+                    },
+                    else => return error.BadMessageType,
+                }
+                p = msg_end;
+            }
+            return error.TruncatedMessage;
+        }
+        try self.processClientFinished(data);
+    }
+
     /// Verify the client's Finished message (raw bytes).
     pub fn processClientFinished(self: *ServerHandshake, fin_bytes: []const u8) !void {
         if (fin_bytes.len < 4) return error.TruncatedMessage;
@@ -1153,8 +1263,11 @@ pub const ServerHandshake = struct {
 
 // ── Client handshake state machine ───────────────────────────────────────────
 
-/// Upper bound for the captured server leaf certificate on [`ClientHandshake`] (libp2p TLS identity).
-pub const max_peer_leaf_cert_bytes: usize = 16384;
+/// Optional client certificate + key for TLS 1.3 mutual authentication (e.g. libp2p QUIC).
+pub const ClientMutualTlsCredentials = struct {
+    cert_der: []const u8,
+    private_key: *const tls_vendor.config.PrivateKey,
+};
 
 /// Client-side TLS 1.3 handshake state for QUIC.
 pub const ClientHandshake = struct {
@@ -1315,11 +1428,13 @@ pub const ClientHandshake = struct {
 
     /// Process server Handshake messages (EncryptedExtensions, Certificate,
     /// CertificateVerify, Finished). Certificate is NOT verified — accepts any.
-    /// Returns bytes of ClientFinished to send in Handshake CRYPTO frames.
+    /// Returns bytes to send in Handshake CRYPTO frames: `Finished` only, or
+    /// `Certificate` + `CertificateVerify` + `Finished` when `mutual` is non-null.
     pub fn processServerFlight(
         self: *ClientHandshake,
         hs_bytes: []const u8,
-        out_finished: []u8,
+        out: []u8,
+        mutual: ?ClientMutualTlsCredentials,
     ) !usize {
         // Walk through messages
         var p: usize = 0;
@@ -1371,10 +1486,28 @@ pub const ClientHandshake = struct {
 
         if (!found_finished) return error.NoServerFinished;
 
-        // Build client Finished
+        if (mutual) |m| {
+            var out_pos: usize = 0;
+            const cert_len = try buildCertificate(out[out_pos..], m.cert_der);
+            self.transcript.update(out[out_pos..][0..cert_len]);
+            out_pos += cert_len;
+
+            const cv_hash = peekHash(self.transcript);
+            const cv_len = try buildClientCertificateVerify(out[out_pos..], &cv_hash, m.private_key);
+            self.transcript.update(out[out_pos..][0..cv_len]);
+            out_pos += cv_len;
+
+            const fin_hash = peekHash(self.transcript);
+            const fin_len = buildFinished(out[out_pos..], self.secrets.client_handshake, &fin_hash);
+            self.transcript.update(out[out_pos..][0..fin_len]);
+            out_pos += fin_len;
+            self.handshake_done = true;
+            return out_pos;
+        }
+
         const client_fin_hash = peekHash(self.transcript);
-        const n = buildFinished(out_finished, self.secrets.client_handshake, &client_fin_hash);
-        self.transcript.update(out_finished[0..n]);
+        const n = buildFinished(out, self.secrets.client_handshake, &client_fin_hash);
+        self.transcript.update(out[0..n]);
         self.handshake_done = true;
         return n;
     }
