@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.1] - 2026-05-09
+
+### Fixed
+
+- **Raw application STREAM reassembly.** Embedders using
+  `raw_application_streams = true` previously dropped any STREAM frame that
+  arrived ahead of the current contiguous offset (logged as `raw app gap`),
+  losing data on UDP reordering. The receive path now buffers out-of-order
+  chunks and splices them in once the preceding bytes arrive, matching the
+  in-order reassembly the HTTP/0.9 and HTTP/3 code paths already had.
+  Affects both server and client.
+
+### Changed
+
+- **`Client.flushDeferredAck` is now `pub`.** External event loops that drive
+  the client via `feedPacket` (instead of the built-in `run` loop) must call
+  `flushDeferredAck` once per inbound-drain cycle so the peer receives ACKs
+  and keeps sending application data. Backwards-compatible: the built-in
+  `run` loop already invokes it internally.
+
+---
+
 ## [v1.6.0] - 2026-05-08
 
 ### Changed
@@ -319,7 +341,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.6.1...HEAD
+[v1.6.1]: https://github.com/ch4r10t33r/zquic/compare/v1.6.0...v1.6.1
 [v1.6.0]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...v1.6.0
 [v1.5.0]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...v1.5.0
 [v1.4.0]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...v1.4.0
