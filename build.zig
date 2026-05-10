@@ -35,6 +35,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // Main library module (exposed as `zquic` for `build.zig.zon` dependents).
+    const zig_varint_mod = b.dependency("zig_varint", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig_varint");
+
     const zquic_mod = b.addModule("zquic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -42,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = needs_libc,
     });
     zquic_mod.addImport("tls", tls_mod);
+    zquic_mod.addImport("zig_varint", zig_varint_mod);
     zquic_mod.addOptions("build_options", opts);
 
     const lib = b.addLibrary(.{

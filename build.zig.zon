@@ -3,7 +3,12 @@
     .fingerprint = 0x947d823dd45c34db,
     .version = "1.6.4",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zig_varint = .{
+            .url = "https://github.com/ch4r10t33r/zig-varint/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "zig_varint-0.1.0-JouQHUVXAAAGN-XdMYrVEmYrzJd6zXtI7zk9bPnKYXVK",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
