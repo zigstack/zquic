@@ -204,14 +204,34 @@ jobs:
           # Reload the zquic image after Docker restart (daemon was restarted)
           docker load < zquic-interop.tar.gz
 
+      # Bump the upstream quic-interop-runner per-test timeout from 60 s to 180 s.
+      # GitHub-hosted runners have highly variable performance: the same SHA can
+      # finish a transfer test in 27 s on a fast runner and time out at 60 s on
+      # a slow runner (observed identical commit passing 13/13 on push event,
+      # failing 11/13 on pull_request event due to runner allocation class).
+      # 180 s gives a 3× safety margin while still bounding total job runtime.
+      - name: Bump interop per-test timeout to 180s
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("quic-interop-runner/testcase.py")
+          src = p.read_text()
+          old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
+          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 180\n'
+          if old not in src:
+              raise SystemExit("Did not find expected default timeout block in testcase.py")
+          p.write_text(src.replace(old, new, 1))
+          print("Patched base TestCase.timeout() -> 180s")
+          EOF
+
       # Run the test suite against zquic acting as both client and server.
       # Order rationale: fast-passing tests run first to fail early on
-      # regressions.  Tests that time out at 60 s (zerortt, connectionmigration,
-      # multiplexing) are pushed to the end because a 60 s timeout corrupts the
-      # NS3 ARP cache for subsequent tests.
+      # regressions.  Tests that time out (zerortt, connectionmigration,
+      # multiplexing) are pushed to the end because a per-test timeout corrupts
+      # the NS3 ARP cache for subsequent tests.
       # http3 must run BEFORE zerortt/connectionmigration: zerortt now actually
-      # connects to the server (resolveAddress IPv4 fix) and times out at 60 s,
-      # which would contaminate NS3 ARP state and cause http3 to fail.
+      # connects to the server (resolveAddress IPv4 fix) and times out, which
+      # would contaminate NS3 ARP state and cause http3 to fail.
       # rebind-port uses the "rebind" NS3 scenario which periodically changes the
       # client's source port (simulating NAT rebinding).  The server detects the
       # new src addr and sends PATH_CHALLENGE; the client responds PATH_RESPONSE.
