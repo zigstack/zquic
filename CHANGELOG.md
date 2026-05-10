@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.5] - 2026-05-10
+
+### Changed
+
+- **Varint codec extracted to shared module.** `src/varint.zig` is now a thin
+  re-export of [`zig-varint`](https://github.com/ch4r10t33r/zig-varint) `quic`
+  submodule (v0.1.0). Wire format, public API (`encode`, `decode`,
+  `encodedLen`, `lenToUsize`, `Reader`, `Writer`, `EncodeError`,
+  `DecodeError`, `max_value`) and behavior are byte-identical with the
+  previous in-tree implementation. Lets `zig-libp2p`, `zig-discv5`, and
+  `zig-ethp2p` share a single canonical RFC 9000 §16 varint without
+  drift.
+
+### CI
+
+- **Bumped quic-interop-runner per-test timeout from 60 s to 180 s.**
+  GitHub-hosted runners have ~2-3× performance variance between
+  allocations; the same SHA could pass in 27 s on one runner and time
+  out at 60 s on another. The workflow now patches
+  `TestCase.timeout()` to 180 s before invoking `run.py`, giving a 3×
+  safety margin.
+
+---
+
 ## [v1.6.3] - 2026-05-09
 
 ### Added
