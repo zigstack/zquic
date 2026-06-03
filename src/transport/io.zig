@@ -558,24 +558,17 @@ pub fn decryptLongPacket(
 
 // ── PEM loading helpers ───────────────────────────────────────────────────────
 
-/// Load the first DER certificate from a PEM file (heap-allocated).
-pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const pem = compat.fs.openFileAbsolute(path, .{}) catch |err| {
-        dbg("io: cannot open cert {s}: {}\n", .{ path, err });
-        return err;
-    };
-    defer pem.close();
-    const pem_data = pem.readToEndAlloc(allocator, 65536) catch return error.CertReadFailed;
-    defer allocator.free(pem_data);
-
+/// Parse the first DER certificate from in-memory PEM bytes (heap-allocated).
+/// Returns owned DER; caller frees with `allocator.free`.
+pub fn parseCertDerFromPem(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
     const begin = "-----BEGIN CERTIFICATE-----";
     const end_m = "-----END CERTIFICATE-----";
-    const bi = std.mem.indexOf(u8, pem_data, begin) orelse return error.NoCertificate;
+    const bi = std.mem.indexOf(u8, pem, begin) orelse return error.NoCertificate;
     const after = bi + begin.len;
-    const ei = std.mem.indexOf(u8, pem_data[after..], end_m) orelse return error.NoCertEnd;
+    const ei = std.mem.indexOf(u8, pem[after..], end_m) orelse return error.NoCertEnd;
 
     // Remove whitespace from base64 region
-    const raw = pem_data[after .. after + ei];
+    const raw = pem[after .. after + ei];
     const b64 = try allocator.alloc(u8, raw.len);
     defer allocator.free(b64);
     var b64_len: usize = 0;
@@ -593,6 +586,26 @@ pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return der;
 }
 
+/// Parse a TLS PrivateKey from in-memory PEM bytes.
+/// The allocator parameter is for API symmetry with `parseCertDerFromPem`;
+/// `tls_vendor.config.PrivateKey.parsePem` does not require it.
+pub fn parsePrivateKeyFromPem(allocator: std.mem.Allocator, pem: []const u8) !tls_vendor.config.PrivateKey {
+    _ = allocator;
+    return tls_vendor.config.PrivateKey.parsePem(pem);
+}
+
+/// Load the first DER certificate from a PEM file (heap-allocated).
+pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const pem = compat.fs.openFileAbsolute(path, .{}) catch |err| {
+        dbg("io: cannot open cert {s}: {}\n", .{ path, err });
+        return err;
+    };
+    defer pem.close();
+    const pem_data = pem.readToEndAlloc(allocator, 65536) catch return error.CertReadFailed;
+    defer allocator.free(pem_data);
+    return parseCertDerFromPem(allocator, pem_data);
+}
+
 /// Load a PrivateKey from a PEM file using tls.zig's parser.
 pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendor.config.PrivateKey {
     const f = compat.fs.openFileAbsolute(path, .{}) catch |err| {
@@ -600,7 +613,9 @@ pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendo
         return err;
     };
     defer f.close();
-    return tls_vendor.config.PrivateKey.fromFile(allocator, f);
+    const pem_data = f.readToEndAlloc(allocator, 1024 * 1024) catch return error.KeyReadFailed;
+    defer allocator.free(pem_data);
+    return parsePrivateKeyFromPem(allocator, pem_data);
 }
 
 // ── Per-connection state ──────────────────────────────────────────────────────
@@ -1158,6 +1173,16 @@ pub const ServerConfig = struct {
     port: u16 = 443,
     cert_path: []const u8 = "/certs/cert.pem",
     key_path: []const u8 = "/certs/priv.key",
+    /// In-memory PEM cert bytes. When non-null, takes precedence over
+    /// `cert_path` and the cert is never read from disk. Lifetime: borrowed
+    /// for the duration of `Server.init` / `initFromSocket` only; the
+    /// `Server` does not retain a reference to the PEM bytes (it owns the
+    /// parsed DER instead). Path-based loading remains the fallback when
+    /// this field is null.
+    cert_pem: ?[]const u8 = null,
+    /// In-memory PEM private key bytes. Same precedence/lifetime semantics
+    /// as `cert_pem`. Parsed via `tls_vendor.config.PrivateKey.parsePem`.
+    key_pem: ?[]const u8 = null,
     www_dir: []const u8 = "/www",
     keylog_path: ?[]const u8 = null,
     retry_enabled: bool = false,
@@ -1239,18 +1264,30 @@ pub const Server = struct {
         const self = try allocator.create(Server);
         errdefer allocator.destroy(self);
 
-        // Load certificate DER bytes
-        const cert_der = loadCertDer(allocator, config.cert_path) catch |err| {
-            dbg("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
-            return err;
-        };
+        // Load certificate DER bytes — PEM-in-memory wins over file path.
+        const cert_der = if (config.cert_pem) |pem|
+            parseCertDerFromPem(allocator, pem) catch |err| {
+                dbg("io: cert load failed (pem): {}\n", .{err});
+                return err;
+            }
+        else
+            loadCertDer(allocator, config.cert_path) catch |err| {
+                dbg("io: cert load failed (path {s}): {}\n", .{ config.cert_path, err });
+                return err;
+            };
         errdefer allocator.free(cert_der);
 
-        // Load private key
-        const pk = loadPrivateKey(allocator, config.key_path) catch |err| {
-            dbg("io: key load failed ({s}): {}\n", .{ config.key_path, err });
-            return err;
-        };
+        // Load private key — PEM-in-memory wins over file path.
+        const pk = if (config.key_pem) |pem|
+            parsePrivateKeyFromPem(allocator, pem) catch |err| {
+                dbg("io: key load failed (pem): {}\n", .{err});
+                return err;
+            }
+        else
+            loadPrivateKey(allocator, config.key_path) catch |err| {
+                dbg("io: key load failed (path {s}): {}\n", .{ config.key_path, err });
+                return err;
+            };
 
         // Create UDP socket (IPv4)
         const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -1316,16 +1353,28 @@ pub const Server = struct {
         const self = try allocator.create(Server);
         errdefer allocator.destroy(self);
 
-        const cert_der = loadCertDer(allocator, config.cert_path) catch |err| {
-            dbg("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
-            return err;
-        };
+        const cert_der = if (config.cert_pem) |pem|
+            parseCertDerFromPem(allocator, pem) catch |err| {
+                dbg("io: cert load failed (pem): {}\n", .{err});
+                return err;
+            }
+        else
+            loadCertDer(allocator, config.cert_path) catch |err| {
+                dbg("io: cert load failed (path {s}): {}\n", .{ config.cert_path, err });
+                return err;
+            };
         errdefer allocator.free(cert_der);
 
-        const pk = loadPrivateKey(allocator, config.key_path) catch |err| {
-            dbg("io: key load failed ({s}): {}\n", .{ config.key_path, err });
-            return err;
-        };
+        const pk = if (config.key_pem) |pem|
+            parsePrivateKeyFromPem(allocator, pem) catch |err| {
+                dbg("io: key load failed (pem): {}\n", .{err});
+                return err;
+            }
+        else
+            loadPrivateKey(allocator, config.key_path) catch |err| {
+                dbg("io: key load failed (path {s}): {}\n", .{ config.key_path, err });
+                return err;
+            };
 
         var sk_buf: i32 = 8 * 1024 * 1024;
         const sk_opt = std.mem.asBytes(&sk_buf);
@@ -4430,6 +4479,14 @@ pub const ClientConfig = struct {
     /// Non-empty together with [`client_key_path`]: present this cert + key after the server flight (mutual TLS).
     client_cert_path: []const u8 = "",
     client_key_path: []const u8 = "",
+    /// In-memory PEM client cert (mutual TLS). When non-null, takes precedence
+    /// over `client_cert_path` and the cert is never read from disk. Lifetime:
+    /// borrowed for the duration of `Client.init` / `initFromSocket` only.
+    /// Path-based loading remains the fallback when this field is null.
+    client_cert_pem: ?[]const u8 = null,
+    /// In-memory PEM client private key. Same precedence/lifetime semantics
+    /// as `client_cert_pem`.
+    client_key_pem: ?[]const u8 = null,
 };
 
 /// TLS ALPN value for `ClientConfig`.
@@ -4637,10 +4694,18 @@ pub const Client = struct {
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
         var client_private_key: tls_vendor.config.PrivateKey = undefined;
-        if (config.client_cert_path.len > 0 and config.client_key_path.len > 0) {
-            client_cert_der = try loadCertDer(allocator, config.client_cert_path);
+        const have_cert_src = config.client_cert_pem != null or config.client_cert_path.len > 0;
+        const have_key_src = config.client_key_pem != null or config.client_key_path.len > 0;
+        if (have_cert_src and have_key_src) {
+            client_cert_der = if (config.client_cert_pem) |pem|
+                try parseCertDerFromPem(allocator, pem)
+            else
+                try loadCertDer(allocator, config.client_cert_path);
             errdefer allocator.free(client_cert_der);
-            client_private_key = try loadPrivateKey(allocator, config.client_key_path);
+            client_private_key = if (config.client_key_pem) |pem|
+                try parsePrivateKeyFromPem(allocator, pem)
+            else
+                try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
 
@@ -4703,10 +4768,18 @@ pub const Client = struct {
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
         var client_private_key: tls_vendor.config.PrivateKey = undefined;
-        if (config.client_cert_path.len > 0 and config.client_key_path.len > 0) {
-            client_cert_der = try loadCertDer(allocator, config.client_cert_path);
+        const have_cert_src = config.client_cert_pem != null or config.client_cert_path.len > 0;
+        const have_key_src = config.client_key_pem != null or config.client_key_path.len > 0;
+        if (have_cert_src and have_key_src) {
+            client_cert_der = if (config.client_cert_pem) |pem|
+                try parseCertDerFromPem(allocator, pem)
+            else
+                try loadCertDer(allocator, config.client_cert_path);
             errdefer allocator.free(client_cert_der);
-            client_private_key = try loadPrivateKey(allocator, config.client_key_path);
+            client_private_key = if (config.client_key_pem) |pem|
+                try parsePrivateKeyFromPem(allocator, pem)
+            else
+                try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
 
@@ -6714,4 +6787,188 @@ fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !co
         if (addr.any.family == std.posix.AF.INET) return addr;
     }
     return list.addrs[0];
+}
+
+// ── In-memory PEM parser tests ────────────────────────────────────────────────
+
+/// Wrap a DER blob in a PEM block with `label`, base64 encoded 64 cols wide.
+fn pemEncodeForTest(allocator: std.mem.Allocator, label: []const u8, der_bytes: []const u8) ![]u8 {
+    const Base64 = std.base64.standard.Encoder;
+    const b64_len = Base64.calcSize(der_bytes.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = Base64.encode(b64, der_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "-----BEGIN ");
+    try out.appendSlice(allocator, label);
+    try out.appendSlice(allocator, "-----\n");
+    var i: usize = 0;
+    while (i < b64.len) {
+        const end = @min(i + 64, b64.len);
+        try out.appendSlice(allocator, b64[i..end]);
+        try out.append(allocator, '\n');
+        i = end;
+    }
+    try out.appendSlice(allocator, "-----END ");
+    try out.appendSlice(allocator, label);
+    try out.appendSlice(allocator, "-----\n");
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a SEC1 `EC PRIVATE KEY` PEM (RFC 5915) for a deterministic P-256
+/// keypair derived from `seed`. Format matches what zquic's vendored TLS
+/// parser accepts via the `EC PRIVATE KEY` marker.
+fn buildEcP256PemForTest(allocator: std.mem.Allocator, seed: [32]u8) ![]u8 {
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const kp = try EcdsaP256.KeyPair.generateDeterministic(seed);
+    const secret_bytes: [32]u8 = kp.secret_key.toBytes();
+    const sec1_pub: [65]u8 = kp.public_key.toUncompressedSec1();
+
+    // Hand-roll the SEC1 ECPrivateKey DER:
+    //   SEQUENCE {
+    //     INTEGER 1,
+    //     OCTET STRING <32-byte secret>,
+    //     [0] EXPLICIT { OID prime256v1 },
+    //     [1] EXPLICIT { BIT STRING 0x00 || SEC1 uncompressed }
+    //   }
+    const oid_prime256v1 = [_]u8{ 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07 };
+
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    // INTEGER 1
+    try inner.appendSlice(allocator, &[_]u8{ 0x02, 0x01, 0x01 });
+    // OCTET STRING (32 bytes)
+    try inner.appendSlice(allocator, &[_]u8{ 0x04, 0x20 });
+    try inner.appendSlice(allocator, &secret_bytes);
+    // [0] EXPLICIT { OID prime256v1 }
+    try inner.append(allocator, 0xA0);
+    try inner.append(allocator, @intCast(oid_prime256v1.len));
+    try inner.appendSlice(allocator, &oid_prime256v1);
+    // [1] EXPLICIT { BIT STRING 0x00 || SEC1 uncompressed (65 bytes) }
+    // Inner BIT STRING TLV: tag 0x03, length 66 (0x42), 0x00 (unused bits), then 65 bytes
+    try inner.append(allocator, 0xA1);
+    try inner.append(allocator, 2 + 1 + 65); // length of [1] payload: TL(2) + unused-bits(1) + sec1(65)
+    try inner.append(allocator, 0x03); // BIT STRING tag
+    try inner.append(allocator, 1 + 65); // length of BIT STRING value
+    try inner.append(allocator, 0x00); // unused bits
+    try inner.appendSlice(allocator, &sec1_pub);
+
+    // SEQUENCE { inner }
+    var der_buf: std.ArrayList(u8) = .empty;
+    defer der_buf.deinit(allocator);
+    try der_buf.append(allocator, 0x30);
+    if (inner.items.len < 0x80) {
+        try der_buf.append(allocator, @intCast(inner.items.len));
+    } else {
+        try der_buf.append(allocator, 0x81);
+        try der_buf.append(allocator, @intCast(inner.items.len));
+    }
+    try der_buf.appendSlice(allocator, inner.items);
+
+    return pemEncodeForTest(allocator, "EC PRIVATE KEY", der_buf.items);
+}
+
+test "io PEM: parseCertDerFromPem round-trips file-based loadCertDer" {
+    const a = std.testing.allocator;
+
+    // Build a fake certificate DER (the parser only does base64-decode; it
+    // does not validate cert structure, so arbitrary bytes are fine here).
+    const fake_der = "hello-from-parseCertDerFromPem-test-payload-123";
+    const pem = try pemEncodeForTest(a, "CERTIFICATE", fake_der);
+    defer a.free(pem);
+
+    const from_mem = try parseCertDerFromPem(a, pem);
+    defer a.free(from_mem);
+    try std.testing.expectEqualSlices(u8, fake_der, from_mem);
+
+    // Write the same PEM to a temp file and confirm loadCertDer gives the
+    // same DER bytes. Uses /tmp directly to match the existing absolute-path API.
+    var rnd_buf: [8]u8 = undefined;
+    compat.random.bytes(&rnd_buf);
+    var path_buf: [128:0]u8 = undefined;
+    @memset(&path_buf, 0);
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/zquic_io_pem_test_cert_{x}.pem", .{std.mem.readInt(u64, &rnd_buf, .little)});
+
+    {
+        const f = try compat.fs.createFileAbsolute(path, .{});
+        defer f.close();
+        try f.writeAll(pem);
+    }
+    defer _ = std.c.unlink(&path_buf);
+
+    const from_file = try loadCertDer(a, path);
+    defer a.free(from_file);
+    try std.testing.expectEqualSlices(u8, from_mem, from_file);
+}
+
+test "io PEM: parsePrivateKeyFromPem round-trips file-based loadPrivateKey" {
+    const a = std.testing.allocator;
+
+    // Deterministic seed → deterministic P-256 keypair → SEC1 EC PRIVATE KEY PEM.
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast((i * 7 + 13) & 0xff);
+
+    const key_pem = try buildEcP256PemForTest(a, seed);
+    defer a.free(key_pem);
+
+    const pk_mem = try parsePrivateKeyFromPem(a, key_pem);
+    try std.testing.expectEqual(.ecdsa_secp256r1_sha256, pk_mem.signature_scheme);
+
+    // Write the same PEM to a temp file and ensure loadPrivateKey produces
+    // the same parsed key (compare via the ECDSA secret bytes, 32 bytes).
+    var rnd_buf: [8]u8 = undefined;
+    compat.random.bytes(&rnd_buf);
+    var path_buf: [128:0]u8 = undefined;
+    @memset(&path_buf, 0);
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/zquic_io_pem_test_key_{x}.pem", .{std.mem.readInt(u64, &rnd_buf, .little)});
+
+    {
+        const f = try compat.fs.createFileAbsolute(path, .{});
+        defer f.close();
+        try f.writeAll(key_pem);
+    }
+    defer _ = std.c.unlink(&path_buf);
+
+    const pk_file = try loadPrivateKey(a, path);
+    try std.testing.expectEqual(pk_mem.signature_scheme, pk_file.signature_scheme);
+    try std.testing.expectEqualSlices(u8, pk_mem.key.ecdsa[0..32], pk_file.key.ecdsa[0..32]);
+}
+
+test "io PEM: ServerConfig.cert_pem precedence over cert_path" {
+    // When cert_pem is set, parsing succeeds even with a nonexistent
+    // cert_path because the byte-level branch never opens the file.
+    const a = std.testing.allocator;
+
+    const fake_der = "precedence-test-cert-der";
+    const cert_pem = try pemEncodeForTest(a, "CERTIFICATE", fake_der);
+    defer a.free(cert_pem);
+
+    // The cert-loading branch in Server.init / Server.initFromSocket is just:
+    //   if (config.cert_pem) |pem| parseCertDerFromPem(allocator, pem) else loadCertDer(...)
+    // Simulate that gate here without bringing up a UDP socket.
+    const config: ServerConfig = .{ .cert_pem = cert_pem, .cert_path = "/nonexistent/path/does-not-exist.pem" };
+    const cert_der = if (config.cert_pem) |pem|
+        try parseCertDerFromPem(a, pem)
+    else
+        try loadCertDer(a, config.cert_path);
+    defer a.free(cert_der);
+
+    try std.testing.expectEqualSlices(u8, fake_der, cert_der);
+}
+
+test "io PEM: ServerConfig with both nil falls back to path loader" {
+    // When neither cert_pem nor a usable cert_path are present, the path
+    // loader should be reached and fail with the expected error. We use a
+    // nonexistent path to verify the gate routes correctly without
+    // requiring on-disk test fixtures.
+    const a = std.testing.allocator;
+    const config: ServerConfig = .{ .cert_path = "/nonexistent/zquic-io-test-cert.pem" };
+    try std.testing.expect(config.cert_pem == null);
+    const r = if (config.cert_pem) |pem|
+        parseCertDerFromPem(a, pem)
+    else
+        loadCertDer(a, config.cert_path);
+    try std.testing.expectError(error.FileNotFound, r);
 }
