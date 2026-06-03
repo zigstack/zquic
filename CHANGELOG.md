@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.6] - 2026-06-03
+
+### Added
+
+- **In-memory PEM TLS config.** `ServerConfig` gains optional `cert_pem` /
+  `key_pem` fields and `ClientConfig` gains `client_cert_pem` /
+  `client_key_pem`. When set, the cert and key are parsed straight from
+  caller-owned PEM bytes — the filesystem is never touched. The
+  path-based fields (`cert_path`, `key_path`, `client_cert_path`,
+  `client_key_path`) remain the fallback; if both are supplied, the PEM
+  fields win. The byte-level parsers `parseCertDerFromPem` and
+  `parsePrivateKeyFromPem` are also exposed for direct use. This lets
+  higher-level libraries (zig-libp2p, …) hand zquic certs they minted in
+  memory without writing them to disk first — fixes the `FROM scratch`
+  container case where `/tmp` does not exist.
+
+---
+
 ## [v1.6.5] - 2026-05-10
 
 ### Changed
