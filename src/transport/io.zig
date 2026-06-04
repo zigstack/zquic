@@ -1000,18 +1000,18 @@ pub const ConnState = struct {
     path_challenge_data: ?[8]u8 = null,
 
     // ── Stream limit enforcement (RFC 9000 §4.6) ──────────────────────────────
-    // The server advertises initial_max_streams_bidi=100 and
-    // initial_max_streams_uni=100 in transport parameters.  Stream IDs that
+    // The server advertises initial_max_streams_bidi=1024 and
+    // initial_max_streams_uni=1024 in transport parameters.  Stream IDs that
     // exceed these limits trigger a STREAM_LIMIT_ERROR (0x4).
     // max_streams_*_recv is updated when we send MAX_STREAMS frames.
     // peer_*_stream_count tracks the highest stream number used so far.
     //
     // peer_max_*_streams: how many **locally initiated** streams of each type
     // the peer allows us to open (initial transport params + MAX_STREAMS frames).
-    max_streams_bidi_recv: u64 = 100,
-    max_streams_uni_recv: u64 = 100,
-    peer_max_bidi_streams: u64 = 100,
-    peer_max_uni_streams: u64 = 100,
+    max_streams_bidi_recv: u64 = 1024,
+    max_streams_uni_recv: u64 = 1024,
+    peer_max_bidi_streams: u64 = 1024,
+    peer_max_uni_streams: u64 = 1024,
     peer_bidi_stream_count: u64 = 0,
     peer_uni_stream_count: u64 = 0,
     /// Next locally opened uni stream ID (RFC 9000 §2.1). Initialized to 3 on the
@@ -3178,11 +3178,11 @@ pub const Server = struct {
                         }
                         if (stream_count > conn.peer_bidi_stream_count)
                             conn.peer_bidi_stream_count = stream_count;
-                        // Proactively raise the limit when 75% consumed — mirrors how
-                        // MAX_DATA is sent at 50% (RFC 9000 §4.2).  Prevents the
-                        // client from needing to send STREAMS_BLOCKED in the common
-                        // case of a burst of requests (e.g. multiplexing test).
-                        if (conn.peer_bidi_stream_count * 4 >= conn.max_streams_bidi_recv * 3)
+                        // Proactively raise the limit when 50% consumed (matches
+                        // MAX_DATA's 50% rule in RFC 9000 §4.2).  Earlier MAX_STREAMS
+                        // means the client never blocks on a burst of stream opens
+                        // (gossipsub per-message-stream pattern or batched req/resps).
+                        if (conn.peer_bidi_stream_count * 2 >= conn.max_streams_bidi_recv)
                             self.sendMaxStreams(conn, true, src);
                     } else {
                         // Unidirectional: enforce hard limit.
@@ -3193,8 +3193,8 @@ pub const Server = struct {
                         }
                         if (stream_count > conn.peer_uni_stream_count)
                             conn.peer_uni_stream_count = stream_count;
-                        // Proactively raise uni limit at 75% consumed.
-                        if (conn.peer_uni_stream_count * 4 >= conn.max_streams_uni_recv * 3)
+                        // Proactively raise uni limit at 50% consumed.
+                        if (conn.peer_uni_stream_count * 2 >= conn.max_streams_uni_recv)
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
@@ -3593,11 +3593,13 @@ pub const Server = struct {
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
     fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
-        // Raise the limit by 100 streams each time we receive STREAMS_BLOCKED.
+        // Grow by 1024 streams per MAX_STREAMS — large enough that bursts of
+        // gossipsub publishes or req/resps on a fan-out mesh don't repeatedly
+        // race with the next credit grant.
         const new_limit: u64 = if (bidi)
-            conn.max_streams_bidi_recv + 100
+            conn.max_streams_bidi_recv + 1024
         else
-            conn.max_streams_uni_recv + 100;
+            conn.max_streams_uni_recv + 1024;
 
         if (bidi) {
             conn.max_streams_bidi_recv = new_limit;
@@ -6896,7 +6898,7 @@ test "io PEM: parseCertDerFromPem round-trips file-based loadCertDer" {
         defer f.close();
         try f.writeAll(pem);
     }
-    defer _ = std.c.unlink(&path_buf);
+    defer compat.fs.deleteFileAbsolute(path) catch {};
 
     const from_file = try loadCertDer(a, path);
     defer a.free(from_file);
@@ -6929,7 +6931,7 @@ test "io PEM: parsePrivateKeyFromPem round-trips file-based loadPrivateKey" {
         defer f.close();
         try f.writeAll(key_pem);
     }
-    defer _ = std.c.unlink(&path_buf);
+    defer compat.fs.deleteFileAbsolute(path) catch {};
 
     const pk_file = try loadPrivateKey(a, path);
     try std.testing.expectEqual(pk_mem.signature_scheme, pk_file.signature_scheme);

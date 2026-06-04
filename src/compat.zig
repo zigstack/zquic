@@ -616,6 +616,20 @@ pub const fs = struct {
         return .{ .handle = fd };
     }
 
+    pub fn deleteFileAbsolute(path: []const u8) !void {
+        var path_buf: [4096]u8 = undefined;
+        const c_path = try nullTerminate(path, &path_buf);
+        const rc = system.unlink(c_path);
+        switch (checkRc(rc)) {
+            .SUCCESS => return,
+            .NOENT => return error.FileNotFound,
+            .ACCES => return error.AccessDenied,
+            .ISDIR => return error.IsDir,
+            .NAMETOOLONG => return error.NameTooLong,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+
     pub fn makeDirAbsolute(path: []const u8) !void {
         var path_buf: [4096]u8 = undefined;
         if (path.len >= path_buf.len) return error.NameTooLong;
