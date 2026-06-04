@@ -1788,17 +1788,13 @@ pub const Server = struct {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
             if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial: re-send the server flight so the client
-                // can make progress even if our first response was lost.
+                // Retransmitted Initial after the server flight was already sent.
+                // Quinn/rustls feed duplicate Initial/Handshake CRYPTO bytes into TLS
+                // and report UnsolicitedEncryptedExtension; zquic clients dedupe by
+                // offset, so silence is safe once we are past the first flight.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    // Retransmitted Initial after we already sent the Handshake flight:
-                    // replay only ServerHello in an Initial packet.  Re-sending the
-                    // Handshake CRYPTO stream from offset 0 duplicates
-                    // EncryptedExtensions and quinn/rustls reports
-                    // UnsolicitedEncryptedExtension (interop cross-handshake CI).
-                    self.sendInitialServerHello(existing, src);
+                    return;
                 }
-                return;
             }
 
             // Truly new connection
@@ -4637,6 +4633,10 @@ const StreamDownload = struct {
     active: bool,
     /// Highest contiguous byte offset received from stream offset 0 (HTTP/0.9).
     recv_contiguous: u64 = 0,
+    /// Highest `offset + data.len` seen (includes out-of-order segments).
+    recv_high_water: u64 = 0,
+    /// Out-of-order STREAM payloads waiting to extend `recv_contiguous`.
+    recv_reorder: quic_tls_mod.CryptoReorderBuf = .{},
     /// Set when a STREAM frame with FIN is seen; download completes once
     /// `recv_contiguous` reaches this offset (handles FIN-before-gap reordering).
     fin_end_offset: ?u64 = null,
@@ -5214,6 +5214,11 @@ pub const Client = struct {
         if (self.conn.phase != .connected) {
             dbg("io: client handshake timed out\n", .{});
             return error.HandshakeTimeout;
+        }
+
+        if (self.streams_done < self.active_urls.len) {
+            dbg("io: client downloads incomplete streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
+            return error.DownloadIncomplete;
         }
 
         dbg("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
@@ -6264,9 +6269,25 @@ pub const Client = struct {
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
-    fn http09AdvanceContiguous(recv_contiguous: *u64, frame_offset: u64, data_len: usize) void {
-        if (frame_offset == recv_contiguous.*) {
-            recv_contiguous.* += @as(u64, @intCast(data_len));
+    fn http09DeliverStreamBytes(s: *StreamDownload, offset: u64, data: []const u8) void {
+        const end = offset + @as(u64, @intCast(data.len));
+        if (end > s.recv_high_water) s.recv_high_water = end;
+
+        if (offset == s.recv_contiguous) {
+            s.file.seekTo(offset) catch return;
+            s.file.writeAll(data) catch return;
+            s.recv_contiguous = end;
+            var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
+            while (true) {
+                const n = s.recv_reorder.take(s.recv_contiguous, &drain_buf);
+                if (n == 0) break;
+                s.file.seekTo(s.recv_contiguous) catch return;
+                s.file.writeAll(drain_buf[0..n]) catch return;
+                s.recv_contiguous += @as(u64, @intCast(n));
+                if (s.recv_contiguous > s.recv_high_water) s.recv_high_water = s.recv_contiguous;
+            }
+        } else if (offset > s.recv_contiguous) {
+            s.recv_reorder.insert(offset, data);
         }
     }
 
@@ -6335,22 +6356,12 @@ pub const Client = struct {
                     self.handleH3StreamData(s, sf);
                 } else {
                     dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    // Write at the exact stream offset so retransmitted or
-                    // out-of-order STREAM frames (possible after a NAT rebind
-                    // triggers server-side retransmit) land at the right place.
-                    s.file.seekTo(sf.offset) catch |err| {
-                        dbg("io: client seekTo failed stream_id={}: {}\n", .{ sf.stream_id, err });
-                        return;
-                    };
-                    s.file.writeAll(sf.data) catch |err| {
-                        dbg("io: client writeAll failed stream_id={}: {}\n", .{ sf.stream_id, err });
-                        return;
-                    };
-                    http09AdvanceContiguous(&s.recv_contiguous, sf.offset, sf.data.len);
+                    http09DeliverStreamBytes(s, sf.offset, sf.data);
                     if (sf.fin) {
-                        s.fin_end_offset = sf.offset + @as(u64, @intCast(sf.data.len));
-                        dbg("io: stream {} saw FIN (contiguous={} fin_end={})\n", .{
-                            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?,
+                        const fin_end = sf.offset + @as(u64, @intCast(sf.data.len));
+                        s.fin_end_offset = @max(fin_end, s.recv_high_water);
+                        dbg("io: stream {} saw FIN (contiguous={} fin_end={} high_water={})\n", .{
+                            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?, s.recv_high_water,
                         });
                     }
                     self.http09TryCompleteDownload(s);
@@ -6777,7 +6788,7 @@ pub const Client = struct {
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
             dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
-            const dl_deadline = compat.milliTimestamp() + 60_000;
+            const dl_deadline = compat.milliTimestamp() + 120_000;
             var dl_iter: u32 = 0;
             while (true) {
                 dl_iter += 1;
