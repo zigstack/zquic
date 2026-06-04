@@ -6345,7 +6345,7 @@ pub const Client = struct {
                         dbg("io: client writeAll failed stream_id={}: {}\n", .{ sf.stream_id, err });
                         return;
                     };
-                    self.http09AdvanceContiguous(&s.recv_contiguous, sf.offset, sf.data.len);
+                    http09AdvanceContiguous(&s.recv_contiguous, sf.offset, sf.data.len);
                     if (sf.fin) {
                         s.fin_end_offset = sf.offset + @as(u64, @intCast(sf.data.len));
                         dbg("io: stream {} saw FIN (contiguous={} fin_end={})\n", .{
