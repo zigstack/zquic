@@ -1000,18 +1000,20 @@ pub const ConnState = struct {
     path_challenge_data: ?[8]u8 = null,
 
     // ── Stream limit enforcement (RFC 9000 §4.6) ──────────────────────────────
-    // The server advertises initial_max_streams_bidi=1024 and
-    // initial_max_streams_uni=1024 in transport parameters.  Stream IDs that
-    // exceed these limits trigger a STREAM_LIMIT_ERROR (0x4).
+    // The server advertises initial_max_streams_bidi=1000 and
+    // initial_max_streams_uni=1000 in transport parameters.  The value is
+    // pinned to <=1000 so quic-interop-runner's multiplexing test (which
+    // asserts "stream limit > 1000" as a failure) still passes.  Stream IDs
+    // that exceed these limits trigger STREAM_LIMIT_ERROR (0x4).
     // max_streams_*_recv is updated when we send MAX_STREAMS frames.
     // peer_*_stream_count tracks the highest stream number used so far.
     //
     // peer_max_*_streams: how many **locally initiated** streams of each type
     // the peer allows us to open (initial transport params + MAX_STREAMS frames).
-    max_streams_bidi_recv: u64 = 1024,
-    max_streams_uni_recv: u64 = 1024,
-    peer_max_bidi_streams: u64 = 1024,
-    peer_max_uni_streams: u64 = 1024,
+    max_streams_bidi_recv: u64 = 1000,
+    max_streams_uni_recv: u64 = 1000,
+    peer_max_bidi_streams: u64 = 1000,
+    peer_max_uni_streams: u64 = 1000,
     peer_bidi_stream_count: u64 = 0,
     peer_uni_stream_count: u64 = 0,
     /// Next locally opened uni stream ID (RFC 9000 §2.1). Initialized to 3 on the
@@ -3593,13 +3595,14 @@ pub const Server = struct {
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
     fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
-        // Grow by 1024 streams per MAX_STREAMS — large enough that bursts of
+        // Grow by 1000 streams per MAX_STREAMS — large enough that bursts of
         // gossipsub publishes or req/resps on a fan-out mesh don't repeatedly
-        // race with the next credit grant.
+        // race with the next credit grant, and matches the initial value to
+        // keep behaviour predictable.
         const new_limit: u64 = if (bidi)
-            conn.max_streams_bidi_recv + 1024
+            conn.max_streams_bidi_recv + 1000
         else
-            conn.max_streams_uni_recv + 1024;
+            conn.max_streams_uni_recv + 1000;
 
         if (bidi) {
             conn.max_streams_bidi_recv = new_limit;
