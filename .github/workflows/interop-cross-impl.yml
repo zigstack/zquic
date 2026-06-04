@@ -1,0 +1,218 @@
+# Full zquic↔quinn cross-implementation interop matrix (slow).
+# Not run on every PR — see ci.yml for zquic↔zquic full suite + handshake smoke.
+name: Interop Cross-Impl
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Run unit tests
+        run: zig build test --summary all
+
+  interop-image:
+    name: Build Interop Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build release binaries
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=baseline
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and export interop image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: interop/Dockerfile.prebuilt
+          load: true
+          push: false
+          tags: zquic:interop
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image tar
+        run: docker save zquic:interop | gzip > zquic-interop.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zquic-interop-image
+          path: zquic-interop.tar.gz
+          retention-days: 7
+
+  interop-cross-impl:
+    name: Full Cross-Impl Matrix
+    runs-on: ubuntu-latest
+    needs: [test, interop-image]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zquic-interop-image
+
+      - name: Checkout quic-interop-runner
+        uses: actions/checkout@v4
+        with:
+          repository: quic-interop/quic-interop-runner
+          path: quic-interop-runner
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install interop runner dependencies
+        run: pip3 install -r quic-interop-runner/requirements.txt
+
+      - name: Register zquic implementation
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib
+
+          path = pathlib.Path("quic-interop-runner/implementations_quic.json")
+          impls = json.loads(path.read_text())
+          impls["zquic"] = {
+              "image": "zquic:interop",
+              "url": "https://github.com/ch4r10t33r/zquic",
+              "role": "both",
+          }
+          path.write_text(json.dumps(impls, indent=2))
+          print("Registered zquic:", impls["zquic"])
+          EOF
+
+      - name: Upgrade Docker Engine to v28.1+
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+            https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin
+          docker --version
+
+      - name: Install TShark
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tshark
+          tshark --version | head -1
+
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo modprobe ip6table_filter || true
+          echo '{"ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64"}' | \
+            sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker load < zquic-interop.tar.gz
+
+      - name: Bump interop per-test timeout to 180s
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("quic-interop-runner/testcase.py")
+          src = p.read_text()
+          old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
+          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 180\n'
+          if old not in src:
+              raise SystemExit("Did not find expected default timeout block in testcase.py")
+          p.write_text(src.replace(old, new, 1))
+          print("Patched base TestCase.timeout() -> 180s")
+          EOF
+
+      - name: Run full cross-impl interop matrix
+        run: |
+          mkdir -p interop-results
+          cd quic-interop-runner
+          python3 run.py \
+            --client zquic,quinn \
+            --server zquic,quinn \
+            --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
+            --log-dir ../interop-results/logs \
+            --json ../interop-results/results-cross-impl-full.json \
+            --debug
+
+      - name: Upload interop results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-cross-impl-${{ github.sha }}
+          path: interop-results/
+          retention-days: 30
+
+      - name: Print result summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, sys
+
+          p = pathlib.Path("interop-results/results-cross-impl-full.json")
+          if not p.exists():
+              print("No results-cross-impl-full.json found.")
+              sys.exit(0)
+
+          data = json.loads(p.read_text())
+          clients = data.get("clients", [])
+          servers = data.get("servers", [])
+          raw = data.get("results", [])
+
+          passed, failed, unsupported = [], [], []
+          pair_idx = 0
+          for client in clients:
+              for server in servers:
+                  if pair_idx >= len(raw):
+                      break
+                  pair_results = raw[pair_idx]
+                  pair_idx += 1
+                  label = f"{client}→{server}"
+                  for test_result in pair_results:
+                      if not isinstance(test_result, dict):
+                          continue
+                      test_name = test_result.get("name") or test_result.get("abbr", "?")
+                      result = test_result.get("result")
+                      tag = f"{test_name}({label})"
+                      if result == "succeeded":
+                          passed.append(tag)
+                      elif result in (None, "unsupported", "skipped"):
+                          unsupported.append(tag)
+                      else:
+                          failed.append(tag)
+
+          print(f"\n{'='*55}")
+          print("CROSS-IMPL INTEROP RESULTS")
+          print(f"{'='*55}")
+          print(f"  PASSED      : {len(passed):2d}  {passed}")
+          print(f"  FAILED      : {len(failed):2d}  {failed}")
+          print(f"  UNSUPPORTED : {len(unsupported):2d}  {unsupported}")
+          print(f"{'='*55}\n")
+          if failed:
+              sys.exit(1)
+          EOF

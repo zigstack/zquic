@@ -224,28 +224,32 @@ jobs:
           print("Patched base TestCase.timeout() -> 180s")
           EOF
 
-      # Run the test suite against zquic acting as both client and server.
-      # Order rationale: fast-passing tests run first to fail early on
-      # regressions.  Tests that time out (zerortt, connectionmigration,
-      # multiplexing) are pushed to the end because a per-test timeout corrupts
-      # the NS3 ARP cache for subsequent tests.
-      # http3 must run BEFORE zerortt/connectionmigration: zerortt now actually
-      # connects to the server (resolveAddress IPv4 fix) and times out, which
-      # would contaminate NS3 ARP state and cause http3 to fail.
-      # rebind-port uses the "rebind" NS3 scenario which periodically changes the
-      # client's source port (simulating NAT rebinding).  The server detects the
-      # new src addr and sends PATH_CHALLENGE; the client responds PATH_RESPONSE.
+      # PR interop is split for runtime:
+      #   1) zquic↔zquic — full suite (regression signal on every push/PR)
+      #   2) zquic↔quinn — handshake smoke only (catches #132-class cross-impl bugs
+      #      without ~1–2 h of 56 matrix cases).  Full cross-impl matrix runs in
+      #      .github/workflows/interop-cross-impl.yml (nightly + manual).
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
           cd quic-interop-runner
+          failed=0
+          INTEROP_TESTS="handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port"
+          python3 run.py \
+            --client zquic \
+            --server zquic \
+            --test "$INTEROP_TESTS" \
+            --log-dir ../interop-results/logs-zquic \
+            --json ../interop-results/results-zquic.json \
+            --debug || failed=1
           python3 run.py \
             --client zquic,quinn \
-            --server zquic,quinn \
-            --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
-            --log-dir ../interop-results/logs \
-            --json ../interop-results/results.json \
-            --debug
+            --server zquic \
+            --test handshake \
+            --log-dir ../interop-results/logs-cross-handshake \
+            --json ../interop-results/results-cross-handshake.json \
+            --debug || failed=1
+          exit "$failed"
         # run.py exits with nr_failed (0 = all passed). Do NOT use continue-on-error
         # here — test failures must fail the job. The upload/summary steps below use
         # if: always() so they still run even when this step fails.
@@ -266,44 +270,40 @@ jobs:
           python3 - <<'EOF'
           import json, pathlib, sys
 
-          p = pathlib.Path("interop-results/results.json")
-          if not p.exists():
-              print("No results.json found — test run may have failed to start.")
+          result_files = sorted(pathlib.Path("interop-results").glob("results-*.json"))
+          if not result_files:
+              print("No results-*.json found — test run may have failed to start.")
               sys.exit(0)
 
-          data = json.loads(p.read_text())
-
-          # quic-interop-runner JSON layout:
-          #   clients:  [str, ...]
-          #   servers:  [str, ...]
-          #   results:  flat list, one entry per (client, server) pair (iterating clients outer, servers inner)
-          #             each entry is a list of per-test dicts: [{abbr, name, result}, ...]
-          #             result values: "succeeded" | "failed" | "unsupported" | None
-          clients = data.get("clients", [])
-          servers = data.get("servers", [])
-          raw = data.get("results", [])
-
           passed, failed, unsupported = [], [], []
-          pair_idx = 0
-          for client in clients:
-              for server in servers:
-                  if pair_idx >= len(raw):
-                      break
-                  pair_results = raw[pair_idx]
-                  pair_idx += 1
-                  label = f"{client}→{server}"
-                  for test_result in pair_results:
-                      if not isinstance(test_result, dict):
-                          continue
-                      test_name = test_result.get("name") or test_result.get("abbr", "?")
-                      result = test_result.get("result")
-                      tag = f"{test_name}({label})"
-                      if result == "succeeded":
-                          passed.append(tag)
-                      elif result in (None, "unsupported", "skipped"):
-                          unsupported.append(tag)
-                      else:
-                          failed.append(tag)
+          for p in result_files:
+              data = json.loads(p.read_text())
+              suite = p.stem.removeprefix("results-")
+              # quic-interop-runner JSON layout:
+              #   clients, servers, results (flat per client×server pair)
+              clients = data.get("clients", [])
+              servers = data.get("servers", [])
+              raw = data.get("results", [])
+              pair_idx = 0
+              for client in clients:
+                  for server in servers:
+                      if pair_idx >= len(raw):
+                          break
+                      pair_results = raw[pair_idx]
+                      pair_idx += 1
+                      label = f"{suite}:{client}→{server}"
+                      for test_result in pair_results:
+                          if not isinstance(test_result, dict):
+                              continue
+                          test_name = test_result.get("name") or test_result.get("abbr", "?")
+                          result = test_result.get("result")
+                          tag = f"{test_name}({label})"
+                          if result == "succeeded":
+                              passed.append(tag)
+                          elif result in (None, "unsupported", "skipped"):
+                              unsupported.append(tag)
+                          else:
+                              failed.append(tag)
 
           print(f"\n{'='*55}")
           print(f"INTEROP RESULTS")
