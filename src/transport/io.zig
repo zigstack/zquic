@@ -6819,58 +6819,45 @@ pub const Client = struct {
                     break :blk url;
                 };
 
-                // For 0-RTT-registered streams, the slot already exists.  If a
-                // response has already arrived (recv_high_water > 0) the GET
-                // was delivered and we skip entirely.  Otherwise the 0-RTT
-                // packet was likely dropped (NS3 25-packet queue) — re-send
-                // the GET as 1-RTT without re-registering the slot.
-                var skip_register = false;
+                // Skip streams already sent as 0-RTT (registered by send0RttRequests).
+                // Re-sending them as 1-RTT would inflate 1-RTT bytes past the
+                // 0-RTT byte total and fail the interop zerortt check.  If a
+                // 0-RTT GET was actually lost the peer's PTO/k_packet_threshold
+                // loss detector will trigger STREAM retransmission on the
+                // already-registered slot.
                 if (global_i < self.zerortt_count) {
-                    var any_progress = false;
-                    for (&self.streams) |*s| {
-                        if (s.active and s.stream_id == stream_id) {
-                            if (s.recv_high_water > 0) any_progress = true;
-                            break;
-                        }
-                    }
-                    if (any_progress) {
-                        dbg("io: stream {} ({s}) already received 0-RTT data, skipping\n", .{ stream_id, path });
-                        continue;
-                    }
-                    dbg("io: stream {} ({s}) 0-RTT GET likely dropped, re-sending as 1-RTT\n", .{ stream_id, path });
-                    skip_register = true;
+                    dbg("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
+                    continue;
                 }
 
                 dbg("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
 
-                if (!skip_register) {
-                    // Open output file
-                    var dl_path_buf: [512]u8 = undefined;
-                    const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
-                    const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
-                        dbg("io: cannot create {s}\n", .{dl_path});
-                        continue;
-                    };
+                // Open output file
+                var dl_path_buf: [512]u8 = undefined;
+                const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
+                const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
+                    dbg("io: cannot create {s}\n", .{dl_path});
+                    continue;
+                };
 
-                    // Register stream download in an available slot
-                    var registered = false;
-                    for (&self.streams) |*s| {
-                        if (!s.active) {
-                            s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
-                            if (!self.config.http3) {
-                                s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
-                                s.recv_reorder.?.* = .{};
-                            }
-                            dbg("io: registered stream {} for download\n", .{stream_id});
-                            registered = true;
-                            break;
+                // Register stream download in an available slot
+                var registered = false;
+                for (&self.streams) |*s| {
+                    if (!s.active) {
+                        s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                        if (!self.config.http3) {
+                            s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                            s.recv_reorder.?.* = .{};
                         }
+                        dbg("io: registered stream {} for download\n", .{stream_id});
+                        registered = true;
+                        break;
                     }
-                    if (!registered) {
-                        out_file.close();
-                        dbg("io: streams array full\n", .{});
-                        continue;
-                    }
+                }
+                if (!registered) {
+                    out_file.close();
+                    dbg("io: streams array full\n", .{});
+                    continue;
                 }
 
                 // Build the request payload and QUIC STREAM frame.
