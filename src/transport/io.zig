@@ -9,8 +9,8 @@
 //!
 //! Encryption levels:
 //!   Initial    – AES-128-GCM with DCID-derived Initial secrets
-//!   Handshake  – AES-128-GCM with keys derived from TLS handshake_secret
-//!   1-RTT      – AES-128-GCM with keys derived from TLS application_secret
+//!   Handshake  – AEAD from negotiated TLS cipher (AES-128/256-GCM or ChaCha20)
+//!   1-RTT      – same AEAD as Handshake
 
 const std = @import("std");
 const compat = @import("../compat.zig");
@@ -52,6 +52,16 @@ const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
 const InitialSecrets = keys_mod.InitialSecrets;
 const QuicKeyMaterial = tls_hs.QuicKeyMaterial;
+const PacketCipher = initial_mod.PacketCipher;
+
+fn packetCipherFromTls(cipher_suite: u16) PacketCipher {
+    return switch (cipher_suite) {
+        tls_hs.TLS_AES_128_GCM_SHA256 => .aes128_gcm,
+        tls_hs.TLS_AES_256_GCM_SHA384 => .aes256_gcm,
+        tls_hs.TLS_CHACHA20_POLY1305_SHA256 => .chacha20_poly1305,
+        else => .aes128_gcm,
+    };
+}
 const ServerHandshake = tls_hs.ServerHandshake;
 const ClientHandshake = tls_hs.ClientHandshake;
 
@@ -333,6 +343,7 @@ pub fn buildHandshakePacket(
     pn: u64,
     km: *const KeyMaterial,
     version: u32,
+    cipher: PacketCipher,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
@@ -354,7 +365,7 @@ pub fn buildHandshakePacket(
     hp += len_enc2.len;
 
     // We reuse the Initial protect logic since the AEAD structure is identical.
-    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+    return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
 /// Build a 0-RTT (Long Header, Type=0-RTT) packet.
@@ -367,6 +378,7 @@ pub fn build0RttPacket(
     pn: u64,
     km: *const KeyMaterial,
     version: u32,
+    cipher: PacketCipher,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
@@ -385,7 +397,7 @@ pub fn build0RttPacket(
     const length: u64 = 1 + payload.len + 16;
     const len_enc = try varint.encode(hdr_buf[hp..], length);
     hp += len_enc.len;
-    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+    return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
 /// Build a 1-RTT (Short Header) packet.
@@ -555,8 +567,9 @@ pub fn decryptLongPacket(
     payload_end: usize,
     km: *const KeyMaterial,
     expected_recv_pn: ?u64,
+    cipher: PacketCipher,
 ) !initial_mod.UnprotectResult {
-    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn);
+    return initial_mod.unprotectLongHeaderPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn, cipher);
 }
 
 // ── PEM loading helpers ───────────────────────────────────────────────────────
@@ -851,7 +864,6 @@ fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64)
     return true;
 }
 
-/// Per-connection crypto and TLS state.
 /// Max Handshake datagrams for an 8192-byte server flight (~8 at 1100 B/crypto).
 const max_server_flight_resend_datagrams: usize = 10;
 
@@ -1117,6 +1129,8 @@ pub const ConnState = struct {
     early_km: KeyMaterial = undefined,
     has_early_keys: bool = false,
 
+    // AEAD for Handshake / 0-RTT / 1-RTT (Initial always AES-128-GCM).
+    packet_cipher: PacketCipher = .aes128_gcm,
     // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
     use_chacha20: bool = false,
 
@@ -1171,15 +1185,18 @@ pub const ConnState = struct {
     /// Derive Handshake QUIC keys from TLS handshake traffic secrets.
     /// Call this after processServerHello (client) or processClientHello (server).
     pub fn deriveHandshakeKeys(self: *ConnState, secrets: *const tls_hs.TrafficSecrets) void {
-        const hs_client_qkm = tls_hs.deriveQuicKeys(secrets.client_handshake);
-        const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
-
-        self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
-        self.hs_client_km.initCachedContexts();
-        self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
-        self.hs_server_km.initCachedContexts();
+        self.hs_client_km = .{ .secret = secrets.client_handshake };
+        self.hs_server_km = .{ .secret = secrets.server_handshake };
+        if (self.use_v2) {
+            self.hs_client_km.expandV2();
+            self.hs_server_km.expandV2();
+        } else {
+            self.hs_client_km.expand();
+            self.hs_server_km.expand();
+        }
 
         self.has_hs_keys = true;
+        self.qlog.keyUpdated("handshake", "tls");
     }
 
     /// Derive 1-RTT QUIC keys from TLS application traffic secrets.
@@ -1926,6 +1943,7 @@ pub const Server = struct {
             payload_end,
             &conn.early_km,
             conn.zerortt_recv_pn,
+            conn.packet_cipher,
         ) catch |err| {
             dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
@@ -2142,12 +2160,9 @@ pub const Server = struct {
         conn.sh_len = sh_len;
 
         // Handshake secrets are available; derive QUIC handshake keys.
+        conn.packet_cipher = packetCipherFromTls(conn.tls.ch.cipher_suite);
+        conn.use_chacha20 = conn.packet_cipher == .chacha20_poly1305;
         conn.deriveHandshakeKeys(&conn.tls.secrets);
-
-        // Set cipher based on what was negotiated with the client.
-        if (conn.tls.ch.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
-            conn.use_chacha20 = true;
-        }
 
         // Build and send server flight
         self.buildAndSendServerFlight(conn, src);
@@ -2237,7 +2252,7 @@ pub const Server = struct {
     }
 
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
-        Server.clearServerFlightResend(conn);
+        clearServerFlightResend(conn);
 
         // Server transport parameters (RFC 9000 §7.4 / §18.2): quinn and other
         // stacks require initial_source_connection_id and original_destination_connection_id.
@@ -2276,10 +2291,13 @@ pub const Server = struct {
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
 
+        if (self.config.keylog_path) |kpath| {
+            writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
+        }
+
         // Send Initial (ServerHello) and Handshake (EE + cert + Finished) in
-        // separate UDP datagrams.  Coalescing (RFC 9000 §12.2) is valid but
-        // quinn rejects the coalesced Handshake portion (#132); separate sends
-        // match what quinn-interop and other stacks expect in practice.
+        // separate UDP datagrams.  Coalescing is valid (RFC 9000 §12.2) but
+        // quinn/rustls rejects the coalesced Handshake portion (#132).
         self.sendInitialServerHello(conn, src);
         self.sendHandshakeServerFlight(conn, src);
 
@@ -2322,9 +2340,11 @@ pub const Server = struct {
                 dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
                 return;
             }
+            const init_pn_sent = conn.init_pn;
             conn.init_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
             coalesced_len = pkt_len;
+            conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
         }
 
         // ── Append Handshake packet(s) into the same datagram ───────────────
@@ -2344,20 +2364,23 @@ pub const Server = struct {
 
                 // Try to fit this Handshake packet into the coalesced datagram.
                 const remaining = coalesced_buf[coalesced_len..];
+                const hs_pn_sent = conn.hs_pn;
                 const pkt_len = buildHandshakePacket(
                     remaining,
                     conn.remote_cid,
                     conn.local_cid,
                     frames_buf[0..crypto_len],
-                    conn.hs_pn,
+                    hs_pn_sent,
                     &conn.hs_server_km,
                     conn.quicVersion(),
+                    conn.packet_cipher,
                 ) catch break; // not enough room — send what we have, rest goes separately
 
                 if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
                     dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
                     break;
                 }
+                conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
                 conn.hs_pn += 1;
                 conn.anti_amp_bytes_sent += pkt_len;
                 coalesced_len += pkt_len;
@@ -2418,8 +2441,10 @@ pub const Server = struct {
             return;
         }
 
+        const init_pn_sent = conn.init_pn;
         conn.init_pn += 1;
         conn.anti_amp_bytes_sent += pkt_len;
+        conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
         conn.init_resend.store(send_buf[0..pkt_len]);
         conn.init_resend_valid = true;
@@ -2456,14 +2481,16 @@ pub const Server = struct {
             ) catch return;
             fp += crypto_len;
 
+            const hs_pn_sent = conn.hs_pn;
             const pkt_len = buildHandshakePacket(
                 &send_buf,
                 conn.remote_cid,
                 conn.local_cid,
                 frames_buf[0..fp],
-                conn.hs_pn,
+                hs_pn_sent,
                 &conn.hs_server_km,
                 conn.quicVersion(),
+                conn.packet_cipher,
             ) catch return;
 
             if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
@@ -2473,6 +2500,7 @@ pub const Server = struct {
 
             conn.hs_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
+            conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
                 conn.hs_resend[conn.hs_resend_count].store(send_buf[0..pkt_len]);
@@ -2531,6 +2559,7 @@ pub const Server = struct {
             payload_end,
             &conn.hs_client_km,
             conn.hs_recv_pn,
+            conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
         if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
@@ -2623,16 +2652,19 @@ pub const Server = struct {
         var frames_buf: [64]u8 = undefined;
         const ack_len = buildAckFrame(&frames_buf, pn, 0) catch return;
 
+        const hs_pn_sent = conn.hs_pn;
         const pkt_len = buildHandshakePacket(
             &send_buf,
             conn.remote_cid,
             conn.local_cid,
             frames_buf[0..ack_len],
-            conn.hs_pn,
+            hs_pn_sent,
             &conn.hs_server_km,
             conn.quicVersion(),
+            conn.packet_cipher,
         ) catch return;
         conn.hs_pn += 1;
+        conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
     }
@@ -3431,7 +3463,7 @@ pub const Server = struct {
         };
         const old_offset = slot.stream_offset;
         slot.stream_offset += @intCast(n);
-        var frame_buf: [2048]u8 = undefined;
+        var frame_buf: [path_mtu_mod.max_app_stream_chunk_cap + 64]u8 = undefined;
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
             dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
@@ -4665,6 +4697,16 @@ const StreamDownload = struct {
     stream_id: u64,
     file: compat.fs.File,
     active: bool,
+    /// Highest contiguous byte offset received from stream offset 0 (HTTP/0.9).
+    recv_contiguous: u64 = 0,
+    /// Highest `offset + data.len` seen (includes out-of-order segments).
+    recv_high_water: u64 = 0,
+    /// HTTP/0.9 only: out-of-order STREAM payloads (heap-allocated; not embedded in
+    /// the struct — 2000× CryptoReorderBuf would overflow the stack in Client.init).
+    recv_reorder: ?*quic_tls_mod.CryptoReorderBuf = null,
+    /// Set when a STREAM frame with FIN is seen; download completes once
+    /// `recv_contiguous` reaches this offset (handles FIN-before-gap reordering).
+    fin_end_offset: ?u64 = null,
     /// HTTP/3 only: have we already seen and skipped the HEADERS frame?
     h3_headers_received: bool = false,
     /// Small buffer for incomplete HTTP/3 frame headers that span two STREAM frames.
@@ -4902,6 +4944,12 @@ pub const Client = struct {
         if (self.client_cert_owned) {
             self.allocator.free(self.client_cert_der);
         }
+        for (&self.streams) |*s| {
+            if (s.recv_reorder) |r| {
+                self.allocator.destroy(r);
+                s.recv_reorder = null;
+            }
+        }
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);
         }
@@ -5087,12 +5135,13 @@ pub const Client = struct {
         // Fresh TLS handshake state.
         self.tls = ClientHandshake.init();
 
-        // Close any open stream files.
+        // Close any open stream files and release reorder buffers.
         for (&self.streams) |*s| {
             if (s.active) {
                 s.file.close();
                 s.active = false;
             }
+            self.http09FreeStreamReorder(s);
         }
         self.streams_done = 0;
         self.requested = false;
@@ -5117,7 +5166,10 @@ pub const Client = struct {
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        var deadline = compat.milliTimestamp() + 60_000; // 60 second timeout for transfer
+        // 120 s overall budget keeps us well below the interop runner's 180 s
+        // docker abort, so a stall surfaces as `error.DownloadIncomplete`
+        // instead of a silent SIGKILL.
+        var deadline = compat.milliTimestamp() + 120_000;
 
         while (compat.milliTimestamp() < deadline) {
             const now = compat.milliTimestamp();
@@ -5214,6 +5266,10 @@ pub const Client = struct {
             // the existing processAppFrames handler responds with PATH_RESPONSE,
             // the server validates and updates conn.peer, and subsequent STREAM
             // responses are delivered to the new address (RFC 9000 §9).
+            // Connection migration (RFC 9000 §9): rebind to a new ephemeral
+            // port as soon as the handshake completes so subsequent GETs go
+            // out on the new path. The interop runner verifies via pcap that
+            // the server observed >1 source ports.
             if (self.conn.phase == .connected and self.config.migrate and !self.migrate_done) {
                 self.migrate_done = true;
                 self.rebindMigrateSocket(server_addr);
@@ -5221,6 +5277,10 @@ pub const Client = struct {
 
             // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
+                // Drain any 0-RTT GETs that did not fit in the first two NS3-safe batches.
+                if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
+                    self.send0RttRequests(server_addr) catch {};
+                }
                 if (self.active_urls.len > 0) {
                     try self.downloadUrls(server_addr);
                 }
@@ -5233,12 +5293,17 @@ pub const Client = struct {
                 break;
             }
 
-            deadline = compat.milliTimestamp() + 10_000; // reset on activity
+            deadline = compat.milliTimestamp() + 30_000; // extend while packets still arrive
         }
 
         if (self.conn.phase != .connected) {
             dbg("io: client handshake timed out\n", .{});
             return error.HandshakeTimeout;
+        }
+
+        if (self.streams_done < self.active_urls.len) {
+            dbg("io: client downloads incomplete streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
+            return error.DownloadIncomplete;
         }
 
         dbg("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
@@ -5437,11 +5502,13 @@ pub const Client = struct {
                 continue;
             };
 
-            // Register stream for download.
+            // Register stream for download (reorder buf required for HTTP/0.9 recv).
             var registered = false;
             for (&self.streams) |*s| {
                 if (!s.active) {
                     s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                    s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                    s.recv_reorder.?.* = .{};
                     registered = true;
                     break;
                 }
@@ -5474,6 +5541,7 @@ pub const Client = struct {
                 self.zerortt_pn,
                 &km,
                 self.conn.quicVersion(),
+                packetCipherFromTls(self.tls.cipher_suite),
             ) catch continue;
             self.zerortt_pn += 1;
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -5672,11 +5740,9 @@ pub const Client = struct {
                     return;
                 };
                 // Now we have handshake secrets — derive QUIC keys
+                self.conn.packet_cipher = packetCipherFromTls(self.tls.cipher_suite);
+                self.conn.use_chacha20 = self.conn.packet_cipher == .chacha20_poly1305;
                 self.conn.deriveHandshakeKeys(&self.tls.secrets);
-                // Set cipher based on what the server negotiated.
-                if (self.tls.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
-                    self.conn.use_chacha20 = true;
-                }
             }
             pos += dlen;
         }
@@ -5705,6 +5771,7 @@ pub const Client = struct {
             payload_end,
             &self.conn.hs_server_km,
             self.conn.hs_recv_pn,
+            self.conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
         if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
@@ -5771,16 +5838,19 @@ pub const Client = struct {
             ) catch return;
 
             var pkt_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const hs_pn_sent = self.conn.hs_pn;
             const pkt_len = buildHandshakePacket(
                 &pkt_buf,
                 self.conn.remote_cid,
                 self.conn.local_cid,
                 frame_buf[0..crypto_len],
-                self.conn.hs_pn,
+                hs_pn_sent,
                 &self.conn.hs_client_km,
                 self.conn.quicVersion(),
+                self.conn.packet_cipher,
             ) catch return;
             self.conn.hs_pn += 1;
+            self.conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             _ = compat.sendto(
                 self.sock,
@@ -6286,6 +6356,85 @@ pub const Client = struct {
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
+    fn http09DeliverStreamBytes(s: *StreamDownload, reorder: *quic_tls_mod.CryptoReorderBuf, offset: u64, data: []const u8) void {
+        var off = offset;
+        var payload = data;
+        // Retransmits often cover bytes we already wrote; keep only the new suffix.
+        if (off + payload.len <= s.recv_contiguous) return;
+        if (off < s.recv_contiguous) {
+            const skip = @as(usize, @intCast(s.recv_contiguous - off));
+            if (skip >= payload.len) return;
+            payload = payload[skip..];
+            off = s.recv_contiguous;
+        }
+
+        const end = off + @as(u64, @intCast(payload.len));
+        if (end > s.recv_high_water) s.recv_high_water = end;
+
+        if (off == s.recv_contiguous) {
+            s.file.seekTo(off) catch return;
+            s.file.writeAll(payload) catch return;
+            s.recv_contiguous = end;
+            var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
+            while (true) {
+                const n = reorder.take(s.recv_contiguous, &drain_buf);
+                if (n == 0) break;
+                s.file.seekTo(s.recv_contiguous) catch return;
+                s.file.writeAll(drain_buf[0..n]) catch return;
+                s.recv_contiguous += @as(u64, @intCast(n));
+                if (s.recv_contiguous > s.recv_high_water) s.recv_high_water = s.recv_contiguous;
+            }
+        } else if (off > s.recv_contiguous) {
+            reorder.insert(off, payload);
+        }
+    }
+
+    fn http09NoteStreamFin(s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        const fin_end = sf.offset + @as(u64, @intCast(sf.data.len));
+        if (s.fin_end_offset) |fe| {
+            s.fin_end_offset = @max(fe, @max(fin_end, s.recv_high_water));
+        } else {
+            s.fin_end_offset = @max(fin_end, s.recv_high_water);
+        }
+        dbg("io: stream {} saw FIN (contiguous={} fin_end={} high_water={})\n", .{
+            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?, s.recv_high_water,
+        });
+    }
+
+    fn http09HandleStreamFrame(self: *Client, s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        const reorder = s.recv_reorder orelse return;
+
+        if (sf.offset + sf.data.len <= s.recv_contiguous) {
+            if (sf.fin) http09NoteStreamFin(s, sf);
+            self.http09TryCompleteDownload(s);
+            return;
+        }
+
+        dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
+        http09DeliverStreamBytes(s, reorder, sf.offset, sf.data);
+        if (sf.fin) http09NoteStreamFin(s, sf);
+        self.http09TryCompleteDownload(s);
+    }
+
+    fn http09FreeStreamReorder(self: *Client, s: *StreamDownload) void {
+        if (s.recv_reorder) |r| {
+            self.allocator.destroy(r);
+            s.recv_reorder = null;
+        }
+    }
+
+    fn http09TryCompleteDownload(self: *Client, s: *StreamDownload) void {
+        const fin_end = s.fin_end_offset orelse return;
+        if (!s.active or s.recv_contiguous < fin_end) return;
+        s.file.close();
+        s.active = false;
+        self.http09FreeStreamReorder(s);
+        self.streams_done += 1;
+        dbg("io: stream {} download complete (contiguous={} fin_end={} total: {}/{})\n", .{
+            s.stream_id, s.recv_contiguous, fin_end, self.streams_done, self.active_urls.len,
+        });
+    }
+
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
         dbg("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
@@ -6339,24 +6488,7 @@ pub const Client = struct {
                 if (self.config.http3) {
                     self.handleH3StreamData(s, sf);
                 } else {
-                    dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    // Write at the exact stream offset so retransmitted or
-                    // out-of-order STREAM frames (possible after a NAT rebind
-                    // triggers server-side retransmit) land at the right place.
-                    s.file.seekTo(sf.offset) catch |err| {
-                        dbg("io: client seekTo failed stream_id={}: {}\n", .{ sf.stream_id, err });
-                        return;
-                    };
-                    s.file.writeAll(sf.data) catch |err| {
-                        dbg("io: client writeAll failed stream_id={}: {}\n", .{ sf.stream_id, err });
-                        return;
-                    };
-                    if (sf.fin) {
-                        s.file.close();
-                        s.active = false;
-                        self.streams_done += 1;
-                        dbg("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
-                    }
+                    self.http09HandleStreamFrame(s, sf);
                 }
                 return;
             }
@@ -6688,9 +6820,11 @@ pub const Client = struct {
                 };
 
                 // Skip streams already sent as 0-RTT (registered by send0RttRequests).
-                // Those streams are already tracked in self.streams; re-registering them
-                // would create duplicate slots.  The responses will arrive independently
-                // (either during the handshake phase or via server FIN retransmits).
+                // Re-sending them as 1-RTT would inflate 1-RTT bytes past the
+                // 0-RTT byte total and fail the interop zerortt check.  If a
+                // 0-RTT GET was actually lost the peer's PTO/k_packet_threshold
+                // loss detector will trigger STREAM retransmission on the
+                // already-registered slot.
                 if (global_i < self.zerortt_count) {
                     dbg("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
                     continue;
@@ -6711,6 +6845,10 @@ pub const Client = struct {
                 for (&self.streams) |*s| {
                     if (!s.active) {
                         s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                        if (!self.config.http3) {
+                            s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                            s.recv_reorder.?.* = .{};
+                        }
                         dbg("io: registered stream {} for download\n", .{stream_id});
                         registered = true;
                         break;
@@ -6780,7 +6918,7 @@ pub const Client = struct {
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
             dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
-            const dl_deadline = compat.milliTimestamp() + 60_000;
+            const dl_deadline = compat.milliTimestamp() + 120_000;
             var dl_iter: u32 = 0;
             while (true) {
                 dl_iter += 1;
@@ -6863,6 +7001,7 @@ pub const Client = struct {
             if (s.active) {
                 s.file.close();
                 s.active = false;
+                self.http09FreeStreamReorder(s);
             }
         }
     }

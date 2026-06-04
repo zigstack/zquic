@@ -9,6 +9,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const Aes128 = crypto.core.aes.Aes128;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
+const Aes256Gcm = crypto.aead.aes_gcm.Aes256Gcm;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const Ghash = crypto.onetimeauth.Ghash;
 const modes = crypto.core.modes;
@@ -44,6 +45,35 @@ pub fn encryptAes128Gcm(
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
     Aes128Gcm.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
     @memcpy(dst[plaintext.len..][0..Aes128Gcm.tag_length], &tag);
+}
+
+/// Encrypt using AES-256-GCM (TLS_AES_256_GCM_SHA384 handshake / 1-RTT protection).
+pub fn encryptAes256Gcm(
+    dst: []u8,
+    plaintext: []const u8,
+    aad: []const u8,
+    key: [32]u8,
+    nonce: [12]u8,
+) AeadError!void {
+    if (dst.len < plaintext.len + Aes256Gcm.tag_length) return error.BufferTooSmall;
+    var tag: [Aes256Gcm.tag_length]u8 = undefined;
+    Aes256Gcm.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
+    @memcpy(dst[plaintext.len..][0..Aes256Gcm.tag_length], &tag);
+}
+
+/// Decrypt using AES-256-GCM.
+pub fn decryptAes256Gcm(
+    dst: []u8,
+    ciphertext: []const u8,
+    aad: []const u8,
+    key: [32]u8,
+    nonce: [12]u8,
+) AeadError!void {
+    if (ciphertext.len < Aes256Gcm.tag_length) return error.AuthenticationFailed;
+    const ct = ciphertext[0 .. ciphertext.len - Aes256Gcm.tag_length];
+    const tag = ciphertext[ciphertext.len - Aes256Gcm.tag_length ..][0..Aes256Gcm.tag_length];
+    if (dst.len < ct.len) return error.BufferTooSmall;
+    Aes256Gcm.decrypt(dst[0..ct.len], ct, tag.*, aad, nonce, key) catch return error.AuthenticationFailed;
 }
 
 /// Decrypt and authenticate ciphertext using AES-128-GCM.

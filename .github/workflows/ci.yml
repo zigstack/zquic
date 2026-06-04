@@ -236,7 +236,8 @@ jobs:
           zquic_failed=0
           cross_failed=0
           # rebind-port is flaky on GitHub-hosted runners (NS3 port rebind); keep in nightly cross-impl.
-          INTEROP_TESTS="handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing"
+          # connectionmigration before zerortt: long zerortt run leaves NS3 in a bad state.
+          INTEROP_TESTS="handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,connectionmigration,zerortt,multiplexing"
           python3 run.py \
             --client zquic \
             --server zquic \
