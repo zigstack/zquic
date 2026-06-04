@@ -5506,9 +5506,9 @@ pub const Client = struct {
             var registered = false;
             for (&self.streams) |*s| {
                 if (!s.active) {
+                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
                     s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
                     s.recv_reorder.?.* = .{};
-                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
                     registered = true;
                     break;
                 }
