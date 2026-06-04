@@ -1791,11 +1791,12 @@ pub const Server = struct {
                 // Retransmitted Initial: re-send the server flight so the client
                 // can make progress even if our first response was lost.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    // Separate Initial + Handshake datagrams (not coalesced): quinn
-                    // rustls rejects a second EncryptedExtensions if the Handshake
-                    // flight is replayed inside a coalesced datagram (#132 / #135).
+                    // Retransmitted Initial after we already sent the Handshake flight:
+                    // replay only ServerHello in an Initial packet.  Re-sending the
+                    // Handshake CRYPTO stream from offset 0 duplicates
+                    // EncryptedExtensions and quinn/rustls reports
+                    // UnsolicitedEncryptedExtension (interop cross-handshake CI).
                     self.sendInitialServerHello(existing, src);
-                    self.sendHandshakeServerFlight(existing, src);
                 }
                 return;
             }
