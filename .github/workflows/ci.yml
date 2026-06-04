@@ -239,9 +239,12 @@ jobs:
         run: |
           mkdir -p interop-results
           cd quic-interop-runner
+          # Cross-impl matrix: include quinn so we catch zquic↔quinn handshake
+          # regressions early.  quinn is libp2p's primary QUIC stack in the Rust
+          # ecosystem; zeam's interop with lambdaclass/ethlambda runs through it.
           python3 run.py \
-            --client zquic \
-            --server zquic \
+            --client zquic,quinn \
+            --server zquic,quinn \
             --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
