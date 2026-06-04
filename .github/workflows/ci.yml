@@ -252,10 +252,7 @@ jobs:
             --log-dir ../interop-results/logs-cross-handshake \
             --json ../interop-results/results-cross-handshake.json \
             --debug || cross_failed=1
-          if [[ "$cross_failed" -ne 0 ]]; then
-            echo "::warning::quinn↔zquic cross-impl handshake failed (see results-cross-handshake.json); nightly interop-cross-impl.yml tracks full matrix"
-          fi
-          exit "$zquic_failed"
+          exit "$((zquic_failed | cross_failed))"
         # run.py exits with nr_failed (0 = all passed). Do NOT use continue-on-error
         # here — test failures must fail the job. The upload/summary steps below use
         # if: always() so they still run even when this step fails.

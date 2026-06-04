@@ -10,6 +10,14 @@ const aead = @import("aead.zig");
 pub const InitialSecrets = keys.InitialSecrets;
 pub const KeyMaterial = keys.KeyMaterial;
 
+/// AEAD used for Handshake / 0-RTT / 1-RTT packets (RFC 9001 §5.3).
+/// Initial packets always use AES-128-GCM regardless of the TLS cipher suite.
+pub const PacketCipher = enum {
+    aes128_gcm,
+    aes256_gcm,
+    chacha20_poly1305,
+};
+
 /// The number of bytes of ciphertext sampled for header protection (RFC 9001 §5.4.2).
 pub const hp_sample_len = 16;
 
@@ -56,13 +64,16 @@ pub fn decompressPacketNumber(truncated_pn: u64, expected_pn: ?u64, pn_len_bits:
     return candidate_pn;
 }
 
+/// Minimum `pn_len` wire encoding (RFC 9000 §17.1) for a given packet number.
+pub fn wirePacketNumberLen(pn: u64) u2 {
+    if (pn < 0x100) return 0;
+    if (pn < 0x10000) return 1;
+    if (pn < 0x1000000) return 2;
+    return 3;
+}
+
 /// Encrypt a QUIC Initial packet payload and apply header protection.
-///
-/// `header` must contain the full QUIC long header (up to but not including
-/// the packet number). `pn_buf` contains the raw packet number bytes (1–4).
-/// `plaintext` is the QUIC payload (frames). `dst` must be large enough.
-///
-/// Returns the total number of bytes written to `dst` (header + pn + ct + tag).
+/// Initial packets always use AES-128-GCM (RFC 9001 §5.3).
 pub fn protectInitialPacket(
     dst: []u8,
     header: []const u8,
@@ -71,16 +82,29 @@ pub fn protectInitialPacket(
     plaintext: []const u8,
     km: *const KeyMaterial,
 ) aead.AeadError!usize {
+    return protectLongHeaderPacket(dst, header, pn, pn_len, plaintext, km, .aes128_gcm);
+}
+
+/// Encrypt a long-header (Handshake / 0-RTT) packet and apply header protection.
+pub fn protectLongHeaderPacket(
+    dst: []u8,
+    header: []const u8,
+    pn: u64,
+    pn_len: u2,
+    plaintext: []const u8,
+    km: *const KeyMaterial,
+    cipher: PacketCipher,
+) aead.AeadError!usize {
     const actual_pn_len: usize = @as(usize, pn_len) + 1;
-    const ct_and_tag_len = plaintext.len + 16; // AES-128-GCM tag
+    const ct_and_tag_len = plaintext.len + 16;
 
     if (dst.len < header.len + actual_pn_len + ct_and_tag_len) return error.BufferTooSmall;
 
-    // Copy header
     @memcpy(dst[0..header.len], header);
+    dst[0] &= ~@as(u8, 0x03);
+    dst[0] |= @as(u8, pn_len);
     var pos = header.len;
 
-    // Write packet number (big-endian, truncated)
     var pn_buf: [4]u8 = undefined;
     var i: usize = 0;
     while (i < actual_pn_len) : (i += 1) {
@@ -89,16 +113,19 @@ pub fn protectInitialPacket(
     @memcpy(dst[pos .. pos + actual_pn_len], pn_buf[0..actual_pn_len]);
     pos += actual_pn_len;
 
-    // AAD = header || pn_bytes
-    const aad = dst[0..pos];
+    var aad_buf: [128]u8 = undefined;
+    if (pos > aad_buf.len) return error.BufferTooSmall;
+    @memcpy(aad_buf[0..pos], dst[0..pos]);
+    const aad = aad_buf[0..pos];
     const nonce = aead.buildNonce(km.iv, pn);
 
-    // Encrypt payload
-    try km.aes_ctx.encrypt(dst[pos .. pos + ct_and_tag_len], plaintext, aad, nonce);
+    switch (cipher) {
+        .aes128_gcm => try km.aes_ctx.encrypt(dst[pos .. pos + ct_and_tag_len], plaintext, aad, nonce),
+        .aes256_gcm => try aead.encryptAes256Gcm(dst[pos .. pos + ct_and_tag_len], plaintext, aad, km.key32, nonce),
+        .chacha20_poly1305 => try aead.encryptChaCha20Poly1305(dst[pos .. pos + ct_and_tag_len], plaintext, aad, km.key32, nonce),
+    }
     pos += ct_and_tag_len;
 
-    // Apply header protection using cached HP context
-    // Sample starts at pn_start + 4 (RFC 9001 §5.4.2)
     const pn_start = header.len;
     const sample_start = pn_start + hp_sample_offset;
     if (pos < sample_start + hp_sample_len) return error.BufferTooSmall;
@@ -106,12 +133,18 @@ pub fn protectInitialPacket(
     @memcpy(&sample, dst[sample_start .. sample_start + hp_sample_len]);
 
     const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
-    // RFC 9001 §5.4.1: long headers mask bits 3-0 (0x0f), short headers mask bits 5-0 (0x1f).
     const first_byte_mask: u8 = if (header[0] & 0x80 != 0) 0x0f else 0x1f;
-    const mask = km.hp_ctx.hpMask(sample);
-    dst[0] ^= mask[0] & first_byte_mask;
-    for (pn_bytes_slice, 0..) |*b, mi| {
-        b.* ^= mask[1 + mi];
+    switch (cipher) {
+        .aes128_gcm, .aes256_gcm => {
+            const mask = km.hp_ctx.hpMask(sample);
+            dst[0] ^= mask[0] & first_byte_mask;
+            for (pn_bytes_slice, 0..) |*b, mi| {
+                b.* ^= mask[1 + mi];
+            }
+        },
+        .chacha20_poly1305 => {
+            aead.HeaderProtection.applyChaCha20(km.hp32, sample, &dst[0], pn_bytes_slice, first_byte_mask);
+        },
     }
 
     return pos;
@@ -146,6 +179,18 @@ pub fn unprotectInitialPacket(
     km: *const KeyMaterial,
     expected_recv_pn: ?u64,
 ) (aead.AeadError || error{BufferTooShort})!UnprotectResult {
+    return unprotectLongHeaderPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn, .aes128_gcm);
+}
+
+pub fn unprotectLongHeaderPacket(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    payload_end: usize,
+    km: *const KeyMaterial,
+    expected_recv_pn: ?u64,
+    cipher: PacketCipher,
+) (aead.AeadError || error{BufferTooShort})!UnprotectResult {
     if (buf.len < pn_start + hp_sample_offset + hp_sample_len) return error.BufferTooShort;
 
     // Sample for header protection removal
@@ -155,21 +200,44 @@ pub fn unprotectInitialPacket(
 
     // Compute HP mask and unmask first byte to discover PN length.
     const first_byte_mask: u8 = if (buf[0] & 0x80 != 0) 0x0f else 0x1f;
-    const mask = km.hp_ctx.hpMask(sample);
-    const unmasked_first = buf[0] ^ (mask[0] & first_byte_mask);
+    const unmasked_first: u8 = switch (cipher) {
+        .aes128_gcm, .aes256_gcm => blk: {
+            const mask = km.hp_ctx.hpMask(sample);
+            break :blk buf[0] ^ (mask[0] & first_byte_mask);
+        },
+        .chacha20_poly1305 => blk: {
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const cc_nonce = sample[4..16].*;
+            var full_mask: [64]u8 = undefined;
+            std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+            break :blk buf[0] ^ (full_mask[0] & first_byte_mask);
+        },
+    };
     const actual_pn_len: usize = (unmasked_first & 0x03) + 1;
 
-    // Copy only the header bytes needed for AAD (replaces the 1600-byte full-packet copy).
-    // 128 bytes covers the worst case: 1 + 4 + 1+20 + 1+20 + 8(token_len) + 53(token) + 8 + 4 = ~120.
     const aad_end = pn_start + actual_pn_len;
     var aad_buf: [128]u8 = undefined;
     if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
     @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
-    // Unmask first byte and PN bytes in the AAD copy.
-    aad_buf[0] ^= mask[0] & first_byte_mask;
-    for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
-        b.* ^= mask[mi];
+    switch (cipher) {
+        .aes128_gcm, .aes256_gcm => {
+            const mask = km.hp_ctx.hpMask(sample);
+            aad_buf[0] ^= mask[0] & first_byte_mask;
+            for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
+                b.* ^= mask[mi];
+            }
+        },
+        .chacha20_poly1305 => {
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const cc_nonce = sample[4..16].*;
+            var full_mask: [64]u8 = undefined;
+            std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+            aad_buf[0] ^= full_mask[0] & first_byte_mask;
+            for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
+                b.* ^= full_mask[mi];
+            }
+        },
     }
 
     // Decode the truncated wire PN, then reconstruct the full PN per RFC 9000
@@ -193,7 +261,11 @@ pub fn unprotectInitialPacket(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
+    switch (cipher) {
+        .aes128_gcm => try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce),
+        .aes256_gcm => try aead.decryptAes256Gcm(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce),
+        .chacha20_poly1305 => try aead.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce),
+    }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
 
@@ -294,6 +366,29 @@ pub fn unprotectPacketChaCha20(
 
     try aead.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad_slice, km.key32, nonce);
     return plaintext_len;
+}
+
+test "initial: AES-256-GCM long-header round-trip" {
+    const testing = std.testing;
+    var km: KeyMaterial = .{ .secret = [_]u8{0x77} ** 32 };
+    km.expand();
+
+    const header = [_]u8{ 0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0x00, 0x40, 0x10 };
+    const plaintext = "handshake flight payload";
+
+    var dst: [512]u8 = undefined;
+    const written = try protectLongHeaderPacket(&dst, &header, 0, 0, plaintext, &km, .aes256_gcm);
+    var decrypted: [128]u8 = undefined;
+    const dec = try unprotectLongHeaderPacket(
+        &decrypted,
+        dst[0..written],
+        header.len,
+        written,
+        &km,
+        null,
+        .aes256_gcm,
+    );
+    try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec.pt_len]);
 }
 
 test "initial: encrypt/decrypt round-trip" {

@@ -230,19 +230,7 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
     const cs_len = readU16(body[p..]);
     p += 2;
     if (body.len < p + cs_len) return error.TruncatedMessage;
-    var preferred: u16 = 0;
-    var i: usize = 0;
-    while (i + 1 < cs_len) : (i += 2) {
-        const cs = readU16(body[p + i ..]);
-        if (preferred == 0 and (cs == TLS_AES_128_GCM_SHA256 or
-            cs == TLS_AES_256_GCM_SHA384 or
-            cs == TLS_CHACHA20_POLY1305_SHA256))
-        {
-            preferred = cs;
-        }
-    }
-    if (preferred == 0) return error.UnsupportedCipherSuites;
-    result.cipher_suite = preferred;
+    result.cipher_suite = selectPreferredCipherSuite(body[p .. p + cs_len]) catch return error.UnsupportedCipherSuites;
     p += cs_len;
 
     // compression methods
@@ -323,6 +311,30 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
 
     if (result.x25519_key == null) return error.NoKeyShare;
     return result;
+}
+
+/// Pick the best TLS 1.3 cipher from a ClientHello cipher_suites list (big-endian u16 values).
+/// Prefer AES-128-GCM for QUIC interop: many peers (e.g. quinn) list AES-256 first but
+/// expect the negotiated AEAD to match the suite (RFC 9001 §5.3).
+pub fn selectPreferredCipherSuite(cs_list: []const u8) !u16 {
+    var best: u16 = 0;
+    var best_rank: u8 = 0;
+    var i: usize = 0;
+    while (i + 1 < cs_list.len) : (i += 2) {
+        const cs = readU16(cs_list[i..]);
+        const rank: u8 = switch (cs) {
+            TLS_AES_128_GCM_SHA256 => 3,
+            TLS_CHACHA20_POLY1305_SHA256 => 2,
+            TLS_AES_256_GCM_SHA384 => 1,
+            else => 0,
+        };
+        if (rank > best_rank) {
+            best_rank = rank;
+            best = cs;
+        }
+    }
+    if (best_rank == 0) return error.UnsupportedCipherSuites;
+    return best;
 }
 
 // ── ServerHello builder ──────────────────────────────────────────────────────
@@ -1727,6 +1739,16 @@ test "handshake: client-server secrets are mirrored" {
     // At this point both sides should have matching handshake secrets
     try testing.expectEqualSlices(u8, &cli.secrets.client_handshake, &srv.secrets.client_handshake);
     try testing.expectEqualSlices(u8, &cli.secrets.server_handshake, &srv.secrets.server_handshake);
+}
+
+test "handshake: selectPreferredCipherSuite prefers AES-128 over AES-256" {
+    const testing = std.testing;
+    // quinn-style ordering: AES-256 first, then AES-128, then ChaCha20.
+    const suites = [_]u8{
+        0x13, 0x02, 0x13, 0x01, 0x13, 0x03,
+    };
+    const picked = try selectPreferredCipherSuite(&suites);
+    try testing.expectEqual(TLS_AES_128_GCM_SHA256, picked);
 }
 
 test "handshake: QUIC key derivation" {

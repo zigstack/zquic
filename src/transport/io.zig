@@ -9,8 +9,8 @@
 //!
 //! Encryption levels:
 //!   Initial    – AES-128-GCM with DCID-derived Initial secrets
-//!   Handshake  – AES-128-GCM with keys derived from TLS handshake_secret
-//!   1-RTT      – AES-128-GCM with keys derived from TLS application_secret
+//!   Handshake  – AEAD from negotiated TLS cipher (AES-128/256-GCM or ChaCha20)
+//!   1-RTT      – same AEAD as Handshake
 
 const std = @import("std");
 const compat = @import("../compat.zig");
@@ -52,6 +52,16 @@ const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
 const InitialSecrets = keys_mod.InitialSecrets;
 const QuicKeyMaterial = tls_hs.QuicKeyMaterial;
+const PacketCipher = initial_mod.PacketCipher;
+
+fn packetCipherFromTls(cipher_suite: u16) PacketCipher {
+    return switch (cipher_suite) {
+        tls_hs.TLS_AES_128_GCM_SHA256 => .aes128_gcm,
+        tls_hs.TLS_AES_256_GCM_SHA384 => .aes256_gcm,
+        tls_hs.TLS_CHACHA20_POLY1305_SHA256 => .chacha20_poly1305,
+        else => .aes128_gcm,
+    };
+}
 const ServerHandshake = tls_hs.ServerHandshake;
 const ClientHandshake = tls_hs.ClientHandshake;
 
@@ -333,6 +343,7 @@ pub fn buildHandshakePacket(
     pn: u64,
     km: *const KeyMaterial,
     version: u32,
+    cipher: PacketCipher,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
@@ -354,7 +365,7 @@ pub fn buildHandshakePacket(
     hp += len_enc2.len;
 
     // We reuse the Initial protect logic since the AEAD structure is identical.
-    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+    return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
 /// Build a 0-RTT (Long Header, Type=0-RTT) packet.
@@ -367,6 +378,7 @@ pub fn build0RttPacket(
     pn: u64,
     km: *const KeyMaterial,
     version: u32,
+    cipher: PacketCipher,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
@@ -385,7 +397,7 @@ pub fn build0RttPacket(
     const length: u64 = 1 + payload.len + 16;
     const len_enc = try varint.encode(hdr_buf[hp..], length);
     hp += len_enc.len;
-    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+    return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
 /// Build a 1-RTT (Short Header) packet.
@@ -555,8 +567,9 @@ pub fn decryptLongPacket(
     payload_end: usize,
     km: *const KeyMaterial,
     expected_recv_pn: ?u64,
+    cipher: PacketCipher,
 ) !initial_mod.UnprotectResult {
-    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn);
+    return initial_mod.unprotectLongHeaderPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn, cipher);
 }
 
 // ── PEM loading helpers ───────────────────────────────────────────────────────
@@ -1095,6 +1108,8 @@ pub const ConnState = struct {
     early_km: KeyMaterial = undefined,
     has_early_keys: bool = false,
 
+    // AEAD for Handshake / 0-RTT / 1-RTT (Initial always AES-128-GCM).
+    packet_cipher: PacketCipher = .aes128_gcm,
     // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
     use_chacha20: bool = false,
 
@@ -1149,15 +1164,18 @@ pub const ConnState = struct {
     /// Derive Handshake QUIC keys from TLS handshake traffic secrets.
     /// Call this after processServerHello (client) or processClientHello (server).
     pub fn deriveHandshakeKeys(self: *ConnState, secrets: *const tls_hs.TrafficSecrets) void {
-        const hs_client_qkm = tls_hs.deriveQuicKeys(secrets.client_handshake);
-        const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
-
-        self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
-        self.hs_client_km.initCachedContexts();
-        self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
-        self.hs_server_km.initCachedContexts();
+        self.hs_client_km = .{ .secret = secrets.client_handshake };
+        self.hs_server_km = .{ .secret = secrets.server_handshake };
+        if (self.use_v2) {
+            self.hs_client_km.expandV2();
+            self.hs_server_km.expandV2();
+        } else {
+            self.hs_client_km.expand();
+            self.hs_server_km.expand();
+        }
 
         self.has_hs_keys = true;
+        self.qlog.keyUpdated("handshake", "tls");
     }
 
     /// Derive 1-RTT QUIC keys from TLS application traffic secrets.
@@ -1773,8 +1791,8 @@ pub const Server = struct {
                 // Retransmitted Initial: re-send the server flight so the client
                 // can make progress even if our first response was lost.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    self.sendInitialServerHello(existing, src);
-                    self.sendHandshakeServerFlight(existing, src);
+                    existing.hs_pn = 0;
+                    self.sendCoalescedServerFlight(existing, src);
                 }
                 return;
             }
@@ -1903,6 +1921,7 @@ pub const Server = struct {
             payload_end,
             &conn.early_km,
             conn.zerortt_recv_pn,
+            conn.packet_cipher,
         ) catch |err| {
             dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
@@ -2119,12 +2138,9 @@ pub const Server = struct {
         conn.sh_len = sh_len;
 
         // Handshake secrets are available; derive QUIC handshake keys.
+        conn.packet_cipher = packetCipherFromTls(conn.tls.ch.cipher_suite);
+        conn.use_chacha20 = conn.packet_cipher == .chacha20_poly1305;
         conn.deriveHandshakeKeys(&conn.tls.secrets);
-
-        // Set cipher based on what was negotiated with the client.
-        if (conn.tls.ch.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
-            conn.use_chacha20 = true;
-        }
 
         // Build and send server flight
         self.buildAndSendServerFlight(conn, src);
@@ -2217,12 +2233,11 @@ pub const Server = struct {
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
 
-        // Send Initial (ServerHello) and Handshake (EE + cert + Finished) in
-        // separate UDP datagrams.  Coalescing (RFC 9000 §12.2) is valid but
-        // quinn rejects the coalesced Handshake portion (#132); separate sends
-        // match what quinn-interop and other stacks expect in practice.
-        self.sendInitialServerHello(conn, src);
-        self.sendHandshakeServerFlight(conn, src);
+        if (self.config.keylog_path) |kpath| {
+            writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
+        }
+
+        self.sendCoalescedServerFlight(conn, src);
 
         conn.phase = .waiting_finished;
     }
@@ -2263,9 +2278,11 @@ pub const Server = struct {
                 dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
                 return;
             }
+            const init_pn_sent = conn.init_pn;
             conn.init_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
             coalesced_len = pkt_len;
+            conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
         }
 
         // ── Append Handshake packet(s) into the same datagram ───────────────
@@ -2285,20 +2302,23 @@ pub const Server = struct {
 
                 // Try to fit this Handshake packet into the coalesced datagram.
                 const remaining = coalesced_buf[coalesced_len..];
+                const hs_pn_sent = conn.hs_pn;
                 const pkt_len = buildHandshakePacket(
                     remaining,
                     conn.remote_cid,
                     conn.local_cid,
                     frames_buf[0..crypto_len],
-                    conn.hs_pn,
+                    hs_pn_sent,
                     &conn.hs_server_km,
                     conn.quicVersion(),
+                    conn.packet_cipher,
                 ) catch break; // not enough room — send what we have, rest goes separately
 
                 if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
                     dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
                     break;
                 }
+                conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
                 conn.hs_pn += 1;
                 conn.anti_amp_bytes_sent += pkt_len;
                 coalesced_len += pkt_len;
@@ -2359,8 +2379,10 @@ pub const Server = struct {
             return;
         }
 
+        const init_pn_sent = conn.init_pn;
         conn.init_pn += 1;
         conn.anti_amp_bytes_sent += pkt_len;
+        conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
             dbg("io: sendto Initial failed: {}\n", .{err});
@@ -2394,14 +2416,16 @@ pub const Server = struct {
             ) catch return;
             fp += crypto_len;
 
+            const hs_pn_sent = conn.hs_pn;
             const pkt_len = buildHandshakePacket(
                 &send_buf,
                 conn.remote_cid,
                 conn.local_cid,
                 frames_buf[0..fp],
-                conn.hs_pn,
+                hs_pn_sent,
                 &conn.hs_server_km,
                 conn.quicVersion(),
+                conn.packet_cipher,
             ) catch return;
 
             if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
@@ -2411,6 +2435,7 @@ pub const Server = struct {
 
             conn.hs_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
+            conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                 dbg("io: sendto Handshake failed: {}\n", .{err});
@@ -2464,6 +2489,7 @@ pub const Server = struct {
             payload_end,
             &conn.hs_client_km,
             conn.hs_recv_pn,
+            conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
         if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
@@ -2556,16 +2582,19 @@ pub const Server = struct {
         var frames_buf: [64]u8 = undefined;
         const ack_len = buildAckFrame(&frames_buf, pn, 0) catch return;
 
+        const hs_pn_sent = conn.hs_pn;
         const pkt_len = buildHandshakePacket(
             &send_buf,
             conn.remote_cid,
             conn.local_cid,
             frames_buf[0..ack_len],
-            conn.hs_pn,
+            hs_pn_sent,
             &conn.hs_server_km,
             conn.quicVersion(),
+            conn.packet_cipher,
         ) catch return;
         conn.hs_pn += 1;
+        conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
     }
@@ -5407,6 +5436,7 @@ pub const Client = struct {
                 self.zerortt_pn,
                 &km,
                 self.conn.quicVersion(),
+                packetCipherFromTls(self.tls.cipher_suite),
             ) catch continue;
             self.zerortt_pn += 1;
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -5605,11 +5635,9 @@ pub const Client = struct {
                     return;
                 };
                 // Now we have handshake secrets — derive QUIC keys
+                self.conn.packet_cipher = packetCipherFromTls(self.tls.cipher_suite);
+                self.conn.use_chacha20 = self.conn.packet_cipher == .chacha20_poly1305;
                 self.conn.deriveHandshakeKeys(&self.tls.secrets);
-                // Set cipher based on what the server negotiated.
-                if (self.tls.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
-                    self.conn.use_chacha20 = true;
-                }
             }
             pos += dlen;
         }
@@ -5638,6 +5666,7 @@ pub const Client = struct {
             payload_end,
             &self.conn.hs_server_km,
             self.conn.hs_recv_pn,
+            self.conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
         if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
@@ -5704,16 +5733,19 @@ pub const Client = struct {
             ) catch return;
 
             var pkt_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const hs_pn_sent = self.conn.hs_pn;
             const pkt_len = buildHandshakePacket(
                 &pkt_buf,
                 self.conn.remote_cid,
                 self.conn.local_cid,
                 frame_buf[0..crypto_len],
-                self.conn.hs_pn,
+                hs_pn_sent,
                 &self.conn.hs_client_km,
                 self.conn.quicVersion(),
+                self.conn.packet_cipher,
             ) catch return;
             self.conn.hs_pn += 1;
+            self.conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             _ = compat.sendto(
                 self.sock,
