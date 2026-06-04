@@ -6898,7 +6898,7 @@ test "io PEM: parseCertDerFromPem round-trips file-based loadCertDer" {
         defer f.close();
         try f.writeAll(pem);
     }
-    defer _ = std.c.unlink(&path_buf);
+    defer compat.fs.deleteFileAbsolute(path) catch {};
 
     const from_file = try loadCertDer(a, path);
     defer a.free(from_file);
@@ -6931,7 +6931,7 @@ test "io PEM: parsePrivateKeyFromPem round-trips file-based loadPrivateKey" {
         defer f.close();
         try f.writeAll(key_pem);
     }
-    defer _ = std.c.unlink(&path_buf);
+    defer compat.fs.deleteFileAbsolute(path) catch {};
 
     const pk_file = try loadPrivateKey(a, path);
     try std.testing.expectEqual(pk_mem.signature_scheme, pk_file.signature_scheme);
