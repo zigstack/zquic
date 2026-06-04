@@ -468,6 +468,20 @@ pub fn buildEncryptedExtensions(
     return pos;
 }
 
+/// ALPN for EncryptedExtensions only when the client offered it (rustls
+/// `server/hs.rs` `process_common` + client `validate_encrypted_extensions`).
+fn eeAlpnMatchingClientOffer(ch: *const ClientHelloData, preferred: ?[]const u8) ?[]const u8 {
+    const p = preferred orelse return null;
+    if (std.mem.eql(u8, p, ALPN_H3) and ch.alpn_h3) return p;
+    if (std.mem.eql(u8, p, ALPN_H09) and ch.alpn_h09) return p;
+    return null;
+}
+
+/// early_data in EE only on accepted PSK resumption (rustls `decide_if_early_data_allowed`).
+fn eeAcceptEarlyData(ch: *const ClientHelloData, accept_psk: bool) bool {
+    return ch.has_early_data and accept_psk;
+}
+
 // ── Certificate builder ───────────────────────────────────────────────────────
 
 /// Build a TLS 1.3 Certificate message with one DER certificate.
@@ -1207,8 +1221,10 @@ pub const ServerHandshake = struct {
     ) !usize {
         var pos: usize = 0;
 
-        // EncryptedExtensions (include early_data acceptance if client requested it)
-        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, alpn, self.ch.has_early_data);
+        // EncryptedExtensions: mirror rustls/quinn — only extensions the client offered.
+        const ee_alpn = eeAlpnMatchingClientOffer(&self.ch, alpn);
+        const ee_early = eeAcceptEarlyData(&self.ch, self.accept_psk);
+        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, ee_alpn, ee_early);
         self.transcript.update(out[pos .. pos + ee_len]);
         pos += ee_len;
 
