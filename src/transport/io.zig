@@ -2217,9 +2217,12 @@ pub const Server = struct {
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
 
-        // Coalesce Initial + Handshake packets into a single UDP datagram
-        // (RFC 9000 §12.2).  Fall back to separate sends for any remainder.
-        self.sendCoalescedServerFlight(conn, src);
+        // Send Initial (ServerHello) and Handshake (EE + cert + Finished) in
+        // separate UDP datagrams.  Coalescing (RFC 9000 §12.2) is valid but
+        // quinn rejects the coalesced Handshake portion (#132); separate sends
+        // match what quinn-interop and other stacks expect in practice.
+        self.sendInitialServerHello(conn, src);
+        self.sendHandshakeServerFlight(conn, src);
 
         conn.phase = .waiting_finished;
     }
