@@ -864,7 +864,21 @@ fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64)
     return true;
 }
 
-/// Per-connection crypto and TLS state.
+/// Max Handshake datagrams for an 8192-byte server flight (~8 at 1100 B/crypto).
+const max_server_flight_resend_datagrams: usize = 10;
+
+/// Cached UDP payload for server flight retransmit (same PN/ciphertext).
+const StoredDatagram = struct {
+    len: u16 = 0,
+    data: [MAX_DATAGRAM_SIZE]u8 = undefined,
+
+    fn store(self: *StoredDatagram, pkt: []const u8) void {
+        const n = @min(pkt.len, self.data.len);
+        @memcpy(self.data[0..n], pkt[0..n]);
+        self.len = @intCast(n);
+    }
+};
+
 pub const ConnState = struct {
     phase: ConnPhase = .initial,
 
@@ -1003,6 +1017,13 @@ pub const ConnState = struct {
     finished_pkt: [MAX_DATAGRAM_SIZE]u8 = [_]u8{0} ** MAX_DATAGRAM_SIZE,
     finished_pkt_len: usize = 0,
     finished_sent_ms: i64 = 0,
+
+    // Server flight datagrams for Initial retransmit (quinn/rustls #132).
+    init_resend: StoredDatagram = .{},
+    init_resend_valid: bool = false,
+    hs_resend: [max_server_flight_resend_datagrams]StoredDatagram =
+        [_]StoredDatagram{.{}} ** max_server_flight_resend_datagrams,
+    hs_resend_count: u8 = 0,
 
     // 1-RTT key phase tracking for key updates (RFC 9001 §6).
     // Tracks the current key phase bit for outgoing short-header packets.
@@ -1788,12 +1809,13 @@ pub const Server = struct {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
             if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial: replay the server flight so the client can
-                // make progress when our first response was lost (NS3 drops).
+                // Retransmitted Initial: replay exact UDP payloads. Rebuilding with
+                // new PNs re-injects TLS records and quinn reports UnsolicitedEncryptedExtension.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    self.sendInitialServerHello(existing, src);
-                    self.sendHandshakeServerFlight(existing, src);
+                    self.replayStoredServerFlight(existing, src);
                 }
+                // Quinn does not rebuild the TLS flight here; loss recovery re-sends the
+                // same CRYPTO bytes (connection/spaces.rs). We cache the first UDP payloads.
                 return;
             }
 
@@ -2195,7 +2217,43 @@ pub const Server = struct {
         }
     }
 
+    fn clearServerFlightResend(conn: *ConnState) void {
+        conn.init_resend_valid = false;
+        conn.hs_resend_count = 0;
+    }
+
+    /// Resend cached Initial + Handshake datagrams without new packet numbers.
+    fn replayStoredServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
+        if (conn.init_resend_valid and conn.init_resend.len > 0) {
+            _ = compat.sendto(
+                self.sock,
+                conn.init_resend.data[0..conn.init_resend.len],
+                0,
+                &src.any,
+                src.getOsSockLen(),
+            ) catch |err| {
+                dbg("io: retransmit Initial failed: {}\n", .{err});
+            };
+        }
+        var i: u8 = 0;
+        while (i < conn.hs_resend_count) : (i += 1) {
+            const slot = &conn.hs_resend[i];
+            if (slot.len == 0) continue;
+            _ = compat.sendto(
+                self.sock,
+                slot.data[0..slot.len],
+                0,
+                &src.any,
+                src.getOsSockLen(),
+            ) catch |err| {
+                dbg("io: retransmit Handshake failed: {}\n", .{err});
+            };
+        }
+    }
+
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
+        clearServerFlightResend(conn);
+
         // Server transport parameters (RFC 9000 §7.4 / §18.2): quinn and other
         // stacks require initial_source_connection_id and original_destination_connection_id.
         const odcid: []const u8 = if (conn.retry_odcid_len > 0)
@@ -2388,6 +2446,9 @@ pub const Server = struct {
         conn.anti_amp_bytes_sent += pkt_len;
         conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
+        conn.init_resend.store(send_buf[0..pkt_len]);
+        conn.init_resend_valid = true;
+
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
             dbg("io: sendto Initial failed: {}\n", .{err});
         };
@@ -2440,6 +2501,11 @@ pub const Server = struct {
             conn.hs_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
             conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
+
+            if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
+                conn.hs_resend[conn.hs_resend_count].store(send_buf[0..pkt_len]);
+                conn.hs_resend_count += 1;
+            }
 
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                 dbg("io: sendto Handshake failed: {}\n", .{err});
@@ -5069,12 +5135,13 @@ pub const Client = struct {
         // Fresh TLS handshake state.
         self.tls = ClientHandshake.init();
 
-        // Close any open stream files.
+        // Close any open stream files and release reorder buffers.
         for (&self.streams) |*s| {
             if (s.active) {
                 s.file.close();
                 s.active = false;
             }
+            self.http09FreeStreamReorder(s);
         }
         self.streams_done = 0;
         self.requested = false;
@@ -5099,7 +5166,9 @@ pub const Client = struct {
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        var deadline = compat.milliTimestamp() + 60_000; // 60 second timeout for transfer
+        // Scale budget for parallel 0-RTT downloads (interop zerortt sends ~30 GETs).
+        const url_budget_ms: i64 = @intCast(@min(self.active_urls.len * 5_000, 240_000));
+        var deadline = compat.milliTimestamp() + @max(120_000, url_budget_ms);
 
         while (compat.milliTimestamp() < deadline) {
             const now = compat.milliTimestamp();
@@ -5203,6 +5272,10 @@ pub const Client = struct {
 
             // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
+                // Drain any 0-RTT GETs that did not fit in the first two NS3-safe batches.
+                if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
+                    self.send0RttRequests(server_addr) catch {};
+                }
                 if (self.active_urls.len > 0) {
                     try self.downloadUrls(server_addr);
                 }
@@ -5215,7 +5288,7 @@ pub const Client = struct {
                 break;
             }
 
-            deadline = compat.milliTimestamp() + 10_000; // reset on activity
+            deadline = compat.milliTimestamp() + 30_000; // extend while packets still arrive
         }
 
         if (self.conn.phase != .connected) {
@@ -5424,10 +5497,12 @@ pub const Client = struct {
                 continue;
             };
 
-            // Register stream for download.
+            // Register stream for download (reorder buf required for HTTP/0.9 recv).
             var registered = false;
             for (&self.streams) |*s| {
                 if (!s.active) {
+                    s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                    s.recv_reorder.?.* = .{};
                     s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
                     registered = true;
                     break;
@@ -6277,12 +6352,23 @@ pub const Client = struct {
     }
 
     fn http09DeliverStreamBytes(s: *StreamDownload, reorder: *quic_tls_mod.CryptoReorderBuf, offset: u64, data: []const u8) void {
-        const end = offset + @as(u64, @intCast(data.len));
+        var off = offset;
+        var payload = data;
+        // Retransmits often cover bytes we already wrote; keep only the new suffix.
+        if (off + payload.len <= s.recv_contiguous) return;
+        if (off < s.recv_contiguous) {
+            const skip = @as(usize, @intCast(s.recv_contiguous - off));
+            if (skip >= payload.len) return;
+            payload = payload[skip..];
+            off = s.recv_contiguous;
+        }
+
+        const end = off + @as(u64, @intCast(payload.len));
         if (end > s.recv_high_water) s.recv_high_water = end;
 
-        if (offset == s.recv_contiguous) {
-            s.file.seekTo(offset) catch return;
-            s.file.writeAll(data) catch return;
+        if (off == s.recv_contiguous) {
+            s.file.seekTo(off) catch return;
+            s.file.writeAll(payload) catch return;
             s.recv_contiguous = end;
             var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
             while (true) {
@@ -6293,9 +6379,36 @@ pub const Client = struct {
                 s.recv_contiguous += @as(u64, @intCast(n));
                 if (s.recv_contiguous > s.recv_high_water) s.recv_high_water = s.recv_contiguous;
             }
-        } else if (offset > s.recv_contiguous) {
-            reorder.insert(offset, data);
+        } else if (off > s.recv_contiguous) {
+            reorder.insert(off, payload);
         }
+    }
+
+    fn http09NoteStreamFin(s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        const fin_end = sf.offset + @as(u64, @intCast(sf.data.len));
+        if (s.fin_end_offset) |fe| {
+            s.fin_end_offset = @max(fe, @max(fin_end, s.recv_high_water));
+        } else {
+            s.fin_end_offset = @max(fin_end, s.recv_high_water);
+        }
+        dbg("io: stream {} saw FIN (contiguous={} fin_end={} high_water={})\n", .{
+            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?, s.recv_high_water,
+        });
+    }
+
+    fn http09HandleStreamFrame(self: *Client, s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        const reorder = s.recv_reorder orelse return;
+
+        if (sf.offset + sf.data.len <= s.recv_contiguous) {
+            if (sf.fin) http09NoteStreamFin(s, sf);
+            self.http09TryCompleteDownload(s);
+            return;
+        }
+
+        dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
+        http09DeliverStreamBytes(s, reorder, sf.offset, sf.data);
+        if (sf.fin) http09NoteStreamFin(s, sf);
+        self.http09TryCompleteDownload(s);
     }
 
     fn http09FreeStreamReorder(self: *Client, s: *StreamDownload) void {
@@ -6370,17 +6483,7 @@ pub const Client = struct {
                 if (self.config.http3) {
                     self.handleH3StreamData(s, sf);
                 } else {
-                    dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    const reorder = s.recv_reorder orelse return;
-                    http09DeliverStreamBytes(s, reorder, sf.offset, sf.data);
-                    if (sf.fin) {
-                        const fin_end = sf.offset + @as(u64, @intCast(sf.data.len));
-                        s.fin_end_offset = @max(fin_end, s.recv_high_water);
-                        dbg("io: stream {} saw FIN (contiguous={} fin_end={} high_water={})\n", .{
-                            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?, s.recv_high_water,
-                        });
-                    }
-                    self.http09TryCompleteDownload(s);
+                    self.http09HandleStreamFrame(s, sf);
                 }
                 return;
             }
