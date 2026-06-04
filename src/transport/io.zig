@@ -1621,7 +1621,7 @@ pub const Server = struct {
             const version: u32 = (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4];
             dbg("io: server long header version=0x{x:0>8}\n", .{version});
             const lh = header_mod.parseLong(buf) catch |err| {
-                dbg("io: server parseLong failed: {}\n", .{err});
+                log.warn("zquic: server long-header parseLong failed: {s} buf_len={d} first={x:0>2}", .{ @errorName(err), buf.len, buf[0] });
                 return;
             };
             // RFC 9000 §6.1: respond with Version Negotiation for unsupported
@@ -1732,7 +1732,10 @@ pub const Server = struct {
         buf: []const u8,
         src: compat.Address,
     ) void {
-        const ip = packet_mod.parseInitial(buf) catch return;
+        const ip = packet_mod.parseInitial(buf) catch |err| {
+            log.warn("zquic: server Initial parseInitial failed: {s} buf_len={d} first={x:0>2}", .{ @errorName(err), buf.len, if (buf.len > 0) buf[0] else 0 });
+            return;
+        };
         // Detect QUIC version from raw packet (already validated in processPacket).
         const pkt_version: u32 = if (buf.len >= 5)
             (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4]
@@ -1799,7 +1802,12 @@ pub const Server = struct {
             pn_start,
             payload_end,
             &init_km.client,
-        ) catch return; // bad packet
+        ) catch |err| {
+            log.warn("zquic: server Initial AEAD/header-protection failed: {s} dcid_len={d} pn_start={d} payload_len={d}", .{
+                @errorName(err), ip.dcid.len, pn_start, ip.payload_len,
+            });
+            return;
+        };
 
         // Compatible version negotiation (RFC 9368): if the server is configured
         // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
