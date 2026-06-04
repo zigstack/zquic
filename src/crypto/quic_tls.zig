@@ -144,8 +144,10 @@ pub fn buildClientTransportParams(out: []u8) (varint.EncodeError || varint.Decod
     pos = try write_param(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
     pos = try write_param(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
     pos = try write_param(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
-    pos = try write_param(out, pos, 0x08, 1024); // initial_max_streams_bidi
-    pos = try write_param(out, pos, 0x09, 1024); // initial_max_streams_uni
+    // Stay at <=1000 so quic-interop-runner's multiplexing test (which fails
+    // any server advertising "stream limit > 1000") still passes.
+    pos = try write_param(out, pos, 0x08, 1000); // initial_max_streams_bidi
+    pos = try write_param(out, pos, 0x09, 1000); // initial_max_streams_uni
     return pos;
 }
 
