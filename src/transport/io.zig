@@ -1797,6 +1797,8 @@ pub const Server = struct {
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
                     self.replayStoredServerFlight(existing, src);
                 }
+                // Quinn does not rebuild the TLS flight here; loss recovery re-sends the
+                // same CRYPTO bytes (connection/spaces.rs). We cache the first UDP payloads.
                 return;
             }
 
@@ -2235,7 +2237,7 @@ pub const Server = struct {
     }
 
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
-        clearServerFlightResend(conn);
+        Server.clearServerFlightResend(conn);
 
         // Server transport parameters (RFC 9000 §7.4 / §18.2): quinn and other
         // stacks require initial_source_connection_id and original_destination_connection_id.

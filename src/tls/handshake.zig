@@ -1701,6 +1701,53 @@ test "handshake: key schedule" {
     try testing.expect(!std.mem.eql(u8, &client_hs, &client_ap));
 }
 
+test "handshake: EE ALPN only when client offered (rustls/quinn)" {
+    const testing = std.testing;
+    var ch: ClientHelloData = .{};
+    try testing.expect(eeAlpnMatchingClientOffer(&ch, ALPN_H3) == null);
+    try testing.expect(eeAlpnMatchingClientOffer(&ch, ALPN_H09) == null);
+    ch.alpn_h3 = true;
+    try testing.expectEqualSlices(u8, ALPN_H3, eeAlpnMatchingClientOffer(&ch, ALPN_H3).?);
+    ch.alpn_h3 = false;
+    ch.alpn_h09 = true;
+    try testing.expectEqualSlices(u8, ALPN_H09, eeAlpnMatchingClientOffer(&ch, ALPN_H09).?);
+}
+
+test "handshake: EE early_data only on accepted PSK (rustls decide_if_early_data_allowed)" {
+    const testing = std.testing;
+    var ch: ClientHelloData = .{ .has_early_data = true };
+    try testing.expect(!eeAcceptEarlyData(&ch, false));
+    try testing.expect(eeAcceptEarlyData(&ch, true));
+}
+
+test "handshake: EncryptedExtensions wire encoding omits unsolicited ALPN" {
+    const testing = std.testing;
+    var buf_alpn: [512]u8 = undefined;
+    var buf_no_alpn: [512]u8 = undefined;
+    const tp = [_]u8{ 0x05, 0x00, 0x00, 0x00, 0x00 }; // minimal QUIC TP blob
+    const with_alpn = try buildEncryptedExtensions(&buf_alpn, &tp, ALPN_H3, false);
+    const without_alpn = try buildEncryptedExtensions(&buf_no_alpn, &tp, null, false);
+    try testing.expect(eeExtensionsContainType(buf_alpn[0..with_alpn], EXT_ALPN));
+    try testing.expect(!eeExtensionsContainType(buf_no_alpn[0..without_alpn], EXT_ALPN));
+    try testing.expect(eeExtensionsContainType(buf_no_alpn[0..without_alpn], EXT_QUIC_TRANSPORT_PARAMS));
+}
+
+fn eeExtensionsContainType(ee_msg: []const u8, ext_type: u16) bool {
+    if (ee_msg.len < 8 or ee_msg[0] != MSG_ENCRYPTED_EXTENSIONS) return false;
+    const body_len = readU24(ee_msg[1..]);
+    const ext_list_len = readU16(ee_msg[4..]);
+    var p: usize = 6;
+    const ext_end = 4 + body_len;
+    const list_end = p + ext_list_len;
+    if (list_end > ext_end or list_end > ee_msg.len) return false;
+    while (p + 4 <= list_end) {
+        if (readU16(ee_msg[p..]) == ext_type) return true;
+        const elen = readU16(ee_msg[p + 2 ..]);
+        p += 4 + elen;
+    }
+    return false;
+}
+
 test "handshake: build and parse ServerHello" {
     const testing = std.testing;
     var buf: [512]u8 = undefined;
