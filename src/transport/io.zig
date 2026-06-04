@@ -1788,13 +1788,13 @@ pub const Server = struct {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
             if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial after the server flight was already sent.
-                // Quinn/rustls feed duplicate Initial/Handshake CRYPTO bytes into TLS
-                // and report UnsolicitedEncryptedExtension; zquic clients dedupe by
-                // offset, so silence is safe once we are past the first flight.
+                // Retransmitted Initial: replay the server flight so the client can
+                // make progress when our first response was lost (NS3 drops).
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    return;
+                    self.sendInitialServerHello(existing, src);
+                    self.sendHandshakeServerFlight(existing, src);
                 }
+                return;
             }
 
             // Truly new connection
@@ -4635,8 +4635,9 @@ const StreamDownload = struct {
     recv_contiguous: u64 = 0,
     /// Highest `offset + data.len` seen (includes out-of-order segments).
     recv_high_water: u64 = 0,
-    /// Out-of-order STREAM payloads waiting to extend `recv_contiguous`.
-    recv_reorder: quic_tls_mod.CryptoReorderBuf = .{},
+    /// HTTP/0.9 only: out-of-order STREAM payloads (heap-allocated; not embedded in
+    /// the struct — 2000× CryptoReorderBuf would overflow the stack in Client.init).
+    recv_reorder: ?*quic_tls_mod.CryptoReorderBuf = null,
     /// Set when a STREAM frame with FIN is seen; download completes once
     /// `recv_contiguous` reaches this offset (handles FIN-before-gap reordering).
     fin_end_offset: ?u64 = null,
@@ -4876,6 +4877,12 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         if (self.client_cert_owned) {
             self.allocator.free(self.client_cert_der);
+        }
+        for (&self.streams) |*s| {
+            if (s.recv_reorder) |r| {
+                self.allocator.destroy(r);
+                s.recv_reorder = null;
+            }
         }
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);
@@ -6269,7 +6276,7 @@ pub const Client = struct {
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
-    fn http09DeliverStreamBytes(s: *StreamDownload, offset: u64, data: []const u8) void {
+    fn http09DeliverStreamBytes(s: *StreamDownload, reorder: *quic_tls_mod.CryptoReorderBuf, offset: u64, data: []const u8) void {
         const end = offset + @as(u64, @intCast(data.len));
         if (end > s.recv_high_water) s.recv_high_water = end;
 
@@ -6279,7 +6286,7 @@ pub const Client = struct {
             s.recv_contiguous = end;
             var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
             while (true) {
-                const n = s.recv_reorder.take(s.recv_contiguous, &drain_buf);
+                const n = reorder.take(s.recv_contiguous, &drain_buf);
                 if (n == 0) break;
                 s.file.seekTo(s.recv_contiguous) catch return;
                 s.file.writeAll(drain_buf[0..n]) catch return;
@@ -6287,7 +6294,14 @@ pub const Client = struct {
                 if (s.recv_contiguous > s.recv_high_water) s.recv_high_water = s.recv_contiguous;
             }
         } else if (offset > s.recv_contiguous) {
-            s.recv_reorder.insert(offset, data);
+            reorder.insert(offset, data);
+        }
+    }
+
+    fn http09FreeStreamReorder(self: *Client, s: *StreamDownload) void {
+        if (s.recv_reorder) |r| {
+            self.allocator.destroy(r);
+            s.recv_reorder = null;
         }
     }
 
@@ -6296,6 +6310,7 @@ pub const Client = struct {
         if (!s.active or s.recv_contiguous < fin_end) return;
         s.file.close();
         s.active = false;
+        self.http09FreeStreamReorder(s);
         self.streams_done += 1;
         dbg("io: stream {} download complete (contiguous={} fin_end={} total: {}/{})\n", .{
             s.stream_id, s.recv_contiguous, fin_end, self.streams_done, self.active_urls.len,
@@ -6356,7 +6371,8 @@ pub const Client = struct {
                     self.handleH3StreamData(s, sf);
                 } else {
                     dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    http09DeliverStreamBytes(s, sf.offset, sf.data);
+                    const reorder = s.recv_reorder orelse return;
+                    http09DeliverStreamBytes(s, reorder, sf.offset, sf.data);
                     if (sf.fin) {
                         const fin_end = sf.offset + @as(u64, @intCast(sf.data.len));
                         s.fin_end_offset = @max(fin_end, s.recv_high_water);
@@ -6719,6 +6735,10 @@ pub const Client = struct {
                 for (&self.streams) |*s| {
                     if (!s.active) {
                         s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                        if (!self.config.http3) {
+                            s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                            s.recv_reorder.?.* = .{};
+                        }
                         dbg("io: registered stream {} for download\n", .{stream_id});
                         registered = true;
                         break;
@@ -6871,6 +6891,7 @@ pub const Client = struct {
             if (s.active) {
                 s.file.close();
                 s.active = false;
+                self.http09FreeStreamReorder(s);
             }
         }
     }
