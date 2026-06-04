@@ -117,20 +117,35 @@ pub fn protectInitialPacket(
     return pos;
 }
 
-/// Remove header protection from an Initial packet and decrypt its payload.
+/// Result of decrypting a long-header (Initial / Handshake) packet.
+pub const UnprotectResult = struct {
+    /// Decrypted plaintext length written into `dst`.
+    pt_len: usize,
+    /// Fully reconstructed (not truncated) packet number, suitable for use in
+    /// ACK frames and the receive PN tracking table. Computed via
+    /// `decompressPacketNumber` against `expected_recv_pn`.
+    pn: u64,
+};
+
+/// Remove header protection from an Initial / Handshake packet and decrypt
+/// its payload.
 ///
 /// `buf` contains the full received packet. `pn_start` is the byte offset of
 /// the start of the (protected) packet number. `km` is the key material for
 /// the decrypting side. `dst` receives the decrypted plaintext.
+/// `expected_recv_pn` is the largest packet number this connection has
+/// already received at this encryption level, used to decompress the
+/// truncated wire packet number per RFC 9000 §17.1.
 ///
-/// Returns the decrypted plaintext length.
+/// Returns the plaintext length AND the reconstructed full packet number.
 pub fn unprotectInitialPacket(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
     payload_end: usize,
     km: *const KeyMaterial,
-) (aead.AeadError || error{BufferTooShort})!usize {
+    expected_recv_pn: ?u64,
+) (aead.AeadError || error{BufferTooShort})!UnprotectResult {
     if (buf.len < pn_start + hp_sample_offset + hp_sample_len) return error.BufferTooShort;
 
     // Sample for header protection removal
@@ -157,11 +172,18 @@ pub fn unprotectInitialPacket(
         b.* ^= mask[mi];
     }
 
-    // Reconstruct packet number (simple truncated decode)
-    var pn: u64 = 0;
+    // Decode the truncated wire PN, then reconstruct the full PN per RFC 9000
+    // §17.1.  Using only the unmasked truncated bytes as the PN — as a prior
+    // version of this code did — generates ACK frames that quote unsent packet
+    // numbers (e.g. when the wire PN is 0x00 the AEAD nonce is right but the
+    // ACK frame names PN 0x00 even after the connection PN advances), which
+    // peers correctly reject as a PROTOCOL_VIOLATION ("unsent packet acked").
+    var truncated_pn: u64 = 0;
     for (aad_buf[pn_start..aad_end]) |b| {
-        pn = (pn << 8) | b;
+        truncated_pn = (truncated_pn << 8) | b;
     }
+    const pn_len_bits: u3 = @intCast(actual_pn_len - 1);
+    const pn = decompressPacketNumber(truncated_pn, expected_recv_pn, pn_len_bits);
 
     const aad = aad_buf[0..aad_end];
     const nonce = aead.buildNonce(km.iv, pn);
@@ -172,7 +194,7 @@ pub fn unprotectInitialPacket(
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
     try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
-    return plaintext_len;
+    return .{ .pt_len = plaintext_len, .pn = pn };
 }
 
 /// Encrypt a QUIC 1-RTT packet payload using ChaCha20-Poly1305 and apply
@@ -298,6 +320,7 @@ test "initial: encrypt/decrypt round-trip" {
     var decrypted: [128]u8 = undefined;
     const pn_start = header.len;
     const payload_end = written;
-    const dec_len = try unprotectInitialPacket(&decrypted, dst[0..written], pn_start, payload_end, &secrets.client);
-    try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec_len]);
+    const dec = try unprotectInitialPacket(&decrypted, dst[0..written], pn_start, payload_end, &secrets.client, null);
+    try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec.pt_len]);
+    try testing.expectEqual(@as(u64, 0), dec.pn);
 }

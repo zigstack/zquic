@@ -510,7 +510,9 @@ pub fn unprotect1RttPacket(
     if (chacha20) {
         return initial_mod.unprotectPacketChaCha20(dst, buf, pn_start, buf.len, km);
     }
-    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km);
+    // No expected-PN tracking on this thin wrapper (test/helper path).
+    const r = try initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km, null);
+    return r.pt_len;
 }
 
 /// Compute the 16-byte header-protection mask for a 1-RTT short-header packet.
@@ -552,8 +554,9 @@ pub fn decryptLongPacket(
     pn_start: usize,
     payload_end: usize,
     km: *const KeyMaterial,
-) !usize {
-    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, payload_end, km);
+    expected_recv_pn: ?u64,
+) !initial_mod.UnprotectResult {
+    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, payload_end, km, expected_recv_pn);
 }
 
 // ── PEM loading helpers ───────────────────────────────────────────────────────
@@ -896,6 +899,10 @@ pub const ConnState = struct {
     // Received packet numbers (last seen for ACK)
     init_recv_pn: ?u64 = null,
     hs_recv_pn: ?u64 = null,
+    /// Largest 0-RTT packet number received from the peer. Used to
+    /// decompress truncated PNs on subsequent 0-RTT packets and to ACK
+    /// the correct PN range.
+    zerortt_recv_pn: ?u64 = null,
     app_recv_pn: ?u64 = null,
 
     // CRYPTO stream offset tracking (in-order reassembly)
@@ -1796,18 +1803,20 @@ pub const Server = struct {
         var plaintext: [4096]u8 = undefined;
         const pn_start = ip.payload_offset;
         const payload_end = ip.payload_offset + ip.payload_len;
-        const pt_len = initial_mod.unprotectInitialPacket(
+        const dec = initial_mod.unprotectInitialPacket(
             &plaintext,
             buf,
             pn_start,
             payload_end,
             &init_km.client,
+            conn.init_recv_pn,
         ) catch |err| {
             log.warn("zquic: server Initial AEAD/header-protection failed: {s} dcid_len={d} pn_start={d} payload_len={d}", .{
                 @errorName(err), ip.dcid.len, pn_start, ip.payload_len,
             });
             return;
         };
+        const pt_len = dec.pt_len;
 
         // Compatible version negotiation (RFC 9368): if the server is configured
         // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
@@ -1821,8 +1830,10 @@ pub const Server = struct {
             dbg("io: server upgraded connection to QUIC v2 (compatible version negotiation)\n", .{});
         }
 
-        // Record received PN for ACK
-        conn.init_recv_pn = extractPacketNumber(buf, pn_start);
+        // Record reconstructed PN for the ACK we will queue for this packet.
+        // Track the largest seen, so out-of-order/retransmits don't regress.
+        if (conn.init_recv_pn == null or dec.pn > conn.init_recv_pn.?)
+            conn.init_recv_pn = dec.pn;
 
         // Parse frames
         var pos: usize = 0;
@@ -1885,16 +1896,20 @@ pub const Server = struct {
 
         // Decrypt with early client keys.
         var plaintext: [4096]u8 = undefined;
-        const pt_len = decryptLongPacket(
+        const dec0 = decryptLongPacket(
             &plaintext,
             buf,
             pn_start,
             payload_end,
             &conn.early_km,
+            conn.zerortt_recv_pn,
         ) catch |err| {
             dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
         };
+        const pt_len = dec0.pt_len;
+        if (conn.zerortt_recv_pn == null or dec0.pn > conn.zerortt_recv_pn.?)
+            conn.zerortt_recv_pn = dec0.pn;
         dbg("io: server 0-RTT decrypted {} bytes\n", .{pt_len});
 
         // Walk the decrypted payload for STREAM frames.
@@ -2435,18 +2450,21 @@ pub const Server = struct {
         const payload_end = pos + payload_len;
         if (payload_end > buf.len) return;
 
-        // Record received PN
-        conn.hs_recv_pn = extractPacketNumber(buf, pn_start);
-
-        // Decrypt
+        // Decrypt + extract reconstructed PN in one pass; the old path read
+        // a single masked byte and stored it as the ACK PN, which made the
+        // server ACK packet numbers the peer never sent (RFC 9000 §13.1).
         var plaintext: [4096]u8 = undefined;
-        const pt_len = decryptLongPacket(
+        const dec = decryptLongPacket(
             &plaintext,
             buf,
             pn_start,
             payload_end,
             &conn.hs_client_km,
+            conn.hs_recv_pn,
         ) catch return;
+        const pt_len = dec.pt_len;
+        if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
+            conn.hs_recv_pn = dec.pn;
 
         // Parse frames for CRYPTO
         var fpos: usize = 0;
@@ -5499,7 +5517,12 @@ pub const Client = struct {
                 ip.payload_offset,
                 ip.payload_offset + ip.payload_len,
                 &init_km.server,
-            )) |pt| break :blk pt else |_| {}
+                self.conn.init_recv_pn,
+            )) |dec| {
+                if (self.conn.init_recv_pn == null or dec.pn > self.conn.init_recv_pn.?)
+                    self.conn.init_recv_pn = dec.pn;
+                break :blk dec.pt_len;
+            } else |_| {}
 
             // v1 decryption failed — try v2 upgrade if keys are pre-derived.
             if (self.conn.v2_upgrade_keys) |v2km| {
@@ -5515,13 +5538,16 @@ pub const Client = struct {
                         ip.payload_offset,
                         ip.payload_offset + ip.payload_len,
                         &v2km.server,
-                    )) |pt| {
+                        self.conn.init_recv_pn,
+                    )) |dec| {
                         // Successfully decrypted with v2 keys — upgrade.
                         self.conn.use_v2 = true;
                         self.conn.init_keys = v2km;
                         self.conn.v2_upgrade_keys = null;
                         dbg("io: client upgraded to QUIC v2 (compatible version negotiation)\n", .{});
-                        break :blk pt;
+                        if (self.conn.init_recv_pn == null or dec.pn > self.conn.init_recv_pn.?)
+                            self.conn.init_recv_pn = dec.pn;
+                        break :blk dec.pt_len;
                     } else |_| {}
                 }
             }
@@ -5602,13 +5628,17 @@ pub const Client = struct {
         if (payload_end > buf.len) return;
 
         var plaintext: [8192]u8 = undefined;
-        const pt_len = decryptLongPacket(
+        const dec = decryptLongPacket(
             &plaintext,
             buf,
             pn_start,
             payload_end,
             &self.conn.hs_server_km,
+            self.conn.hs_recv_pn,
         ) catch return;
+        const pt_len = dec.pt_len;
+        if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
+            self.conn.hs_recv_pn = dec.pn;
 
         // Accumulate Handshake CRYPTO frames
         var fpos: usize = 0;
@@ -6780,12 +6810,6 @@ fn buildClientTransportParams(buf: []u8) (varint.EncodeError || varint.DecodeErr
 }
 
 // ── Misc helpers ──────────────────────────────────────────────────────────────
-
-/// Extract the first byte of the (protected) packet number field.
-fn extractPacketNumber(buf: []const u8, pn_start: usize) ?u64 {
-    if (pn_start >= buf.len) return null;
-    return @as(u64, buf[pn_start]);
-}
 
 /// Resolve a hostname to an IPv4 address (prefers AF.INET since we only create
 /// IPv4 UDP sockets).  The connectionmigration test uses the dual-stack hostname
