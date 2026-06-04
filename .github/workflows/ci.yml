@@ -240,8 +240,8 @@ jobs:
           mkdir -p interop-results
           cd quic-interop-runner
           python3 run.py \
-            --client zquic \
-            --server zquic \
+            --client zquic,quinn \
+            --server zquic,quinn \
             --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
