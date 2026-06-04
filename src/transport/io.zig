@@ -3400,7 +3400,7 @@ pub const Server = struct {
         };
         const old_offset = slot.stream_offset;
         slot.stream_offset += @intCast(n);
-        var frame_buf: [2048]u8 = undefined;
+        var frame_buf: [path_mtu_mod.max_app_stream_chunk_cap + 64]u8 = undefined;
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
             dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
@@ -4634,6 +4634,11 @@ const StreamDownload = struct {
     stream_id: u64,
     file: compat.fs.File,
     active: bool,
+    /// Highest contiguous byte offset received from stream offset 0 (HTTP/0.9).
+    recv_contiguous: u64 = 0,
+    /// Set when a STREAM frame with FIN is seen; download completes once
+    /// `recv_contiguous` reaches this offset (handles FIN-before-gap reordering).
+    fin_end_offset: ?u64 = null,
     /// HTTP/3 only: have we already seen and skipped the HEADERS frame?
     h3_headers_received: bool = false,
     /// Small buffer for incomplete HTTP/3 frame headers that span two STREAM frames.
@@ -6258,6 +6263,23 @@ pub const Client = struct {
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
     }
 
+    fn http09AdvanceContiguous(recv_contiguous: *u64, frame_offset: u64, data_len: usize) void {
+        if (frame_offset == recv_contiguous.*) {
+            recv_contiguous.* += @as(u64, @intCast(data_len));
+        }
+    }
+
+    fn http09TryCompleteDownload(self: *Client, s: *StreamDownload) void {
+        const fin_end = s.fin_end_offset orelse return;
+        if (!s.active or s.recv_contiguous < fin_end) return;
+        s.file.close();
+        s.active = false;
+        self.streams_done += 1;
+        dbg("io: stream {} download complete (contiguous={} fin_end={} total: {}/{})\n", .{
+            s.stream_id, s.recv_contiguous, fin_end, self.streams_done, self.active_urls.len,
+        });
+    }
+
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
         dbg("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
@@ -6323,12 +6345,14 @@ pub const Client = struct {
                         dbg("io: client writeAll failed stream_id={}: {}\n", .{ sf.stream_id, err });
                         return;
                     };
+                    self.http09AdvanceContiguous(&s.recv_contiguous, sf.offset, sf.data.len);
                     if (sf.fin) {
-                        s.file.close();
-                        s.active = false;
-                        self.streams_done += 1;
-                        dbg("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
+                        s.fin_end_offset = sf.offset + @as(u64, @intCast(sf.data.len));
+                        dbg("io: stream {} saw FIN (contiguous={} fin_end={})\n", .{
+                            sf.stream_id, s.recv_contiguous, s.fin_end_offset.?,
+                        });
                     }
+                    self.http09TryCompleteDownload(s);
                 }
                 return;
             }
