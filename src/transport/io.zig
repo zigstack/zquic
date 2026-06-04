@@ -852,6 +852,21 @@ fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64)
 }
 
 /// Per-connection crypto and TLS state.
+/// Max Handshake datagrams for an 8192-byte server flight (~8 at 1100 B/crypto).
+const max_server_flight_resend_datagrams: usize = 10;
+
+/// Cached UDP payload for server flight retransmit (same PN/ciphertext).
+const StoredDatagram = struct {
+    len: u16 = 0,
+    data: [MAX_DATAGRAM_SIZE]u8 = undefined,
+
+    fn store(self: *StoredDatagram, pkt: []const u8) void {
+        const n = @min(pkt.len, self.data.len);
+        @memcpy(self.data[0..n], pkt[0..n]);
+        self.len = @intCast(n);
+    }
+};
+
 pub const ConnState = struct {
     phase: ConnPhase = .initial,
 
@@ -990,6 +1005,13 @@ pub const ConnState = struct {
     finished_pkt: [MAX_DATAGRAM_SIZE]u8 = [_]u8{0} ** MAX_DATAGRAM_SIZE,
     finished_pkt_len: usize = 0,
     finished_sent_ms: i64 = 0,
+
+    // Server flight datagrams for Initial retransmit (quinn/rustls #132).
+    init_resend: StoredDatagram = .{},
+    init_resend_valid: bool = false,
+    hs_resend: [max_server_flight_resend_datagrams]StoredDatagram =
+        [_]StoredDatagram{.{}} ** max_server_flight_resend_datagrams,
+    hs_resend_count: u8 = 0,
 
     // 1-RTT key phase tracking for key updates (RFC 9001 §6).
     // Tracks the current key phase bit for outgoing short-header packets.
@@ -1770,12 +1792,13 @@ pub const Server = struct {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
             if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial: re-send the server flight so the client
-                // can make progress even if our first response was lost.
+                // Retransmitted Initial: replay exact UDP payloads. Rebuilding with
+                // new PNs re-injects TLS records and quinn reports UnsolicitedEncryptedExtension.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    self.sendInitialServerHello(existing, src);
-                    self.sendHandshakeServerFlight(existing, src);
+                    self.replayStoredServerFlight(existing, src);
                 }
+                // Quinn does not rebuild the TLS flight here; loss recovery re-sends the
+                // same CRYPTO bytes (connection/spaces.rs). We cache the first UDP payloads.
                 return;
             }
 
@@ -2179,7 +2202,43 @@ pub const Server = struct {
         }
     }
 
+    fn clearServerFlightResend(conn: *ConnState) void {
+        conn.init_resend_valid = false;
+        conn.hs_resend_count = 0;
+    }
+
+    /// Resend cached Initial + Handshake datagrams without new packet numbers.
+    fn replayStoredServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
+        if (conn.init_resend_valid and conn.init_resend.len > 0) {
+            _ = compat.sendto(
+                self.sock,
+                conn.init_resend.data[0..conn.init_resend.len],
+                0,
+                &src.any,
+                src.getOsSockLen(),
+            ) catch |err| {
+                dbg("io: retransmit Initial failed: {}\n", .{err});
+            };
+        }
+        var i: u8 = 0;
+        while (i < conn.hs_resend_count) : (i += 1) {
+            const slot = &conn.hs_resend[i];
+            if (slot.len == 0) continue;
+            _ = compat.sendto(
+                self.sock,
+                slot.data[0..slot.len],
+                0,
+                &src.any,
+                src.getOsSockLen(),
+            ) catch |err| {
+                dbg("io: retransmit Handshake failed: {}\n", .{err});
+            };
+        }
+    }
+
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
+        Server.clearServerFlightResend(conn);
+
         // Server transport parameters (RFC 9000 §7.4 / §18.2): quinn and other
         // stacks require initial_source_connection_id and original_destination_connection_id.
         const odcid: []const u8 = if (conn.retry_odcid_len > 0)
@@ -2362,6 +2421,9 @@ pub const Server = struct {
         conn.init_pn += 1;
         conn.anti_amp_bytes_sent += pkt_len;
 
+        conn.init_resend.store(send_buf[0..pkt_len]);
+        conn.init_resend_valid = true;
+
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
             dbg("io: sendto Initial failed: {}\n", .{err});
         };
@@ -2411,6 +2473,11 @@ pub const Server = struct {
 
             conn.hs_pn += 1;
             conn.anti_amp_bytes_sent += pkt_len;
+
+            if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
+                conn.hs_resend[conn.hs_resend_count].store(send_buf[0..pkt_len]);
+                conn.hs_resend_count += 1;
+            }
 
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                 dbg("io: sendto Handshake failed: {}\n", .{err});
