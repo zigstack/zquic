@@ -132,13 +132,13 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
         const rc_i: isize = @bitCast(rc);
         if (rc_i <= 0) {
             for (batch) |*e| {
-                _ = std.posix.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
             }
         } else {
             const n: usize = @intCast(rc_i);
             if (n < batch.len) {
                 for (batch[n..]) |*e| {
-                    _ = std.posix.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                    _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
                 }
             }
         }
