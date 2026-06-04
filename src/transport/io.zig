@@ -2180,24 +2180,24 @@ pub const Server = struct {
     }
 
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: compat.Address) void {
-        // Build server transport parameters into a separate scratch buffer.
-        // Append original_destination_connection_id (id=0x00) when a Retry was
-        // accepted — RFC 9000 §7.3 requires it so the client can verify.
+        // Server transport parameters (RFC 9000 §7.4 / §18.2): quinn and other
+        // stacks require initial_source_connection_id and original_destination_connection_id.
+        const odcid: []const u8 = if (conn.retry_odcid_len > 0)
+            conn.retry_odcid[0..conn.retry_odcid_len]
+        else if (conn.init_dcid) |id|
+            id.slice()
+        else {
+            dbg("io: missing original_destination_connection_id for server transport params\n", .{});
+            return;
+        };
         var tp_buf: [512]u8 = undefined;
-        var tp_len = quic_tls_mod.buildClientTransportParams(&tp_buf) catch |err| {
+        const tp_len = quic_tls_mod.buildTransportParams(&tp_buf, .{
+            .initial_source_cid = conn.local_cid.slice(),
+            .original_destination_cid = odcid,
+        }) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
         };
-        if (conn.retry_odcid_len > 0) {
-            const odcid = conn.retry_odcid[0..conn.retry_odcid_len];
-            // Encode: id=0x00 (1 byte) | length varint (1 byte) | odcid bytes
-            tp_buf[tp_len] = 0x00; // TP id
-            tp_len += 1;
-            tp_buf[tp_len] = @intCast(odcid.len); // length (odcid ≤ 20 bytes, fits in 1 varint byte)
-            tp_len += 1;
-            @memcpy(tp_buf[tp_len..][0..odcid.len], odcid);
-            tp_len += odcid.len;
-        }
         const quic_tp = tp_buf[0..tp_len];
 
         const alpn = serverTlsAlpn(&self.config);
@@ -2217,9 +2217,12 @@ pub const Server = struct {
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
 
-        // Coalesce Initial + Handshake packets into a single UDP datagram
-        // (RFC 9000 §12.2).  Fall back to separate sends for any remainder.
-        self.sendCoalescedServerFlight(conn, src);
+        // Send Initial (ServerHello) and Handshake (EE + cert + Finished) in
+        // separate UDP datagrams.  Coalescing (RFC 9000 §12.2) is valid but
+        // quinn rejects the coalesced Handshake portion (#132); separate sends
+        // match what quinn-interop and other stacks expect in practice.
+        self.sendInitialServerHello(conn, src);
+        self.sendHandshakeServerFlight(conn, src);
 
         conn.phase = .waiting_finished;
     }
@@ -2275,7 +2278,7 @@ pub const Server = struct {
                 var frames_buf: [8192]u8 = undefined;
                 const chunk_len = @min(flight.len - offset, max_crypto_per_pkt);
                 const crypto_len = buildCryptoFrame(
-                    &frames_buf,
+                    frames_buf[0..],
                     @intCast(offset),
                     flight[offset .. offset + chunk_len],
                 ) catch break;
@@ -5203,7 +5206,7 @@ pub const Client = struct {
             // First send: build the ClientHello and save it for any future rebuild.
             const alpn = clientTlsAlpn(&self.config);
             var quic_tp_buf: [128]u8 = undefined;
-            const quic_tp = try buildClientTransportParams(&quic_tp_buf);
+            const quic_tp = try buildEndpointTransportParams(&quic_tp_buf, self.conn.local_cid.slice());
 
             // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(compat.milliTimestamp());
@@ -6804,8 +6807,13 @@ inline fn readU24(b: []const u8) u32 {
     return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | @as(u32, b[2]);
 }
 
-fn buildClientTransportParams(buf: []u8) (varint.EncodeError || varint.DecodeError)![]const u8 {
-    const n = try quic_tls_mod.buildClientTransportParams(buf);
+fn buildEndpointTransportParams(
+    buf: []u8,
+    initial_source_cid: []const u8,
+) (varint.EncodeError || varint.DecodeError)![]const u8 {
+    const n = try quic_tls_mod.buildTransportParams(buf, .{
+        .initial_source_cid = initial_source_cid,
+    });
     return buf[0..n];
 }
 

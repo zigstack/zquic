@@ -110,45 +110,82 @@ pub fn stripRecords(out: []u8, input: []const u8) usize {
 /// QUIC transport parameters extension type (RFC 9001 §8.2)
 pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0xffa5;
 
-/// Build a minimal QUIC transport parameters extension for the client.
-/// Returns bytes written to `out`.
-pub fn buildClientTransportParams(out: []u8) (varint.EncodeError || varint.DecodeError)!usize {
-    // Transport parameters (also used in Encrypted Extensions for the server role).
-    // Flow-control limits must cover interop "transfer" (multi-megabyte files on
-    // several client-initiated bidirectional streams at once).
+/// Options for encoding the QUIC transport parameters TLS extension (RFC 9000 §18).
+pub const TransportParamsOpts = struct {
+    /// `initial_source_connection_id` (0x0f): SCID from this endpoint's first Initial.
+    /// Required on every endpoint; peers (e.g. quinn) close with TRANSPORT_PARAMETER_ERROR if absent.
+    initial_source_cid: []const u8,
+    /// `original_destination_connection_id` (0x00): DCID from the peer's first Initial.
+    /// Required on the server (RFC 9000 §7.4).
+    original_destination_cid: ?[]const u8 = null,
+    /// `retry_source_connection_id` (0x10): SCID from the server's Retry packet, if any.
+    retry_source_cid: ?[]const u8 = null,
+};
+
+fn writeParamVarint(
+    buf: []u8,
+    pos: usize,
+    id: u64,
+    val: u64,
+) (varint.EncodeError || varint.DecodeError)!usize {
+    var w_pos = pos;
+    var id_buf: [8]u8 = undefined;
+    const id_enc = try varint.encode(&id_buf, id);
+    @memcpy(buf[w_pos .. w_pos + id_enc.len], id_enc);
+    w_pos += id_enc.len;
+    var val_buf: [8]u8 = undefined;
+    const val_enc = try varint.encode(&val_buf, val);
+    var len_buf: [8]u8 = undefined;
+    const len_enc = try varint.encode(&len_buf, val_enc.len);
+    @memcpy(buf[w_pos .. w_pos + len_enc.len], len_enc);
+    w_pos += len_enc.len;
+    @memcpy(buf[w_pos .. w_pos + val_enc.len], val_enc);
+    w_pos += val_enc.len;
+    return w_pos;
+}
+
+fn writeParamBytes(buf: []u8, pos: usize, id: u64, value: []const u8) (varint.EncodeError || varint.DecodeError)!usize {
+    var w_pos = pos;
+    var id_buf: [8]u8 = undefined;
+    const id_enc = try varint.encode(&id_buf, id);
+    @memcpy(buf[w_pos .. w_pos + id_enc.len], id_enc);
+    w_pos += id_enc.len;
+    var len_buf: [8]u8 = undefined;
+    const len_enc = try varint.encode(&len_buf, value.len);
+    @memcpy(buf[w_pos .. w_pos + len_enc.len], len_enc);
+    w_pos += len_enc.len;
+    @memcpy(buf[w_pos .. w_pos + value.len], value);
+    w_pos += value.len;
+    return w_pos;
+}
+
+/// Build QUIC transport parameters for ClientHello or EncryptedExtensions.
+pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.EncodeError || varint.DecodeError)!usize {
     var pos: usize = 0;
 
-    const write_param = struct {
-        fn call(buf: []u8, p: usize, id: u64, val: u64) (varint.EncodeError || varint.DecodeError)!usize {
-            var w_pos = p;
-            // ID varint
-            var id_buf: [8]u8 = undefined;
-            const id_enc = try varint.encode(&id_buf, id);
-            @memcpy(buf[w_pos .. w_pos + id_enc.len], id_enc);
-            w_pos += id_enc.len;
-            // Value varint (in a varint-length field)
-            var val_buf: [8]u8 = undefined;
-            const val_enc = try varint.encode(&val_buf, val);
-            var len_buf: [8]u8 = undefined;
-            const len_enc = try varint.encode(&len_buf, val_enc.len);
-            @memcpy(buf[w_pos .. w_pos + len_enc.len], len_enc);
-            w_pos += len_enc.len;
-            @memcpy(buf[w_pos .. w_pos + val_enc.len], val_enc);
-            w_pos += val_enc.len;
-            return w_pos;
-        }
-    }.call;
+    pos = try writeParamVarint(out, pos, 0x01, 30_000); // max_idle_timeout
+    pos = try writeParamVarint(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
+    pos = try writeParamVarint(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
+    pos = try writeParamVarint(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
+    pos = try writeParamVarint(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
+    // Stay at <=1000 so quic-interop-runner's multiplexing test still passes.
+    pos = try writeParamVarint(out, pos, 0x08, 1000); // initial_max_streams_bidi
+    pos = try writeParamVarint(out, pos, 0x09, 1000); // initial_max_streams_uni
 
-    pos = try write_param(out, pos, 0x01, 30_000); // max_idle_timeout
-    pos = try write_param(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
-    pos = try write_param(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
-    pos = try write_param(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
-    pos = try write_param(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
-    // Stay at <=1000 so quic-interop-runner's multiplexing test (which fails
-    // any server advertising "stream limit > 1000") still passes.
-    pos = try write_param(out, pos, 0x08, 1000); // initial_max_streams_bidi
-    pos = try write_param(out, pos, 0x09, 1000); // initial_max_streams_uni
+    if (opts.original_destination_cid) |odcid| {
+        pos = try writeParamBytes(out, pos, 0x00, odcid);
+    }
+    pos = try writeParamBytes(out, pos, 0x0f, opts.initial_source_cid);
+    if (opts.retry_source_cid) |rscid| {
+        pos = try writeParamBytes(out, pos, 0x10, rscid);
+    }
     return pos;
+}
+
+/// Build transport parameters with only flow-control limits (legacy test helper).
+pub fn buildClientTransportParams(out: []u8) (varint.EncodeError || varint.DecodeError)!usize {
+    const placeholder_cid = [_]u8{0} ** 8;
+    return buildTransportParams(out, .{ .initial_source_cid = &placeholder_cid });
 }
 
 /// Tracks CRYPTO stream offsets per encryption level for reassembly.
@@ -316,6 +353,15 @@ test "transport_params: builds non-empty" {
     var buf: [256]u8 = undefined;
     const n = try buildClientTransportParams(&buf);
     try std.testing.expect(n > 0);
+}
+
+test "transport_params: includes initial_source_connection_id" {
+    const cid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+    var buf: [256]u8 = undefined;
+    const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
+    try std.testing.expect(n > 0);
+    // id=0x0f varint is one byte 0x0f; value length 8 follows.
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], &.{ 0x0f, 0x08 }) != null);
 }
 
 test "crypto_stream: in-order feed" {
