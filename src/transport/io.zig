@@ -5265,11 +5265,6 @@ pub const Client = struct {
             // the existing processAppFrames handler responds with PATH_RESPONSE,
             // the server validates and updates conn.peer, and subsequent STREAM
             // responses are delivered to the new address (RFC 9000 §9).
-            if (self.conn.phase == .connected and self.config.migrate and !self.migrate_done) {
-                self.migrate_done = true;
-                self.rebindMigrateSocket(server_addr);
-            }
-
             // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
                 // Drain any 0-RTT GETs that did not fit in the first two NS3-safe batches.
@@ -5280,6 +5275,14 @@ pub const Client = struct {
                     try self.downloadUrls(server_addr);
                 }
                 self.requested = true;
+            }
+
+            // Migrate only after the download has started (RFC 9000 §9; interop
+            // connectionmigration).  Doing this before `downloadUrls` races the
+            // first GET with path validation on a fresh socket.
+            if (self.conn.phase == .connected and self.config.migrate and self.requested and !self.migrate_done) {
+                self.migrate_done = true;
+                self.rebindMigrateSocket(server_addr);
             }
 
             // Wait until all streams complete

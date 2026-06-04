@@ -243,9 +243,11 @@ pub const CryptoStream = struct {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of out-of-order segments held per encryption level.
-pub const REORDER_SLOTS: usize = 8;
-/// Maximum byte length of a single buffered CRYPTO fragment.
-pub const REORDER_SLOT_SIZE: usize = 1024;
+pub const REORDER_SLOTS: usize = 24;
+/// Maximum byte length of a single buffered CRYPTO/STREAM fragment.
+/// Must cover `path_mtu.appStreamChunkBytes` (~1350 B) or `insert` drops the
+/// segment and HTTP/0.9 downloads stall under NS3 loss (interop transfer).
+pub const REORDER_SLOT_SIZE: usize = 1450;
 
 const CryptoReorderSlot = struct {
     offset: u64 = 0,
