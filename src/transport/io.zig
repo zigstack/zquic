@@ -5166,9 +5166,10 @@ pub const Client = struct {
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        // Scale budget for parallel 0-RTT downloads (interop zerortt sends ~30 GETs).
-        const url_budget_ms: i64 = @intCast(@min(self.active_urls.len * 5_000, 240_000));
-        var deadline = compat.milliTimestamp() + @max(120_000, url_budget_ms);
+        // 120 s overall budget keeps us well below the interop runner's 180 s
+        // docker abort, so a stall surfaces as `error.DownloadIncomplete`
+        // instead of a silent SIGKILL.
+        var deadline = compat.milliTimestamp() + 120_000;
 
         while (compat.milliTimestamp() < deadline) {
             const now = compat.milliTimestamp();
@@ -5265,6 +5266,15 @@ pub const Client = struct {
             // the existing processAppFrames handler responds with PATH_RESPONSE,
             // the server validates and updates conn.peer, and subsequent STREAM
             // responses are delivered to the new address (RFC 9000 §9).
+            // Connection migration (RFC 9000 §9): rebind to a new ephemeral
+            // port as soon as the handshake completes so subsequent GETs go
+            // out on the new path. The interop runner verifies via pcap that
+            // the server observed >1 source ports.
+            if (self.conn.phase == .connected and self.config.migrate and !self.migrate_done) {
+                self.migrate_done = true;
+                self.rebindMigrateSocket(server_addr);
+            }
+
             // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
                 // Drain any 0-RTT GETs that did not fit in the first two NS3-safe batches.
@@ -5275,14 +5285,6 @@ pub const Client = struct {
                     try self.downloadUrls(server_addr);
                 }
                 self.requested = true;
-            }
-
-            // Migrate only after the download has started (RFC 9000 §9; interop
-            // connectionmigration).  Doing this before `downloadUrls` races the
-            // first GET with path validation on a fresh socket.
-            if (self.conn.phase == .connected and self.config.migrate and self.requested and !self.migrate_done) {
-                self.migrate_done = true;
-                self.rebindMigrateSocket(server_addr);
             }
 
             // Wait until all streams complete
@@ -6817,43 +6819,58 @@ pub const Client = struct {
                     break :blk url;
                 };
 
-                // Skip streams already sent as 0-RTT (registered by send0RttRequests).
-                // Those streams are already tracked in self.streams; re-registering them
-                // would create duplicate slots.  The responses will arrive independently
-                // (either during the handshake phase or via server FIN retransmits).
+                // For 0-RTT-registered streams, the slot already exists.  If a
+                // response has already arrived (recv_high_water > 0) the GET
+                // was delivered and we skip entirely.  Otherwise the 0-RTT
+                // packet was likely dropped (NS3 25-packet queue) — re-send
+                // the GET as 1-RTT without re-registering the slot.
+                var skip_register = false;
                 if (global_i < self.zerortt_count) {
-                    dbg("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
-                    continue;
+                    var any_progress = false;
+                    for (&self.streams) |*s| {
+                        if (s.active and s.stream_id == stream_id) {
+                            if (s.recv_high_water > 0) any_progress = true;
+                            break;
+                        }
+                    }
+                    if (any_progress) {
+                        dbg("io: stream {} ({s}) already received 0-RTT data, skipping\n", .{ stream_id, path });
+                        continue;
+                    }
+                    dbg("io: stream {} ({s}) 0-RTT GET likely dropped, re-sending as 1-RTT\n", .{ stream_id, path });
+                    skip_register = true;
                 }
 
                 dbg("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
 
-                // Open output file
-                var dl_path_buf: [512]u8 = undefined;
-                const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
-                const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
-                    dbg("io: cannot create {s}\n", .{dl_path});
-                    continue;
-                };
+                if (!skip_register) {
+                    // Open output file
+                    var dl_path_buf: [512]u8 = undefined;
+                    const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
+                    const out_file = compat.fs.createFileAbsolute(dl_path, .{}) catch {
+                        dbg("io: cannot create {s}\n", .{dl_path});
+                        continue;
+                    };
 
-                // Register stream download in an available slot
-                var registered = false;
-                for (&self.streams) |*s| {
-                    if (!s.active) {
-                        s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
-                        if (!self.config.http3) {
-                            s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
-                            s.recv_reorder.?.* = .{};
+                    // Register stream download in an available slot
+                    var registered = false;
+                    for (&self.streams) |*s| {
+                        if (!s.active) {
+                            s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                            if (!self.config.http3) {
+                                s.recv_reorder = try self.allocator.create(quic_tls_mod.CryptoReorderBuf);
+                                s.recv_reorder.?.* = .{};
+                            }
+                            dbg("io: registered stream {} for download\n", .{stream_id});
+                            registered = true;
+                            break;
                         }
-                        dbg("io: registered stream {} for download\n", .{stream_id});
-                        registered = true;
-                        break;
                     }
-                }
-                if (!registered) {
-                    out_file.close();
-                    dbg("io: streams array full\n", .{});
-                    continue;
+                    if (!registered) {
+                        out_file.close();
+                        dbg("io: streams array full\n", .{});
+                        continue;
+                    }
                 }
 
                 // Build the request payload and QUIC STREAM frame.
