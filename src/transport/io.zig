@@ -1791,8 +1791,11 @@ pub const Server = struct {
                 // Retransmitted Initial: re-send the server flight so the client
                 // can make progress even if our first response was lost.
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
-                    existing.hs_pn = 0;
-                    self.sendCoalescedServerFlight(existing, src);
+                    // Separate Initial + Handshake datagrams (not coalesced): quinn
+                    // rustls rejects a second EncryptedExtensions if the Handshake
+                    // flight is replayed inside a coalesced datagram (#132 / #135).
+                    self.sendInitialServerHello(existing, src);
+                    self.sendHandshakeServerFlight(existing, src);
                 }
                 return;
             }
@@ -2237,7 +2240,11 @@ pub const Server = struct {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
         }
 
-        self.sendCoalescedServerFlight(conn, src);
+        // Send Initial (ServerHello) and Handshake (EE + cert + Finished) in
+        // separate UDP datagrams.  Coalescing is valid (RFC 9000 §12.2) but
+        // quinn/rustls rejects the coalesced Handshake portion (#132).
+        self.sendInitialServerHello(conn, src);
+        self.sendHandshakeServerFlight(conn, src);
 
         conn.phase = .waiting_finished;
     }
