@@ -3208,14 +3208,20 @@ pub const Server = struct {
                 continue;
             }
             if (ft == 0x11) {
-                // MAX_STREAM_DATA — peer raises send window on a specific stream.
-                // We track only connection-level credit; use the stream's max to
-                // advance our connection-level credit if it is the binding limit.
+                // MAX_STREAM_DATA (RFC 9000 §19.10) — peer raises send window on
+                // a *specific stream*.  This is a per-stream limit and MUST NOT
+                // be conflated with the connection-level limit (MAX_DATA / 0x10
+                // / conn.fc_send_max).  We currently do not enforce per-stream
+                // send credit (only connection-level), so the safest thing is
+                // to parse the frame for protocol-conformance (varint decode +
+                // skip), and NOT clobber conn.fc_send_max with the per-stream
+                // value.  TODO: track per-stream limits in a side table once
+                // raw-application streams enforce them on the send path.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                if (r.frame.maximum_stream_data > conn.fc_send_max) {
-                    conn.fc_send_max = r.frame.maximum_stream_data;
-                }
+                dbg("io: MAX_STREAM_DATA stream_id={} max={} (per-stream, not applied to conn fc_send_max)\n", .{
+                    r.frame.stream_id, r.frame.maximum_stream_data,
+                });
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
@@ -6270,12 +6276,16 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x11) {
-                // MAX_STREAM_DATA — server raises stream-level send window.
+                // MAX_STREAM_DATA (RFC 9000 §19.10) — per-stream limit; mirror
+                // of the server-side handler.  Must NOT update conn.fc_send_max
+                // (that is the connection-level MAX_DATA limit, frame 0x10).
+                // We currently don't enforce per-stream send credit; decode for
+                // protocol conformance and skip.
                 const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                if (r.frame.maximum_stream_data > self.conn.fc_send_max) {
-                    self.conn.fc_send_max = r.frame.maximum_stream_data;
-                }
+                dbg("io: client MAX_STREAM_DATA stream_id={} max={} (per-stream, not applied to conn fc_send_max)\n", .{
+                    r.frame.stream_id, r.frame.maximum_stream_data,
+                });
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
