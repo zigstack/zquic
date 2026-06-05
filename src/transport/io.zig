@@ -1493,6 +1493,33 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Sending
+        // STREAM payload past the peer's advertised MAX_DATA would let the
+        // peer kill the connection with FLOW_CONTROL_ERROR.  zquic↔zquic
+        // never trips this because both sides advertise 64 MiB and zeam's
+        // libp2p workload is tiny, but cross-impl peers (quinn, msquic)
+        // advertise much smaller initial_max_data defaults.
+        //
+        // When over budget: send a DATA_BLOCKED frame so the peer knows to
+        // grant more credit, drop this send, and free the retransmit buffer.
+        // We deliberately do not queue — the only path that calls us is the
+        // libp2p layer, which retransmits at the application timescale
+        // (gossipsub heartbeat, req-resp timeout).
+        const projected: u64 = conn.fc_bytes_sent +| data.len;
+        if (projected > conn.fc_send_max) {
+            dbg("io: send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
+                stream_id, data.len, conn.fc_bytes_sent, conn.fc_send_max,
+            });
+            var blk_buf: [16]u8 = undefined;
+            blk_buf[0] = 0x14; // DATA_BLOCKED
+            const enc = varint.encode(blk_buf[1..], conn.fc_send_max) catch {
+                if (owned_buf) |b| self.allocator.free(b);
+                return;
+            };
+            self.send1Rtt(conn, blk_buf[0 .. 1 + enc.len], conn.peer);
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -1520,6 +1547,7 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        const is_fresh_send = owned_buf == null;
         const buf = owned_buf orelse blk: {
             // First send: copy the embedder-supplied data onto the heap so we
             // own it until the carrying packet is acked (the embedder's slice
@@ -1536,6 +1564,10 @@ pub const Server = struct {
         last.stream_offset = offset;
         last.stream_data = buf;
         last.stream_fin = fin;
+        // Only fresh sends advance the connection-level send counter; a
+        // retransmit re-emits the same byte range under a new PN (RFC 9000
+        // §4.1: MAX_DATA counts cumulative *original* stream-data bytes).
+        if (is_fresh_send) conn.fc_bytes_sent +|= data.len;
     }
 
     pub fn deinit(self: *Server) void {
@@ -5097,6 +5129,34 @@ pub const Client = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  See
+        // Server.sendRawStreamDataInner for the rationale.  Mirror on the
+        // client side: peer's MAX_DATA bounds our cumulative stream-data
+        // bytes, including retransmits' original byte ranges (already
+        // counted on first send).
+        const projected: u64 = self.conn.fc_bytes_sent +| data.len;
+        if (owned_buf == null and projected > self.conn.fc_send_max) {
+            dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
+                stream_id, data.len, self.conn.fc_bytes_sent, self.conn.fc_send_max,
+            });
+            // Emit DATA_BLOCKED so the peer knows to issue a MAX_DATA update.
+            var blk_buf: [16]u8 = undefined;
+            blk_buf[0] = 0x14;
+            const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return;
+            var send_blk: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const blk_pkt_len = build1RttPacketFull(
+                &send_blk,
+                self.conn.remote_cid,
+                blk_buf[0 .. 1 + enc.len],
+                self.conn.app_pn,
+                &self.conn.app_client_km,
+                self.conn.key_phase_bit,
+                self.conn.use_chacha20,
+            ) catch return;
+            self.conn.app_pn += 1;
+            _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+            return;
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -5125,6 +5185,8 @@ pub const Client = struct {
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        // Original byte range counted once, on the first send only.
+        if (owned_buf == null) self.conn.fc_bytes_sent +|= data.len;
 
         // Track for retransmit.  See Server.sendRawStreamDataInner for the
         // ownership-transfer protocol; the Client mirrors it.
