@@ -89,6 +89,21 @@ pub const SentPacket = struct {
     has_stream_data: bool = false,
     stream_id: u64 = 0,
     stream_offset: u64 = 0,
+    /// Heap-owned plaintext bytes for the raw-application STREAM frame, kept
+    /// so we can re-encrypt them under a fresh PN on loss.  `null` for the
+    /// HTTP/0.9 and HTTP/3 paths — those rewind their own per-slot state from
+    /// the underlying file on disk and don't need an in-memory copy.
+    ///
+    /// Ownership rules:
+    ///   - allocated by the producer (raw-app `sendRawStreamData`) via the
+    ///     same allocator passed to `LossDetector.deinit` / `onAck`;
+    ///   - freed by `onAck` when the carrying packet is acknowledged;
+    ///   - ownership transfers into `lost_buf` when the packet is declared
+    ///     lost — the caller MUST either re-attach the slice to a new
+    ///     `SentPacket` (via `onPacketSent`) or free it.
+    stream_data: ?[]u8 = null,
+    /// FIN flag accompanying `stream_data` (so retransmit preserves the bit).
+    stream_fin: bool = false,
 };
 
 /// Loss detection state for one packet number space.
@@ -100,12 +115,28 @@ pub const LossDetector = struct {
     largest_acked: u64 = 0,
     loss_time_ms: ?u64 = null,
 
+    /// Free any heap-owned retransmit buffers attached to in-flight packets.
+    /// Caller passes the same allocator used when populating `stream_data`.
+    pub fn deinit(self: *LossDetector, allocator: std.mem.Allocator) void {
+        for (self.sent[0..self.sent_count]) |*p| {
+            if (p.stream_data) |sd| allocator.free(sd);
+            p.stream_data = null;
+        }
+        self.sent_count = 0;
+    }
+
     /// Record a newly sent packet.
-    pub fn onPacketSent(self: *LossDetector, pkt: SentPacket) void {
+    ///
+    /// If `pkt.stream_data` is non-null and we cannot record the packet
+    /// (buffer full), the caller is responsible for freeing the slice —
+    /// otherwise it would leak.  Returns true when the packet was stored.
+    pub fn onPacketSent(self: *LossDetector, pkt: SentPacket) bool {
         if (self.sent_count < max_tracked) {
             self.sent[self.sent_count] = pkt;
             self.sent_count += 1;
+            return true;
         }
+        return false;
     }
 
     pub const OnAckError = error{FrameEncodingError};
@@ -137,8 +168,14 @@ pub const LossDetector = struct {
         /// Caller-provided buffer.  On return the first `lost_count` entries
         /// hold the full SentPacket descriptors for packets declared lost.
         /// Callers that stored stream metadata in `has_stream_data` can use
-        /// this to rewind and retransmit the affected data.
+        /// this to rewind and retransmit the affected data.  For lost
+        /// packets whose `stream_data` is non-null, ownership of that slice
+        /// transfers to the caller (see `SentPacket.stream_data` docs).
         lost_buf: []SentPacket,
+        /// Allocator used to free `stream_data` for packets acked by this
+        /// range.  Pass the same allocator that the producer used when
+        /// attaching the data via `onPacketSent`.
+        allocator: std.mem.Allocator,
     ) OnAckError!OnAckResult {
         // Validate: first_ack_range must not exceed largest_acked (RFC 9000 §19.3).
         // A saturating subtract would mask this protocol violation as a silent
@@ -176,6 +213,11 @@ pub const LossDetector = struct {
             // Packet is definitively acked: within [smallest_acked .. largest_acked].
             if (p.pn >= smallest_acked and p.pn <= largest_acked) {
                 bytes_acked += p.size;
+                // Free heap-owned retransmit buffer (raw-application path).
+                if (self.sent[i].stream_data) |sd| {
+                    allocator.free(sd);
+                    self.sent[i].stream_data = null;
+                }
                 self.sent[i] = self.sent[self.sent_count - 1];
                 self.sent_count -= 1;
                 continue;
@@ -189,7 +231,18 @@ pub const LossDetector = struct {
                 lost_bytes += p.size;
                 if (lost_count < lost_buf.len) {
                     lost_buf[lost_count] = p; // full descriptor for retransmission
+                    // Ownership of stream_data transfers from `self.sent[i]`
+                    // to `lost_buf[lost_count]`; clear the source so it isn't
+                    // freed when this slot is later overwritten.
+                    self.sent[i].stream_data = null;
                     lost_count += 1;
+                } else {
+                    // No room to surface this loss — free the retransmit
+                    // buffer so it doesn't leak.
+                    if (self.sent[i].stream_data) |sd| {
+                        allocator.free(sd);
+                        self.sent[i].stream_data = null;
+                    }
                 }
                 self.sent[i] = self.sent[self.sent_count - 1];
                 self.sent_count -= 1;
@@ -243,7 +296,7 @@ test "loss: packet threshold detection" {
     // Send packets 0..5
     var i: u64 = 0;
     while (i < 6) : (i += 1) {
-        ld.onPacketSent(.{
+        _ = ld.onPacketSent(.{
             .pn = i,
             .send_time_ms = 100 + i * 10,
             .size = 100,
@@ -256,7 +309,7 @@ test "loss: packet threshold detection" {
     // Packets 0, 1, 2 are in a gap and should be detected as lost via
     // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
     var lost_buf: [8]SentPacket = undefined;
-    const result = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf);
+    const result = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf, testing.allocator);
     try testing.expect(result.lost_count >= 2);
 }
 
@@ -268,6 +321,74 @@ test "loss: rejects invalid first_ack_range > largest_acked" {
     // largest_acked=5, first_ack_range=10 → would underflow.
     try testing.expectError(
         error.FrameEncodingError,
-        ld.onAck(5, 10, 0, 200, &rtt, &lost_buf),
+        ld.onAck(5, 10, 0, 200, &rtt, &lost_buf, testing.allocator),
     );
+}
+
+test "loss: stream_data is freed on ack and transferred on loss" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var ld = LossDetector{};
+    defer ld.deinit(a);
+    var rtt = RttEstimator{};
+
+    // Pkt 0: will be acked → expect stream_data freed by onAck.
+    const buf0 = try a.dupe(u8, "ack-me");
+    _ = ld.onPacketSent(.{
+        .pn = 0,
+        .send_time_ms = 100,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .has_stream_data = true,
+        .stream_id = 42,
+        .stream_offset = 0,
+        .stream_data = buf0,
+    });
+
+    // Pkts 1..5 keep the gap visible so pkt 1 hits the packet-threshold loss path.
+    var i: u64 = 1;
+    while (i < 6) : (i += 1) {
+        _ = ld.onPacketSent(.{
+            .pn = i,
+            .send_time_ms = 110 + i * 10,
+            .size = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+    }
+
+    // Pkt 1: will be lost (k_packet_threshold trips when pn 5 is acked).
+    // Caller owns stream_data after it lands in lost_buf; we free it below.
+    const buf1 = try a.dupe(u8, "retransmit-me");
+    // Find pkt 1 and attach buf to it so we can verify ownership transfer.
+    for (ld.sent[0..ld.sent_count]) |*p| {
+        if (p.pn == 1) {
+            p.has_stream_data = true;
+            p.stream_id = 7;
+            p.stream_offset = 9;
+            p.stream_data = buf1;
+            break;
+        }
+    }
+
+    var lost_buf: [8]SentPacket = undefined;
+    // Ack pn 0 (frees buf0 internally), then ack pn 5 separately so pn 1
+    // is declared lost via k_packet_threshold.
+    const r0 = try ld.onAck(0, 0, 0, 200, &rtt, &lost_buf, a);
+    try testing.expectEqual(@as(usize, 0), r0.lost_count);
+
+    const r1 = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf, a);
+    try testing.expect(r1.lost_count >= 1);
+    // Find the lost descriptor that owns the heap slice.
+    var saw_transfer = false;
+    var li: usize = 0;
+    while (li < r1.lost_count) : (li += 1) {
+        if (lost_buf[li].pn == 1) {
+            try testing.expect(lost_buf[li].stream_data != null);
+            a.free(lost_buf[li].stream_data.?);
+            saw_transfer = true;
+        }
+    }
+    try testing.expect(saw_transfer);
 }

@@ -1472,7 +1472,27 @@ pub const Server = struct {
         data: []const u8,
         fin: bool,
     ) void {
-        if (conn.phase != .connected or !conn.has_app_keys) return;
+        self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
+    }
+
+    /// Internal: optionally adopt `owned_buf` (already heap-allocated by an
+    /// earlier `sendRawStreamData` call) as the retransmit buffer instead of
+    /// duping `data`.  Used by the loss-recovery branch in `onAck` so we move
+    /// the bytes from the lost SentPacket into the new SentPacket without
+    /// allocating a fresh copy.
+    fn sendRawStreamDataInner(
+        self: *Server,
+        conn: *ConnState,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+        owned_buf: ?[]u8,
+    ) void {
+        if (conn.phase != .connected or !conn.has_app_keys) {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -1481,8 +1501,41 @@ pub const Server = struct {
             .has_length = true,
         };
         var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const flen = sf.serialize(&frame_buf) catch return;
+        const flen = sf.serialize(&frame_buf) catch {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        };
+        const pn_before = conn.app_pn;
         self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
+        // If send1Rtt actually emitted a packet, app_pn advanced.  Attach the
+        // retransmit buffer to the LD entry it just appended so the loss
+        // detector can replay this STREAM frame under a fresh PN on loss.
+        // `send1Rtt` only fails silently for `draining` — in that case
+        // app_pn does not move and we free `owned_buf` to avoid leaking.
+        if (conn.app_pn == pn_before) {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
+        if (conn.ld.sent_count == 0) {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
+        const buf = owned_buf orelse blk: {
+            // First send: copy the embedder-supplied data onto the heap so we
+            // own it until the carrying packet is acked (the embedder's slice
+            // typically points into a transient frame buffer).
+            const dup = self.allocator.dupe(u8, data) catch return;
+            break :blk dup;
+        };
+        const last = &conn.ld.sent[conn.ld.sent_count - 1];
+        // Defence-in-depth: free any pre-existing data so we don't leak if
+        // some unrelated path already attached one.
+        if (last.stream_data) |old| self.allocator.free(old);
+        last.has_stream_data = true;
+        last.stream_id = stream_id;
+        last.stream_offset = offset;
+        last.stream_data = buf;
+        last.stream_fin = fin;
     }
 
     pub fn deinit(self: *Server) void {
@@ -3022,6 +3075,7 @@ pub const Server = struct {
                     @intCast(compat.milliTimestamp()),
                     &conn.rtt,
                     &lost_buf,
+                    self.allocator,
                 ) catch {
                     // Malformed ACK (e.g. first_ack_range > largest_acked) —
                     // RFC 9000 §11.3 FRAME_ENCODING_ERROR.  Skip rest of frames.
@@ -3122,6 +3176,17 @@ pub const Server = struct {
                                 }
                             }
                             break;
+                        }
+                        // raw_application_streams: zquic is the data source.
+                        // The lost packet carries a heap-owned plaintext copy
+                        // of the STREAM payload in `lp.stream_data`; re-send
+                        // it via `sendRawStreamDataInner` so the bytes get a
+                        // fresh PN and the new SentPacket adopts the buffer.
+                        if (lp.stream_data) |buf| {
+                            self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
+                            // ownership of `buf` is transferred into the new
+                            // SentPacket (or freed inside *Inner on draining /
+                            // serialize failure); we must NOT touch it again.
                         }
                     }
                 }
@@ -3411,8 +3476,13 @@ pub const Server = struct {
         }
         // Congestion control: update bytes in flight.
         conn.cc.onPacketSent(@intCast(pkt_len));
-        // Loss detection: record this packet.
-        conn.ld.onPacketSent(.{
+        // Loss detection: record this packet.  Discard return value — this
+        // tracker can fill (max_tracked) under sustained loss; in that case
+        // the packet is dropped from the LD.  The raw-app retransmit path
+        // (`Server.sendRawStreamData` etc.) is responsible for freeing
+        // `stream_data` if it ever attaches a buffer to a SentPacket that
+        // does not get recorded.
+        _ = conn.ld.onPacketSent(.{
             .pn = conn.app_pn - 1,
             .send_time_ms = @intCast(compat.milliTimestamp()),
             .size = pkt_len,
@@ -4634,6 +4704,11 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     for (&conn.raw_app_streams) |*slot| {
         slot.deinit(allocator);
     }
+    // Free any retransmit buffers attached to in-flight LD entries so the
+    // raw_application_streams send-side doesn't leak when a connection is
+    // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
+    // is a no-op for those paths.
+    conn.ld.deinit(allocator);
 }
 
 /// Opening a stream beyond the peer's limit (RFC 9000 §4.6).
