@@ -5145,6 +5145,57 @@ pub const Client = struct {
         }
     }
 
+    /// Probe Timeout (PTO) handler (RFC 9002 §6.2) — client side.
+    ///
+    /// Mirrors `Server.checkPto`, but operates on the single `self.conn`
+    /// instead of iterating a server-side conn array.  Sends a 1-RTT PING
+    /// probe when bytes_in_flight > 0 and no ACK has arrived in pto_ms,
+    /// solely to elicit a peer ACK that:
+    ///   1. lets the loss detector declare tail packets lost (since their
+    ///      retransmit is what the PR-A2 loss-recovery branch then triggers);
+    ///   2. unblocks bytes_in_flight so subsequent client sends can proceed.
+    ///
+    /// Without this, a client that finishes a libp2p REQ burst and then goes
+    /// quiet has no way to recover any tail packet that was dropped — the
+    /// k_packet_threshold loss detector requires a *later* ACK to fire, and
+    /// none arrives in an idle conversation.
+    fn checkPto(self: *Client) void {
+        if (self.conn.phase != .connected) return;
+        if (self.conn.draining) return;
+        if (self.conn.cc.getBytesInFlight() == 0) return;
+        // Need at least one prior ACK so the RTT estimate is meaningful.
+        if (self.conn.last_ack_ms == 0) return;
+        const now_ms = compat.milliTimestamp();
+        const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(25, self.conn.pto_count));
+        const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
+        const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
+        if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+            // PING frame (RFC 9000 §19.2): single byte 0x01.  Wrapped in a
+            // 1-RTT packet using the same path sendRawStreamDataInner uses,
+            // bypassing the congestion window because a probe must go out
+            // regardless of cc state (RFC 9002 §6.2).
+            const ping_frame = [_]u8{0x01};
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build1RttPacketFull(
+                &send_buf,
+                self.conn.remote_cid,
+                &ping_frame,
+                self.conn.app_pn,
+                &self.conn.app_client_km,
+                self.conn.key_phase_bit,
+                self.conn.use_chacha20,
+            ) catch return;
+            const pn = self.conn.app_pn;
+            self.conn.app_pn += 1;
+            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return;
+            self.conn.last_pto_ms = now_ms;
+            self.conn.pto_count +|= 1;
+            dbg("io: client PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
+                pn, self.conn.pto_count, pto_delay, self.conn.cc.getBytesInFlight(),
+            });
+        }
+    }
+
     /// Opaque receive buffer for an inbound raw-application stream on a **client**.
     pub fn rawAppRecvBuffer(self: *const Client, stream_id: u64) ?[]const u8 {
         for (&self.raw_app_recv) |*slot| {
@@ -5331,6 +5382,11 @@ pub const Client = struct {
                 self.flushClientHandshakeTailPacketsTo(server_addr);
                 self.conn.finished_sent_ms = now;
             }
+            // PTO (RFC 9002 §6.2): once the handshake is complete, probe
+            // when an outstanding burst has gone unacknowledged longer than
+            // pto_ms.  Mirrors Server.checkPto.  Cheap when there is nothing
+            // in flight (early-out inside the function).
+            self.checkPto();
 
             if (ready == 0) continue;
 
@@ -6151,6 +6207,11 @@ pub const Client = struct {
                         // ownership transferred into the new SentPacket.
                     }
                 }
+                // ACK received — reset PTO backoff counter and record timestamp
+                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
+                // Mirrors the server-side bookkeeping at the matching ACK arm.
+                self.conn.last_ack_ms = compat.milliTimestamp();
+                self.conn.pto_count = 0;
                 pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                 continue;
             }
