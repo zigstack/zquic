@@ -776,6 +776,13 @@ pub const RawAppStreamSlot = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     /// STREAM frames that arrived ahead of `next_offset` (UDP reordering).
     out_of_order: std.ArrayListUnmanaged(RawAppPendingFrame) = .empty,
+    /// True once a STREAM frame with FIN=true has been merged into `buf` —
+    /// i.e. the peer has finished sending on this stream.  Set by the
+    /// per-side `handleRawApplicationStream{Server,Client}` and inspected
+    /// by embedders (via `rawAppStreamFinReceived`) so they can call
+    /// `releaseRawAppStream` once they have consumed the payload, freeing
+    /// the slot for re-use under the libp2p per-message-stream pattern.
+    fin_received: bool = false,
 
     pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
         for (self.out_of_order.items) |*p| {
@@ -3946,6 +3953,13 @@ pub const Server = struct {
         };
 
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        // RFC 9000 §3.2: STREAM frame with FIN signals the peer is done
+        // sending on this stream.  Record it so the embedder knows it can
+        // release the slot once it has consumed the payload (see
+        // releaseRawAppStream).  Without this, libp2p's per-message-stream
+        // gossipsub pattern exhausts the 64 slots within ~30s and all
+        // subsequent inbound streams are silently dropped.
+        if (sf.fin) slot.fin_received = true;
     }
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
@@ -4786,6 +4800,35 @@ pub fn rawAppRecvBuffer(conn: *ConnState, stream_id: u64) ?[]const u8 {
     return null;
 }
 
+/// True when the peer has sent FIN on `stream_id` (one of the slots holds it
+/// and `fin_received` is set).  Embedders driving the libp2p
+/// per-message-stream pattern should call this after consuming the payload
+/// via `rawAppRecvBuffer` and, when true, follow up with
+/// `releaseRawAppStream` to free the slot for reuse — there are only 64
+/// raw-app slots per connection.
+pub fn rawAppStreamFinReceived(conn: *ConnState, stream_id: u64) bool {
+    for (&conn.raw_app_streams) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) return slot.fin_received;
+    }
+    return false;
+}
+
+/// Free the raw-app slot holding `stream_id` so the connection's 64-slot
+/// table can absorb the next inbound stream.  Returns true if a matching
+/// slot was found.  Calling this on a slot whose FIN has not yet been
+/// received will discard any in-progress buffer and prevent later frames
+/// on that stream from being reassembled, so prefer to gate on
+/// `rawAppStreamFinReceived`.
+pub fn releaseRawAppStream(conn: *ConnState, stream_id: u64, allocator: std.mem.Allocator) bool {
+    for (&conn.raw_app_streams) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) {
+            slot.deinit(allocator);
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Client leaf certificate (DER) on a **server** `ConnState` after mutual TLS.
 pub fn serverConnPeerLeafCertificateDer(conn: *const ConnState) ?[]const u8 {
     const n = conn.tls.peer_leaf_cert_der_len;
@@ -5266,6 +5309,25 @@ pub const Client = struct {
             }
         }
         return null;
+    }
+
+    /// Mirror of the connection-level `rawAppStreamFinReceived`.
+    pub fn rawAppStreamFinReceived(self: *const Client, stream_id: u64) bool {
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.stream_id == stream_id) return slot.fin_received;
+        }
+        return false;
+    }
+
+    /// Mirror of the connection-level `releaseRawAppStream`.
+    pub fn releaseRawAppStream(self: *Client, stream_id: u64) bool {
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.stream_id == stream_id) {
+                slot.deinit(self.allocator);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Send the Initial (ClientHello) and begin the handshake. Use with an external UDP
@@ -6662,6 +6724,9 @@ pub const Client = struct {
         };
 
         rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        // Mirror of the server side: track FIN so embedders can release the
+        // slot once they have read the payload.
+        if (sf.fin) slot.fin_received = true;
     }
 
     fn http09DeliverStreamBytes(s: *StreamDownload, reorder: *quic_tls_mod.CryptoReorderBuf, offset: u64, data: []const u8) void {
