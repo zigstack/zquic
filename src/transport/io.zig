@@ -5077,26 +5077,7 @@ pub const Client = struct {
         data: []const u8,
         fin: bool,
     ) void {
-        self.sendRawStreamDataInner(stream_id, offset, data, fin, null);
-    }
-
-    /// Internal: optionally adopt `owned_buf` (already heap-allocated by an
-    /// earlier `sendRawStreamData` call) as the retransmit buffer instead of
-    /// duping `data`.  Used by the loss-recovery branch in `process1RttPacket`
-    /// so we move the bytes from the lost SentPacket into the new SentPacket
-    /// without allocating a fresh copy.  Mirrors `Server.sendRawStreamDataInner`.
-    fn sendRawStreamDataInner(
-        self: *Client,
-        stream_id: u64,
-        offset: u64,
-        data: []const u8,
-        fin: bool,
-        owned_buf: ?[]u8,
-    ) void {
-        if (self.conn.phase != .connected or !self.conn.has_app_keys) {
-            if (owned_buf) |b| self.allocator.free(b);
-            return;
-        }
+        if (self.conn.phase != .connected or !self.conn.has_app_keys) return;
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -5105,10 +5086,7 @@ pub const Client = struct {
             .has_length = true,
         };
         var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const flen = sf.serialize(&frame_buf) catch {
-            if (owned_buf) |b| self.allocator.free(b);
-            return;
-        };
+        const flen = sf.serialize(&frame_buf) catch return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,
@@ -5118,88 +5096,9 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.use_chacha20,
-        ) catch {
-            if (owned_buf) |b| self.allocator.free(b);
-            return;
-        };
-        const pn = self.conn.app_pn;
+        ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
-
-        // Track for retransmit.  See Server.sendRawStreamDataInner for the
-        // ownership-transfer protocol; the Client mirrors it.
-        const buf = owned_buf orelse blk: {
-            const dup = self.allocator.dupe(u8, data) catch return;
-            break :blk dup;
-        };
-        const recorded = self.conn.ld.onPacketSent(.{
-            .pn = pn,
-            .send_time_ms = @intCast(compat.milliTimestamp()),
-            .size = pkt_len,
-            .ack_eliciting = true,
-            .in_flight = true,
-            .has_stream_data = true,
-            .stream_id = stream_id,
-            .stream_offset = offset,
-            .stream_data = buf,
-            .stream_fin = fin,
-        });
-        if (!recorded) {
-            // LD full — caller's data has already gone on the wire; we just
-            // can't retransmit it on loss.  Free the buffer to avoid the leak.
-            self.allocator.free(buf);
-        }
-    }
-
-    /// Probe Timeout (PTO) handler (RFC 9002 §6.2) — client side.
-    ///
-    /// Mirrors `Server.checkPto`, but operates on the single `self.conn`
-    /// instead of iterating a server-side conn array.  Sends a 1-RTT PING
-    /// probe when bytes_in_flight > 0 and no ACK has arrived in pto_ms,
-    /// solely to elicit a peer ACK that:
-    ///   1. lets the loss detector declare tail packets lost (since their
-    ///      retransmit is what the PR-A2 loss-recovery branch then triggers);
-    ///   2. unblocks bytes_in_flight so subsequent client sends can proceed.
-    ///
-    /// Without this, a client that finishes a libp2p REQ burst and then goes
-    /// quiet has no way to recover any tail packet that was dropped — the
-    /// k_packet_threshold loss detector requires a *later* ACK to fire, and
-    /// none arrives in an idle conversation.
-    fn checkPto(self: *Client) void {
-        if (self.conn.phase != .connected) return;
-        if (self.conn.draining) return;
-        if (self.conn.cc.getBytesInFlight() == 0) return;
-        // Need at least one prior ACK so the RTT estimate is meaningful.
-        if (self.conn.last_ack_ms == 0) return;
-        const now_ms = compat.milliTimestamp();
-        const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(25, self.conn.pto_count));
-        const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
-        const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
-        if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
-            // PING frame (RFC 9000 §19.2): single byte 0x01.  Wrapped in a
-            // 1-RTT packet using the same path sendRawStreamDataInner uses,
-            // bypassing the congestion window because a probe must go out
-            // regardless of cc state (RFC 9002 §6.2).
-            const ping_frame = [_]u8{0x01};
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                &ping_frame,
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.use_chacha20,
-            ) catch return;
-            const pn = self.conn.app_pn;
-            self.conn.app_pn += 1;
-            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return;
-            self.conn.last_pto_ms = now_ms;
-            self.conn.pto_count +|= 1;
-            dbg("io: client PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
-                pn, self.conn.pto_count, pto_delay, self.conn.cc.getBytesInFlight(),
-            });
-        }
     }
 
     /// Opaque receive buffer for an inbound raw-application stream on a **client**.
@@ -5388,11 +5287,6 @@ pub const Client = struct {
                 self.flushClientHandshakeTailPacketsTo(server_addr);
                 self.conn.finished_sent_ms = now;
             }
-            // PTO (RFC 9002 §6.2): once the handshake is complete, probe
-            // when an outstanding burst has gone unacknowledged longer than
-            // pto_ms.  Mirrors Server.checkPto.  Cheap when there is nothing
-            // in flight (early-out inside the function).
-            self.checkPto();
 
             if (ready == 0) continue;
 
@@ -6156,68 +6050,7 @@ pub const Client = struct {
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
             if (ft == 0x02 or ft == 0x03) {
-                // ACK frame (RFC 9000 §19.3).  Parse the first range and run
-                // it through the loss detector so server-sent ACKs can ack
-                // our outgoing 1-RTT packets and surface lost STREAM frames
-                // for the raw-application retransmit path below.
-                var ack_pos: usize = pos;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
-                    pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
-                    continue;
-                };
-                ack_pos += lar_r.len;
-                const largest_ack = lar_r.value;
-
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
-                    pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
-                    continue;
-                };
-                ack_pos += del_r.len;
-                const ack_delay = del_r.value;
-
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
-                    pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
-                    continue;
-                };
-                ack_pos += cnt_r.len;
-
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
-                    pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
-                    continue;
-                };
-                const first_ack_range = fst_r.value;
-
-                var lost_buf: [32]recovery.SentPacket = undefined;
-                const ld_result = self.conn.ld.onAck(
-                    largest_ack,
-                    first_ack_range,
-                    ack_delay,
-                    @intCast(compat.milliTimestamp()),
-                    &self.conn.rtt,
-                    &lost_buf,
-                    self.allocator,
-                ) catch {
-                    pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
-                    continue;
-                };
-                if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked);
-                if (ld_result.lost_bytes > 0) self.conn.cc.subBytesInFlight(ld_result.lost_bytes);
-                // Retransmit any raw-app STREAM frames that the loss detector
-                // surfaced.  Symmetric to Server's onAck loss arm.
-                var li: usize = 0;
-                while (li < ld_result.lost_count) : (li += 1) {
-                    const lp = lost_buf[li];
-                    self.conn.cc.onLoss(lp.pn);
-                    if (lp.stream_data) |sbuf| {
-                        self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
-                        // ownership transferred into the new SentPacket.
-                    }
-                }
-                // ACK received — reset PTO backoff counter and record timestamp
-                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
-                // Mirrors the server-side bookkeeping at the matching ACK arm.
-                self.conn.last_ack_ms = compat.milliTimestamp();
-                self.conn.pto_count = 0;
+                // ACK frame — parse and skip all variable-length fields.
                 pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                 continue;
             }
