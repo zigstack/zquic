@@ -112,8 +112,36 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
             };
         }
 
+        // sendmmsg(2) returns the number of messages actually queued.  A
+        // previous version ignored the rc and assumed every message went
+        // out, which silently dropped the tail on any short send and
+        // dropped EVERYTHING on hard errors (EAGAIN, ENOBUFS, EBADF, …).
+        // That matches the empirical 24-in / 2-out asymmetry observed on
+        // loopback when zeam's server starts emitting STREAM-frame acks.
+        // RFC 9000 §13.2 makes server-side STREAM frames discardable on
+        // the wire but zquic's PTO does NOT re-arm for arbitrary
+        // ack-eliciting raw-app STREAMs, so a dropped batch never
+        // retransmits and the libp2p layer above stalls.
+        //
+        // Fix: check the rc.  On a short return, retry the tail
+        // synchronously via sendto.  On error (rc <= 0) fall back to
+        // sendto for the whole batch so the syscall path's error gets
+        // exercised per-packet (and an individual EAGAIN doesn't drop
+        // the rest of the connection's outbound traffic).
         const rc = linux.sendmmsg(@intCast(sock), msgs[0..batch.len].ptr, @intCast(batch.len), 0);
-        _ = rc; // ignore partial-send; packets are loss-tolerant
+        const rc_i: isize = @bitCast(rc);
+        if (rc_i <= 0) {
+            for (batch) |*e| {
+                _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+            }
+        } else {
+            const n: usize = @intCast(rc_i);
+            if (n < batch.len) {
+                for (batch[n..]) |*e| {
+                    _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                }
+            }
+        }
         sent += batch.len;
     }
 }
