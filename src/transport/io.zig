@@ -1493,6 +1493,27 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Without
+        // this, zquic can send STREAM payload past the peer's advertised
+        // MAX_DATA budget; the peer would then close with FLOW_CONTROL_ERROR
+        // (0x03).  Only the *original* byte range counts toward the
+        // cumulative limit; retransmits (owned_buf set) re-emit bytes
+        // already charged.
+        const is_fresh = owned_buf == null;
+        if (is_fresh) {
+            const projected: u64 = conn.fc_bytes_sent +| data.len;
+            if (projected > conn.fc_send_max) {
+                dbg("io: server send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
+                    stream_id, data.len, conn.fc_bytes_sent, conn.fc_send_max,
+                });
+                // Emit DATA_BLOCKED (0x14) so the peer knows to issue MAX_DATA.
+                var blk_buf: [16]u8 = undefined;
+                blk_buf[0] = 0x14;
+                const enc = varint.encode(blk_buf[1..], conn.fc_send_max) catch return;
+                self.send1Rtt(conn, blk_buf[0 .. 1 + enc.len], conn.peer);
+                return;
+            }
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -1536,6 +1557,9 @@ pub const Server = struct {
         last.stream_offset = offset;
         last.stream_data = buf;
         last.stream_fin = fin;
+        // Charge fresh-send bytes against the connection-level limit.
+        // Retransmits reuse already-charged bytes (RFC 9000 §4.1).
+        if (is_fresh) conn.fc_bytes_sent +|= data.len;
     }
 
     pub fn deinit(self: *Server) void {
@@ -5097,6 +5121,36 @@ pub const Client = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Mirror
+        // of Server.sendRawStreamDataInner.  Retransmits (owned_buf set)
+        // bypass the gate because their byte range was already charged on
+        // the original send.
+        const is_fresh = owned_buf == null;
+        if (is_fresh) {
+            const projected: u64 = self.conn.fc_bytes_sent +| data.len;
+            if (projected > self.conn.fc_send_max) {
+                dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
+                    stream_id, data.len, self.conn.fc_bytes_sent, self.conn.fc_send_max,
+                });
+                // Emit DATA_BLOCKED (0x14) inside a 1-RTT packet.
+                var blk_buf: [16]u8 = undefined;
+                blk_buf[0] = 0x14;
+                const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return;
+                var send_blk: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const blk_pkt_len = build1RttPacketFull(
+                    &send_blk,
+                    self.conn.remote_cid,
+                    blk_buf[0 .. 1 + enc.len],
+                    self.conn.app_pn,
+                    &self.conn.app_client_km,
+                    self.conn.key_phase_bit,
+                    self.conn.use_chacha20,
+                ) catch return;
+                self.conn.app_pn += 1;
+                _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                return;
+            }
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -5125,6 +5179,8 @@ pub const Client = struct {
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        // Charge fresh-send bytes against the connection-level limit.
+        if (is_fresh) self.conn.fc_bytes_sent +|= data.len;
 
         // Track for retransmit.  See Server.sendRawStreamDataInner for the
         // ownership-transfer protocol; the Client mirrors it.
