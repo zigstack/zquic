@@ -226,9 +226,9 @@ jobs:
 
       # PR interop is split for runtime:
       #   1) zquic↔zquic — full suite (regression signal on every push/PR)
-      #   2) zquic↔quinn — handshake smoke only (catches #132-class cross-impl bugs
-      #      without ~1–2 h of 56 matrix cases).  Full cross-impl matrix runs in
-      #      .github/workflows/interop-cross-impl.yml (nightly + manual).
+      #   2) zquic↔quinn — P0 cross-impl subset (handshake + transfer +
+      #      multiplexing, both directions).  Full matrix runs nightly in
+      #      .github/workflows/interop-cross-impl.yml.
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
@@ -245,18 +245,23 @@ jobs:
             --log-dir ../interop-results/logs-zquic \
             --json ../interop-results/results-zquic.json \
             --debug || zquic_failed=1
-          # Cross-impl smoke (quinn→zquic handshake); tracked separately until #132 is fully green.
+          # P0 cross-impl: libp2p-relevant cases in both directions (quinn↔zquic).
+          CROSS_P0="handshake,transfer,multiplexing"
           python3 run.py \
-            --client zquic,quinn \
+            --client quinn \
             --server zquic \
-            --test handshake \
-            --log-dir ../interop-results/logs-cross-handshake \
-            --json ../interop-results/results-cross-handshake.json \
+            --test "$CROSS_P0" \
+            --log-dir ../interop-results/logs-cross-quinn-zquic \
+            --json ../interop-results/results-cross-quinn-zquic.json \
             --debug || cross_failed=1
-          if [[ "$cross_failed" -ne 0 ]]; then
-            echo "::warning::quinn↔zquic cross-impl handshake failed (see results-cross-handshake.json); nightly interop-cross-impl.yml tracks full matrix"
-          fi
-          exit "$zquic_failed"
+          python3 run.py \
+            --client zquic \
+            --server quinn \
+            --test "$CROSS_P0" \
+            --log-dir ../interop-results/logs-cross-zquic-quinn \
+            --json ../interop-results/results-cross-zquic-quinn.json \
+            --debug || cross_failed=1
+          exit "$((zquic_failed | cross_failed))"
         # run.py exits with nr_failed (0 = all passed). Do NOT use continue-on-error
         # here — test failures must fail the job. The upload/summary steps below use
         # if: always() so they still run even when this step fails.
@@ -309,7 +314,7 @@ jobs:
                               passed.append(tag)
                           elif result in (None, "unsupported", "skipped"):
                               unsupported.append(tag)
-                          elif suite == "cross-handshake":
+                          elif suite.startswith("cross-"):
                               cross_failed.append(tag)
                           else:
                               failed.append(tag)
@@ -320,7 +325,9 @@ jobs:
           print(f"  PASSED      : {len(passed):2d}  {passed}")
           print(f"  FAILED      : {len(failed):2d}  {failed}")
           if cross_failed:
-              print(f"  CROSS (warn): {len(cross_failed):2d}  {cross_failed}")
+              print(f"  CROSS FAILED: {len(cross_failed):2d}  {cross_failed}")
           print(f"  UNSUPPORTED : {len(unsupported):2d}  {unsupported}")
           print(f"{'='*55}\n")
+          if failed or cross_failed:
+              sys.exit(1)
           EOF

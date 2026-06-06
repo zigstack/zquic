@@ -40,6 +40,7 @@ const recovery = @import("../loss/recovery.zig");
 const build_options = @import("build_options");
 const batch_io = @import("batch_io.zig");
 const path_mtu_mod = @import("path_mtu.zig");
+const raw_app_stream = @import("raw_app_stream.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
 
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
@@ -510,6 +511,17 @@ pub fn build1RttPacketFull(
     return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
+/// Pad a 1-RTT payload to the minimum length required for header protection
+/// sampling (RFC 9001 §5.4.2).  Returns `payload` unchanged when already long
+/// enough; otherwise writes PADDING (0x00) into `pad_buf`.
+fn pad1RttPayload(payload: []const u8, pad_buf: []u8) []const u8 {
+    const min_len: usize = 3;
+    if (payload.len >= min_len) return payload;
+    @memcpy(pad_buf[0..payload.len], payload);
+    @memset(pad_buf[payload.len..min_len], 0x00);
+    return pad_buf[0..min_len];
+}
+
 /// Result of decrypting a 1-RTT packet with PN reconstruction.
 const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
 
@@ -821,83 +833,9 @@ const Http3OutSlot = struct {
     }
 };
 
-/// One out-of-order STREAM chunk waiting until `next_offset` reaches `off`.
-const RawAppPendingFrame = struct {
-    off: u64,
-    data: std.ArrayListUnmanaged(u8) = .empty,
-
-    fn deinit(self: *RawAppPendingFrame, allocator: std.mem.Allocator) void {
-        self.data.deinit(allocator);
-    }
-};
-
-/// Append stream bytes and splice any buffered gaps that become contiguous.
-fn rawAppStreamReceiveFrame(allocator: std.mem.Allocator, slot: *RawAppStreamSlot, o: u64, d: []const u8) std.mem.Allocator.Error!void {
-    const frame_end = o + @as(u64, @intCast(d.len));
-    if (frame_end <= slot.next_offset) return;
-
-    if (o > slot.next_offset) {
-        for (slot.out_of_order.items) |p| {
-            if (p.off == o) return;
-        }
-        var copy = std.ArrayListUnmanaged(u8).empty;
-        try copy.appendSlice(allocator, d);
-        try slot.out_of_order.append(allocator, .{ .off = o, .data = copy });
-        try rawAppStreamFlushPending(allocator, slot);
-        return;
-    }
-
-    const start: usize = @intCast(slot.next_offset - o);
-    try slot.buf.appendSlice(allocator, d[start..]);
-    slot.next_offset = frame_end;
-    try rawAppStreamFlushPending(allocator, slot);
-}
-
-/// Merge pending chunks whose start offset matches `next_offset` (may chain).
-fn rawAppStreamFlushPending(allocator: std.mem.Allocator, slot: *RawAppStreamSlot) std.mem.Allocator.Error!void {
-    while (true) {
-        var found: ?usize = null;
-        for (slot.out_of_order.items, 0..) |p, i| {
-            if (p.off == slot.next_offset) {
-                found = i;
-                break;
-            }
-        }
-        const idx = found orelse return;
-        var pending = slot.out_of_order.swapRemove(idx);
-        defer pending.deinit(allocator);
-        try slot.buf.appendSlice(allocator, pending.data.items);
-        slot.next_offset += @as(u64, @intCast(pending.data.items.len));
-    }
-}
-
 /// Receive buffer for one QUIC stream when `ServerConfig.raw_application_streams` /
 /// `ClientConfig.raw_application_streams` is enabled (opaque bytes, no HTTP parsing).
-pub const RawAppStreamSlot = struct {
-    active: bool = false,
-    stream_id: u64 = 0,
-    /// Next contiguous byte offset expected; bytes [0..next_offset) are in `buf`.
-    next_offset: u64 = 0,
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-    /// STREAM frames that arrived ahead of `next_offset` (UDP reordering).
-    out_of_order: std.ArrayListUnmanaged(RawAppPendingFrame) = .empty,
-    /// True once a STREAM frame with FIN=true has been merged into `buf` —
-    /// i.e. the peer has finished sending on this stream.  Set by the
-    /// per-side `handleRawApplicationStream{Server,Client}` and inspected
-    /// by embedders (via `rawAppStreamFinReceived`) so they can call
-    /// `releaseRawAppStream` once they have consumed the payload, freeing
-    /// the slot for re-use under the libp2p per-message-stream pattern.
-    fin_received: bool = false,
-
-    pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
-        for (self.out_of_order.items) |*p| {
-            p.deinit(allocator);
-        }
-        self.out_of_order.deinit(allocator);
-        self.buf.deinit(allocator);
-        self.* = .{};
-    }
-};
+pub const RawAppStreamSlot = raw_app_stream.RawAppStreamSlot;
 
 /// Maximum number of HTTP/3 request streams that can be blocked waiting for
 /// QPACK dynamic table insertions (RFC 9204 §2.1.2).  We advertise this value
@@ -1697,6 +1635,55 @@ pub const ConnState = struct {
         }
     }
 };
+
+/// Serialize a transport-layer CONNECTION_CLOSE frame and mark the connection
+/// as having sent one.  Returns null when already sent.
+fn prepareTransportConnectionClose(
+    conn: *ConnState,
+    error_code: u64,
+    reason: []const u8,
+    out: []u8,
+) ?[]const u8 {
+    if (conn.conn_close_sent) return null;
+    conn.conn_close_sent = true;
+    const frame = transport_frames.ConnectionClose{
+        .is_application = false,
+        .error_code = error_code,
+        .frame_type = 0,
+        .reason_phrase = reason,
+    };
+    const len = frame.serialize(out) catch return null;
+    return out[0..len];
+}
+
+fn enterConnDraining(conn: *ConnState) void {
+    conn.draining = true;
+    const pto = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
+    conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
+}
+
+/// Send one client 1-RTT packet without checking `draining`.  Used for
+/// CONNECTION_CLOSE, which must go out before the draining flag is set.
+fn clientSend1RttImmediate(
+    sock: std.posix.socket_t,
+    conn: *ConnState,
+    payload: []const u8,
+) void {
+    var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    var pad_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    const effective_payload = pad1RttPayload(payload, &pad_buf);
+    const pkt_len = build1RttPacketFull(
+        &send_buf,
+        conn.remote_cid,
+        effective_payload,
+        conn.app_pn,
+        &conn.app_client_km,
+        conn.key_phase_bit,
+        conn.packet_cipher,
+    ) catch return;
+    conn.app_pn += 1;
+    _ = compat.sendto(sock, send_buf[0..pkt_len], 0, &conn.peer.any, conn.peer.getOsSockLen()) catch {};
+}
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
@@ -3354,6 +3341,9 @@ pub const Server = struct {
         // codepaths that still consult it stay consistent.
         const ncid_frame_size: usize = 28; // type + seq + rpt + len + 8 cid + 16 token
         while (fp + ncid_frame_size <= frames_buf.len) {
+            // RFC 9000 §5.1.1: the peer MUST NOT store more than
+            // `active_connection_id_limit` CIDs (seq 0 counts toward the limit).
+            if (conn.localCidCount() >= conn.peer_active_cid_limit) break;
             // Find the next free pool slot.
             var has_free = false;
             for (conn.cid_pool) |slot| {
@@ -4079,16 +4069,8 @@ pub const Server = struct {
         // CONNECTION_CLOSE copies are allowed, handled via sendConnectionClose).
         if (conn.draining) return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        // Header protection sampling (RFC 9001 §5.4.2) requires at least 3 bytes
-        // of plaintext (PN(1) + plaintext(n) + tag(16) >= pn_offset+4+16=pn_offset+20).
-        // Pad with PADDING frames (0x00) if needed.
         var padded_payload_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const min_len: usize = 3;
-        const effective_payload: []const u8 = if (payload.len < min_len) blk: {
-            @memcpy(padded_payload_buf[0..payload.len], payload);
-            @memset(padded_payload_buf[payload.len..min_len], 0x00);
-            break :blk padded_payload_buf[0..min_len];
-        } else payload;
+        const effective_payload = pad1RttPayload(payload, &padded_payload_buf);
 
         // Check if payload contains FIN frames (0x0b, 0x0d, or 0x0f type)
         var has_fin = false;
@@ -4368,23 +4350,12 @@ pub const Server = struct {
     /// draining state and MUST NOT send any further packets except for additional
     /// CONNECTION_CLOSE copies to handle packet loss.
     fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: compat.Address) void {
-        if (conn.conn_close_sent) return;
-        conn.conn_close_sent = true;
-        const frame = transport_frames.ConnectionClose{
-            .is_application = false,
-            .error_code = error_code,
-            .frame_type = 0,
-            .reason_phrase = reason,
-        };
         var buf: [256]u8 = undefined;
-        const len = frame.serialize(&buf) catch return;
+        const payload = prepareTransportConnectionClose(conn, error_code, reason, &buf) orelse return;
         // Send before setting draining so send1Rtt does not suppress the frame.
-        self.send1Rtt(conn, buf[0..len], dst);
+        self.send1Rtt(conn, payload, dst);
         dbg("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
-        conn.draining = true;
-        // RFC 9000 §10.2.2: stay in draining state for at least 3×PTO.
-        const pto = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
-        conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
+        enterConnDraining(conn);
     }
 
     /// Send a MAX_DATA frame to extend the peer's connection-level send window.
@@ -4417,6 +4388,7 @@ pub const Server = struct {
     /// 1-RTT path, and (lazily) seed the connection's stateless-reset token
     /// mirror. No-op when the pool is already full.
     fn sendNewConnectionId(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        if (conn.localCidCount() >= conn.peer_active_cid_limit) return;
         const new_cid = ConnectionId.random(compat.random, 8);
         var token: [16]u8 = undefined;
         compat.random.bytes(&token);
@@ -4583,7 +4555,7 @@ pub const Server = struct {
             return;
         };
 
-        rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
         // RFC 9000 §3.2: STREAM frame with FIN signals the peer is done
         // sending on this stream.  Record it so the embedder knows it can
         // release the slot once it has consumed the payload (see
@@ -6945,6 +6917,9 @@ pub const Client = struct {
         self.conn.ecn_ect0_recv += 1;
         self.conn.last_recv_ms = compat.milliTimestamp();
 
+        // RFC 9000 §10.2.2: silently discard all frames while draining.
+        if (self.conn.draining) return;
+
         self.conn.peer_key_phase = incoming_phase;
 
         var pos: usize = 0;
@@ -7185,10 +7160,12 @@ pub const Client = struct {
                 }
                 if (self.conn.peerCidCountHeld() >= self.conn.peer_active_cid_limit) {
                     dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued too many CIDs (limit={})\n", .{self.conn.peer_active_cid_limit});
+                    self.sendConnectionClose(0x09, "connection id limit");
                     return;
                 }
                 if (!self.conn.peerCidInsert(seq_r.value, new_cid, token)) {
                     dbg("io: peer CID pool full on NEW_CONNECTION_ID seq={}\n", .{seq_r.value});
+                    self.sendConnectionClose(0x09, "connection id limit");
                     return;
                 }
                 @memcpy(&self.conn.stateless_reset_token, &token);
@@ -7206,7 +7183,10 @@ pub const Client = struct {
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
                 dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
-                if (seq_r.value == 0) return;
+                if (seq_r.value == 0) {
+                    self.sendConnectionClose(0x0a, "retire connection id seq 0");
+                    return;
+                }
                 _ = self.conn.cidPoolRetireSeq(seq_r.value);
                 continue;
             }
@@ -7231,6 +7211,7 @@ pub const Client = struct {
                 const sid_type = sf_r.frame.stream_id & 3;
                 if (sid_type == 2) {
                     dbg("io: client STREAM_STATE_ERROR server wrote to client-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    self.sendConnectionClose(0x05, "write to send-only stream");
                     return;
                 }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
@@ -7252,6 +7233,15 @@ pub const Client = struct {
         if (self.deferred_ack_min_pn == null or decompressed_pn < self.deferred_ack_min_pn.?) {
             self.deferred_ack_min_pn = decompressed_pn;
         }
+    }
+
+    /// Send a CONNECTION_CLOSE frame (QUIC layer, type 0x1c) and enter draining.
+    fn sendConnectionClose(self: *Client, error_code: u64, reason: []const u8) void {
+        var buf: [256]u8 = undefined;
+        const payload = prepareTransportConnectionClose(&self.conn, error_code, reason, &buf) orelse return;
+        clientSend1RttImmediate(self.sock, &self.conn, payload);
+        dbg("io: client sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
+        enterConnDraining(&self.conn);
     }
 
     /// Send a single cumulative ACK for the highest PN accumulated since the
@@ -7466,7 +7456,7 @@ pub const Client = struct {
             return;
         };
 
-        rawAppStreamReceiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
         // Mirror of the server side: track FIN so embedders can release the
         // slot once they have read the payload.
         if (sf.fin) slot.fin_received = true;
