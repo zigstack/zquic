@@ -150,6 +150,26 @@ pub const Cubic = struct {
         self.bytes_acked_ca = 0;
     }
 
+    /// Called when persistent congestion is detected (RFC 9002 §7.6.3).
+    /// Collapse to the minimum window and re-enter slow start; clear the
+    /// CUBIC epoch so the next recovery starts fresh.
+    pub fn onPersistentCongestion(self: *Cubic) void {
+        self.cwnd = nr.minimum_window;
+        self.state = .slow_start;
+        self.epoch_start_ms = null;
+        self.bytes_acked_ca = 0;
+        self.end_of_recovery = null;
+        self.w_max = 0;
+        self.k_ms = 0;
+        self.tcp_cwnd = 0;
+    }
+
+    /// ECN-CE feedback or other peer-signalled congestion event.  Same
+    /// reaction as a packet-loss event — gated by `end_of_recovery`.
+    pub fn onCongestionEvent(self: *Cubic, largest_acked_pn: u64) void {
+        self.onLoss(largest_acked_pn);
+    }
+
     /// Called when a packet is sent.
     pub fn onPacketSent(self: *Cubic, bytes: u64) void {
         self.bytes_in_flight +|= bytes;

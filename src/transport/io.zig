@@ -254,6 +254,37 @@ fn writeKeylog(path: []const u8, client_random: [32]u8, secrets: *const tls_hs.T
 /// Skip the body of an ACK frame (type 0x02 or 0x03), advancing `pos` past it.
 /// `is_ecn` should be true for type 0x03 (includes ECN counts).
 /// Returns the number of bytes consumed from `data` (which starts AFTER the type varint).
+/// Extract the trailing ECN counts (ect0, ect1, ecn-ce) from an ACK-ECN
+/// frame body.  `data` starts at the same offset as `skipAckBody`'s input
+/// (i.e. right after the type byte).  Returns `null` when the body is
+/// truncated; otherwise the three peer-reported counters.  We re-parse the
+/// body instead of refactoring the existing ACK fast path so the change
+/// stays focused on RFC 9002 §B.4 ECN feedback handling.
+fn parseAckEcnCounts(data: []const u8) ?struct { ect0: u64, ect1: u64, ce: u64 } {
+    var pos: usize = 0;
+    const lar = varint.decode(data[pos..]) catch return null;
+    pos += lar.len;
+    const del = varint.decode(data[pos..]) catch return null;
+    pos += del.len;
+    const cnt = varint.decode(data[pos..]) catch return null;
+    pos += cnt.len;
+    const fst = varint.decode(data[pos..]) catch return null;
+    pos += fst.len;
+    var ri: u64 = 0;
+    while (ri < cnt.value) : (ri += 1) {
+        const gp = varint.decode(data[pos..]) catch return null;
+        pos += gp.len;
+        const rl = varint.decode(data[pos..]) catch return null;
+        pos += rl.len;
+    }
+    const ect0 = varint.decode(data[pos..]) catch return null;
+    pos += ect0.len;
+    const ect1 = varint.decode(data[pos..]) catch return null;
+    pos += ect1.len;
+    const ce = varint.decode(data[pos..]) catch return null;
+    return .{ .ect0 = ect0.value, .ect1 = ect1.value, .ce = ce.value };
+}
+
 fn skipAckBody(data: []const u8, is_ecn: bool) usize {
     var pos: usize = 0;
     const lar = varint.decode(data[pos..]) catch return data.len;
@@ -1208,6 +1239,16 @@ pub const ConnState = struct {
     ecn_ect0_recv: u64 = 0,
     ecn_ect1_recv: u64 = 0,
     ecn_ce_recv: u64 = 0,
+
+    // Peer-reported ECN counters from ACK frames carrying ECN feedback
+    // (RFC 9002 §B.4 / RFC 9000 §13.4).  When `peer_ecn_ce` increases for a
+    // packet number space, the peer has reported a CE-marked packet — we
+    // treat this as a congestion signal.  Tracked only for the 1-RTT space;
+    // the Initial / Handshake spaces are short-lived enough that we do not
+    // currently react to ECN feedback there.
+    peer_ecn_ect0: u64 = 0,
+    peer_ecn_ect1: u64 = 0,
+    peer_ecn_ce: u64 = 0,
 
     // ── Congestion control + loss detection (RFC 9002) ────────────────────────
     // Congestion controller: NewReno (default) or CUBIC (configurable).
@@ -3389,6 +3430,28 @@ pub const Server = struct {
                 // lost packets are no longer "in flight").
                 if (ld_result.lost_bytes > 0) {
                     conn.cc.subBytesInFlight(ld_result.lost_bytes);
+                }
+                // ECN-CE feedback (RFC 9002 §B.4): an increase in the peer's
+                // reported CE counter is a congestion signal.  We only
+                // process ACK-ECN frames (type 0x03) and only react to a
+                // strictly-increasing CE count to avoid double-counting
+                // when ACKs are reordered or duplicated.
+                if (ft == 0x03) {
+                    if (parseAckEcnCounts(frames[pos..])) |ec| {
+                        if (ec.ce > conn.peer_ecn_ce) {
+                            conn.peer_ecn_ce = ec.ce;
+                            conn.cc.onCongestionEvent(largest_ack);
+                        }
+                        if (ec.ect0 > conn.peer_ecn_ect0) conn.peer_ecn_ect0 = ec.ect0;
+                        if (ec.ect1 > conn.peer_ecn_ect1) conn.peer_ecn_ect1 = ec.ect1;
+                    }
+                }
+                // Persistent congestion (RFC 9002 §7.6): collapse cwnd to the
+                // minimum window when the loss detector reports a long-enough
+                // unbroken span of lost ack-eliciting packets.
+                if (ld_result.persistent_congestion) {
+                    dbg("io: persistent congestion detected — resetting cwnd\n", .{});
+                    conn.cc.onPersistentCongestion();
                 }
                 // Signal loss events to CC and rewind any affected HTTP/0.9
                 // stream slots so lost data is retransmitted (RFC 9000 §3.3).
@@ -6627,6 +6690,22 @@ pub const Client = struct {
                 };
                 if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked);
                 if (ld_result.lost_bytes > 0) self.conn.cc.subBytesInFlight(ld_result.lost_bytes);
+                // ECN-CE feedback (RFC 9002 §B.4): mirror of the server arm.
+                if (ft == 0x03) {
+                    if (parseAckEcnCounts(plaintext[pos..pt_len])) |ec| {
+                        if (ec.ce > self.conn.peer_ecn_ce) {
+                            self.conn.peer_ecn_ce = ec.ce;
+                            self.conn.cc.onCongestionEvent(largest_ack);
+                        }
+                        if (ec.ect0 > self.conn.peer_ecn_ect0) self.conn.peer_ecn_ect0 = ec.ect0;
+                        if (ec.ect1 > self.conn.peer_ecn_ect1) self.conn.peer_ecn_ect1 = ec.ect1;
+                    }
+                }
+                // Persistent congestion (RFC 9002 §7.6).
+                if (ld_result.persistent_congestion) {
+                    dbg("io: persistent congestion detected — resetting cwnd\n", .{});
+                    self.conn.cc.onPersistentCongestion();
+                }
                 // Retransmit any raw-app STREAM frames that the loss detector
                 // surfaced.  Symmetric to Server's onAck loss arm.
                 var li: usize = 0;

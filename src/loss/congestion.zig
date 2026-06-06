@@ -14,6 +14,8 @@ const std = @import("std");
 pub const mss: u64 = 1350;
 /// Maximum congestion window (bytes).
 const max_cwnd: u64 = 64 * 1024 * 1024; // 64 MB
+/// Minimum congestion window after persistent congestion (RFC 9002 §7.6.3).
+pub const minimum_window: u64 = 2 * mss;
 
 pub const CcState = enum {
     slow_start,
@@ -79,6 +81,26 @@ pub const NewReno = struct {
         self.state = .recovery;
     }
 
+    /// Called when persistent congestion is detected (RFC 9002 §7.6.3).
+    /// Collapses cwnd to the minimum window and re-enters slow start so the
+    /// sender does not continue to overload an apparently dead path.
+    /// Bytes-in-flight is left untouched — outstanding packets remain in
+    /// flight until they are acked, lost, or discarded.
+    pub fn onPersistentCongestion(self: *NewReno) void {
+        self.cwnd = minimum_window;
+        self.state = .slow_start;
+        self.bytes_acked_ca = 0;
+        self.end_of_recovery = null;
+    }
+
+    /// ECN-CE feedback or other peer-signalled congestion (RFC 9002 §B.4 /
+    /// RFC 9000 §13.4).  Equivalent to a packet-loss congestion event: halve
+    /// cwnd and enter recovery, gated by `end_of_recovery` so we don't react
+    /// twice within the same RTT.
+    pub fn onCongestionEvent(self: *NewReno, largest_acked_pn: u64) void {
+        self.onLoss(largest_acked_pn);
+    }
+
     /// Called when a packet is sent.
     pub fn onPacketSent(self: *NewReno, bytes: u64) void {
         self.bytes_in_flight +|= bytes;
@@ -117,6 +139,18 @@ pub const CongestionController = union(enum) {
     pub fn onLoss(self: *CongestionController, largest_lost_pn: u64) void {
         switch (self.*) {
             inline else => |*cc| cc.onLoss(largest_lost_pn),
+        }
+    }
+
+    pub fn onPersistentCongestion(self: *CongestionController) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onPersistentCongestion(),
+        }
+    }
+
+    pub fn onCongestionEvent(self: *CongestionController, largest_acked_pn: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onCongestionEvent(largest_acked_pn),
         }
     }
 
@@ -205,6 +239,34 @@ test "new_reno: can_send check" {
     try testing.expect(cc.canSend(mss));
 }
 
+test "new_reno: persistent congestion collapses to minimum window" {
+    const testing = std.testing;
+    var cc = NewReno.init();
+    cc.cwnd = 100 * mss;
+    cc.state = .congestion_avoidance;
+    cc.bytes_acked_ca = 12345;
+
+    cc.onPersistentCongestion();
+    try testing.expectEqual(minimum_window, cc.cwnd);
+    try testing.expectEqual(CcState.slow_start, cc.state);
+    try testing.expectEqual(@as(u64, 0), cc.bytes_acked_ca);
+}
+
+test "new_reno: onCongestionEvent equivalent to onLoss" {
+    const testing = std.testing;
+    var a = NewReno.init();
+    var b = NewReno.init();
+    a.cwnd = 20 * mss;
+    b.cwnd = 20 * mss;
+    a.bytes_in_flight = 10 * mss;
+    b.bytes_in_flight = 10 * mss;
+    a.onLoss(42);
+    b.onCongestionEvent(42);
+    try testing.expectEqual(a.cwnd, b.cwnd);
+    try testing.expectEqual(a.ssthresh, b.ssthresh);
+    try testing.expectEqual(a.state, b.state);
+}
+
 test "congestion_controller: tagged union dispatches correctly" {
     const testing = std.testing;
 
@@ -224,4 +286,14 @@ test "congestion_controller: tagged union dispatches correctly" {
     cubic.onLoss(1);
     // After loss, CUBIC sets cwnd = cwnd × β (0.7).
     try testing.expect(cubic.canSend(mss));
+
+    // Persistent congestion collapses both variants to the minimum window.
+    // bytes_in_flight may still be non-zero from earlier; assert by reading
+    // the cwnd directly via sendCredit() bound.
+    nr.setBytesInFlight(0);
+    cubic.setBytesInFlight(0);
+    nr.onPersistentCongestion();
+    cubic.onPersistentCongestion();
+    try testing.expectEqual(minimum_window, nr.sendCredit());
+    try testing.expectEqual(minimum_window, cubic.sendCredit());
 }
