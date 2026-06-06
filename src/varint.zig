@@ -6,6 +6,7 @@
 //! in-tree module exposed (`encode`, `decode`, `lenToUsize`, `Reader`,
 //! `Writer`, `EncodeError`, `DecodeError`, `max_value`, `encodedLen`).
 
+const std = @import("std");
 const quic = @import("zig_varint").quic;
 
 pub const max_value = quic.max_value;
@@ -16,6 +17,32 @@ pub const lenToUsize = quic.lenToUsize;
 pub const encodedLen = quic.encodedLen;
 pub const encode = quic.encode;
 pub const decode = quic.decode;
+
+/// Decode a peer varint without rejecting non-minimal encodings.
+/// quinn has been observed to send e.g. `0x4019` for value 25 on coalesced
+/// Initial retransmits; strict decode would skip the trailing Handshake packet.
+pub fn decodePermissive(buf: []const u8) DecodeError!struct { value: u64, len: u4 } {
+    if (buf.len == 0) return error.BufferTooShort;
+    const prefix: u2 = @intCast(buf[0] >> 6);
+    switch (prefix) {
+        0b00 => return .{ .value = buf[0] & 0x3f, .len = 1 },
+        0b01 => {
+            if (buf.len < 2) return error.BufferTooShort;
+            const w = std.mem.readInt(u16, buf[0..2], .big);
+            return .{ .value = w & 0x3fff, .len = 2 };
+        },
+        0b10 => {
+            if (buf.len < 4) return error.BufferTooShort;
+            const w = std.mem.readInt(u32, buf[0..4], .big);
+            return .{ .value = w & 0x3fffffff, .len = 4 };
+        },
+        0b11 => {
+            if (buf.len < 8) return error.BufferTooShort;
+            const w = std.mem.readInt(u64, buf[0..8], .big);
+            return .{ .value = w & 0x3fffffffffffffff, .len = 8 };
+        },
+    }
+}
 
 pub const Reader = quic.Reader;
 pub const Writer = quic.Writer;

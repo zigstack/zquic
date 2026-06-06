@@ -2318,11 +2318,31 @@ pub const Server = struct {
                 return;
             }
             dbg("io: server pkt_type={any}\n", .{lh.header.packet_type});
+            // RFC 9000 §12.2: determine this packet's end for coalesced datagrams.
+            const pkt_end: usize = blk: {
+                var pos = lh.consumed;
+                if (lh.header.packet_type == .initial) {
+                    const tok_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
+                    const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
+                    pos += tok_r.len + tok_len;
+                }
+                if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
+                    if (pos >= buf.len) break :blk buf.len;
+                    const len_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
+                    const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
+                    pos += len_r.len + payload_len;
+                    break :blk @min(pos, buf.len);
+                }
+                break :blk buf.len;
+            };
             switch (lh.header.packet_type) {
-                .initial => self.processInitialPacket(buf, src),
-                .handshake => self.processHandshakePacket(buf, src),
-                .zero_rtt => self.process0RttPacket(buf, src),
+                .initial => self.processInitialPacket(buf[0..pkt_end], src),
+                .handshake => self.processHandshakePacket(buf[0..pkt_end], src),
+                .zero_rtt => self.process0RttPacket(buf[0..pkt_end], src),
                 .retry => {}, // server never receives Retry
+            }
+            if (pkt_end < buf.len) {
+                self.processPacket(buf[pkt_end..], src);
             }
         } else {
             // Short (1-RTT) header
@@ -2955,6 +2975,9 @@ pub const Server = struct {
         // quinn/rustls rejects the coalesced Handshake portion (#132).
         self.sendInitialServerHello(conn, src);
         self.sendHandshakeServerFlight(conn, src);
+        // Quinn multiplexing: grant stream credit before the client's first 1-RTT burst.
+        self.sendMaxStreamsToAtLeast(conn, true, 2000, src);
+        self.send_batch.flush(self.sock);
 
         conn.phase = .waiting_finished;
     }
@@ -3325,14 +3348,14 @@ pub const Server = struct {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
         }
 
-        // Send Handshake ACK + 1-RTT HANDSHAKE_DONE
+        // Send Handshake ACK + 1-RTT HANDSHAKE_DONE (MAX_STREAMS coalesced inside).
         self.sendHandshakeAck(conn, src);
-        self.sendHandshakeDone(conn, src);
-
-        // Quinn's multiplexing test opens ~2000 bidi streams immediately after the
-        // handshake; grant credit before the first STREAM arrives so the client
-        // is not blocked on our initial_max_streams_bidi=1000 transport param.
+        // Quinn acts on HANDSHAKE_DONE immediately; grant stream credit in a
+        // dedicated 1-RTT packet flushed first so it is not ordered after HD.
         self.sendMaxStreamsToAtLeast(conn, true, 2000, src);
+        self.send_batch.flush(self.sock);
+        self.sendHandshakeDone(conn, src);
+        self.send_batch.flush(self.sock);
 
         // Initiate a key update immediately after the handshake if enabled.
         // This satisfies the quic-interop-runner "keyupdate" test case.
@@ -4312,7 +4335,9 @@ pub const Server = struct {
     /// NS3 simulator's 25-packet DropTail queue.  On real networks and
     /// loopback the CC window is the effective bottleneck, not this budget.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 20;
+        // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
+        // enough to drain responses before the client idle timeout.
+        var budget: usize = 64;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -4553,26 +4578,56 @@ pub const Server = struct {
         self.sendMaxStreamsToAtLeast(conn, bidi, current + 1000, dst);
     }
 
+    /// Compute raised stream limit without mutating `conn`.
+    fn computeMaxStreamsLimit(current: u64, minimum: u64) ?u64 {
+        if (minimum <= current) return null;
+        return ((minimum + 999) / 1000) * 1000;
+    }
+
     /// Raise the peer's stream limit to at least `minimum` (RFC 9000 §19.11).
-    /// Quinn's multiplexing interop test opens ~2000 streams in one burst; the
-    /// runner expects MAX_STREAMS credit grants, not CONNECTION_CLOSE(0x4).
-    fn sendMaxStreamsToAtLeast(self: *Server, conn: *ConnState, bidi: bool, minimum: u64, dst: compat.Address) void {
+    /// Returns the new limit when raised, null if already sufficient.
+    fn bumpMaxStreamsLimit(conn: *ConnState, bidi: bool, minimum: u64) ?u64 {
         const current: u64 = if (bidi) conn.max_streams_bidi_recv else conn.max_streams_uni_recv;
-        if (minimum <= current) return;
-        // Round up to the next 1000 boundary — matches initial transport params
-        // granularity and keeps interop checker behaviour predictable.
-        const new_limit = ((minimum + 999) / 1000) * 1000;
+        const new_limit = computeMaxStreamsLimit(current, minimum) orelse return null;
         if (bidi) {
             conn.max_streams_bidi_recv = new_limit;
         } else {
             conn.max_streams_uni_recv = new_limit;
         }
+        return new_limit;
+    }
 
+    /// Send MAX_STREAMS in a standalone 1-RTT datagram via the send batch.
+    fn sendMaxStreams1RttDirect(self: *Server, conn: *ConnState, src: compat.Address, minimum: u64) void {
+        const new_limit = bumpMaxStreamsLimit(conn, true, minimum) orelse return;
         var buf: [16]u8 = undefined;
-        buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13); // MAX_STREAMS bidi/uni
-        const enc = varint.encode(buf[1..], new_limit) catch return;
-        self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
-        dbg("io: sent MAX_STREAMS bidi={} limit={}\n", .{ bidi, new_limit });
+        const flen = writeMaxStreamsFrame(&buf, true, new_limit) orelse return;
+        self.send1Rtt(conn, buf[0..flen], src);
+        self.send_batch.flush(self.sock);
+        dbg("io: sent MAX_STREAMS bidi limit={}\n", .{new_limit});
+    }
+
+    /// Serialize a MAX_STREAMS frame (RFC 9000 §19.11) into `out`.
+    fn writeMaxStreamsFrame(out: []u8, bidi: bool, limit: u64) ?usize {
+        if (out.len == 0) return null;
+        out[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13);
+        const enc = varint.encode(out[1..], limit) catch return null;
+        return 1 + enc.len;
+    }
+
+    /// Raise the peer's stream limit to at least `minimum` (RFC 9000 §19.11).
+    /// Quinn's multiplexing interop test opens ~2000 streams in one burst; the
+    /// runner expects MAX_STREAMS credit grants, not CONNECTION_CLOSE(0x4).
+    fn sendMaxStreamsToAtLeast(self: *Server, conn: *ConnState, bidi: bool, minimum: u64, dst: compat.Address) void {
+        if (bidi) {
+            self.sendMaxStreams1RttDirect(conn, dst, minimum);
+            return;
+        }
+        const new_limit = bumpMaxStreamsLimit(conn, false, minimum) orelse return;
+        var buf: [16]u8 = undefined;
+        const flen = writeMaxStreamsFrame(&buf, false, new_limit) orelse return;
+        self.send1Rtt(conn, buf[0..flen], dst);
+        dbg("io: sent MAX_STREAMS bidi=false limit={}\n", .{new_limit});
     }
 
     /// Extend peer stream budget when a burst opens beyond the current limit.
@@ -6523,9 +6578,7 @@ pub const Client = struct {
             const quic_tp = try buildEndpointTransportParams(
                 &quic_tp_buf,
                 self.conn.local_cid.slice(),
-                // Omit max_udp_payload_size in ClientHello — quinn/rustls interop
-                // accepts the RFC default; an explicit 1500 has been observed to
-                // cause silent Initial discard on some quinn-interop builds.
+                // Omit max_udp_payload_size — peer assumes RFC §18.2 default (65527).
                 0,
             );
 
@@ -6613,25 +6666,31 @@ pub const Client = struct {
 
         // CRYPTO frame
         const crypto_len = try buildCryptoFrame(&frame_buf, 0, self.client_hello_bytes[0..ch_len]);
-        // Pad to 1200 bytes minimum (RFC 9000 §14.1)
-        const min_payload = 1200 - 100; // leave room for headers
-        if (crypto_len < min_payload) {
-            buildPaddingFrames(frame_buf[crypto_len..min_payload], min_payload - crypto_len);
-        }
-        const payload_len = @max(crypto_len, min_payload);
-
+        // RFC 9000 §14.1: UDP datagram payload MUST be ≥1200 bytes.  Quinn/rustls
+        // silently discard undersized Initials (observed at 1151 B without this loop).
         const init_km = self.conn.init_keys.?;
         const token = self.conn.retry_token[0..self.conn.retry_token_len];
-        const pkt_len = try buildInitialPacket(
-            &self.initial_pkt,
-            self.conn.remote_cid,
-            self.conn.local_cid,
-            token,
-            frame_buf[0..payload_len],
-            self.conn.init_pn,
-            &init_km.client,
-            self.conn.quicVersion(),
-        );
+        var payload_len = crypto_len;
+        var pkt_len: usize = 0;
+        while (true) {
+            pkt_len = try buildInitialPacket(
+                &self.initial_pkt,
+                self.conn.remote_cid,
+                self.conn.local_cid,
+                token,
+                frame_buf[0..payload_len],
+                self.conn.init_pn,
+                &init_km.client,
+                self.conn.quicVersion(),
+            );
+            if (pkt_len >= types.min_initial_mtu) break;
+            if (payload_len >= frame_buf.len) return error.BufferTooSmall;
+            const need = types.min_initial_mtu - pkt_len;
+            const add = @max(need, 4);
+            if (payload_len + add > frame_buf.len) return error.BufferTooSmall;
+            buildPaddingFrames(frame_buf[payload_len .. payload_len + add], add);
+            payload_len += add;
+        }
         self.conn.init_pn += 1;
         self.initial_pkt_len = pkt_len;
 
@@ -6759,13 +6818,13 @@ pub const Client = struct {
                 var pos = lh.consumed;
                 if (lh.header.packet_type == .initial) {
                     // Skip token_len + token.
-                    const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    const tok_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
                     const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
                     pos += tok_r.len + tok_len;
                 }
                 if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
                     if (pos >= buf.len) break :blk buf.len;
-                    const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    const len_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
                     const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
                     pos += len_r.len + payload_len;
                     break :blk @min(pos, buf.len);

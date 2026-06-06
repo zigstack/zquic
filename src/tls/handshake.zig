@@ -540,6 +540,20 @@ fn negotiateEeAlpn(ch: *const ClientHelloData, preferred: ?[]const u8) ?[]const 
     return null;
 }
 
+/// RFC 8446 §4.2.9: advertise PSK with (EC)DHE key establishment.
+fn appendClientHelloPskKeyExchangeModes(ext_buf: []u8, ep: usize) usize {
+    var p = ep;
+    writeU16(ext_buf[p..], EXT_PSK_KEY_EXCHANGE_MODES);
+    p += 2;
+    writeU16(ext_buf[p..], 2); // ext data: list_len(1) + mode(1)
+    p += 2;
+    ext_buf[p] = 1; // list len
+    p += 1;
+    ext_buf[p] = 1; // psk_dhe_ke
+    p += 1;
+    return p;
+}
+
 /// RFC 8446 §4.2.3: TLS 1.3 ClientHello MUST include signature_algorithms.
 fn appendClientHelloSignatureAlgorithms(ext_buf: []u8, ep: usize) usize {
     var p = ep;
@@ -930,7 +944,7 @@ pub fn buildClientHelloWithPsk(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
-    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS_DRAFT);
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
     ep += 2;
@@ -1102,6 +1116,8 @@ fn buildClientHelloInner(
 
     ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
 
+    ep = appendClientHelloPskKeyExchangeModes(ext_buf[0..], ep);
+
     // supported_groups: X25519 only (matches key_share; rustls rejects orphan groups)
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
     ep += 2;
@@ -1126,8 +1142,8 @@ fn buildClientHelloInner(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
-    // QUIC transport params — draft ext type for quinn-interop server compatibility
-    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS_DRAFT);
+    // QUIC transport params — RFC 9001 ext type (quinn/rustls expects 0x0039)
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
     ep += 2;

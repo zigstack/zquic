@@ -59,7 +59,7 @@ pub fn parseInitial(buf: []const u8) ParseError!InitialPacket {
 
     // Token length + token
     if (pos >= buf.len) return error.BufferTooShort;
-    const tok_len_r = try varint.decode(buf[pos..]);
+    const tok_len_r = try varint.decodePermissive(buf[pos..]);
     pos += tok_len_r.len;
     const tok_len: usize = @intCast(tok_len_r.value);
     if (pos + tok_len > buf.len) return error.BufferTooShort;
@@ -68,7 +68,7 @@ pub fn parseInitial(buf: []const u8) ParseError!InitialPacket {
 
     // Length (covers PN + payload)
     if (pos >= buf.len) return error.BufferTooShort;
-    const payload_len_r = try varint.decode(buf[pos..]);
+    const payload_len_r = try varint.decodePermissive(buf[pos..]);
     pos += payload_len_r.len;
     const payload_len: usize = @intCast(payload_len_r.value);
 
