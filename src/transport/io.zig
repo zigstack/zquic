@@ -918,9 +918,9 @@ const Http09OutSlot = struct {
     }
 };
 
-/// Parsed HTTP/0.9 request waiting for a free [`Http09OutSlot`].
-/// Quinn's multiplexing test opens ~2000 streams at once; we serve 64
-/// concurrently and queue the rest until a slot frees up.
+/// Quinn's multiplexing test opens ~2000 streams at once; serve enough
+/// concurrent responses that the pending queue does not fill under CC.
+const http09_slot_max = 512;
 const http09_pending_max = 2048;
 
 const Http09PendingOpen = struct {
@@ -1047,6 +1047,7 @@ pub const ConnPhase = enum {
 };
 
 /// Final-size tracking entry (RFC 9000 §4.5).  `used=false` slots are empty.
+const fin_tracker_cap = 2048;
 const FinEntry = struct {
     stream_id: u64 = 0,
     final_size: u64 = 0,
@@ -1055,7 +1056,7 @@ const FinEntry = struct {
 
 /// Record the final size of a stream that reached FIN/RESET.  Evicts the
 /// oldest entry (index 0) if full.  Idempotent for an existing stream_id.
-fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void {
+fn recordFinalSize(tracker: *[fin_tracker_cap]FinEntry, stream_id: u64, final_size: u64) void {
     for (tracker) |*e| {
         if (e.used and e.stream_id == stream_id) {
             e.final_size = final_size;
@@ -1077,7 +1078,7 @@ fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void
 /// Returns true if `final_size` matches any previously-recorded final size
 /// for this stream_id, or if no entry exists (new stream).  Returns false
 /// only on a known mismatch — caller should close with FINAL_SIZE_ERROR.
-fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64) bool {
+fn checkFinalSize(tracker: *const [fin_tracker_cap]FinEntry, stream_id: u64, final_size: u64) bool {
     for (tracker) |e| {
         if (e.used and e.stream_id == stream_id) return e.final_size == final_size;
     }
@@ -1220,7 +1221,7 @@ pub const ConnState = struct {
     qlog: qlog_writer.Writer = .{},
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [128]Http09OutSlot = [_]Http09OutSlot{.{}} ** 128,
+    http09_slots: [http09_slot_max]Http09OutSlot = [_]Http09OutSlot{.{}} ** http09_slot_max,
 
     /// HTTP/3 responses in progress (paced DATA frame sending per connection).
     http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
@@ -1326,7 +1327,7 @@ pub const ConnState = struct {
     // triggers FINAL_SIZE_ERROR (0x06).  A small ring is sufficient: only the
     // most-recently-finished streams need to be checked against late RESETs,
     // and stale entries naturally age out as newer FIN/RESETs arrive.
-    fin_tracker: [16]FinEntry = [_]FinEntry{.{}} ** 16,
+    fin_tracker: [fin_tracker_cap]FinEntry = [_]FinEntry{.{}} ** fin_tracker_cap,
 
     // ── Active connection ID limit (RFC 9000 §5.1.1) ──────────────────────────
     // Count of unretired CIDs the peer has issued via NEW_CONNECTION_ID.
@@ -3853,7 +3854,7 @@ pub const Server = struct {
         while (pos < frames.len) {
             const ft_r = varint.decode(frames[pos..]) catch {
                 dbg("io: frame type decode error at pos={}\n", .{pos});
-                return;
+                break;
             };
             const ft = ft_r.value;
             pos += ft_r.len;
@@ -4260,7 +4261,7 @@ pub const Server = struct {
                 // STREAM frame
                 const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch |err| {
                     dbg("io: STREAM frame parse error ft=0x{x:0>2}: {}\n", .{ ft, err });
-                    return;
+                    break;
                 };
                 pos += sf_r.consumed;
                 dbg("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
@@ -4312,7 +4313,7 @@ pub const Server = struct {
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
-                // Flow control (RFC 9000 §4.1): track cumulative bytes received.
+                // Flow control (RFC 9000 §4.1): track highest end offset seen.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
                 if (conn.fc_bytes_recv > conn.fc_recv_max) {
@@ -4325,9 +4326,19 @@ pub const Server = struct {
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
+            if (ft == 0x07) {
+                // NEW_TOKEN (RFC 9000 §19.7) — ignore on server.
+                const len_r = varint.decode(frames[pos..]) catch break;
+                pos += len_r.len;
+                const tlen = varint.lenToUsize(len_r.value) catch break;
+                if (pos + tlen > frames.len) break;
+                pos += tlen;
+                continue;
+            }
             // Unknown frame type — cannot safely skip without knowing the length.
-            return;
+            break;
         }
+        if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
     }
 
     /// Send a RESET_STREAM frame to cancel a stream (RFC 9000 §19.4).
@@ -4507,7 +4518,7 @@ pub const Server = struct {
             slot.file.close();
             // Single-chunk HTTP/0.9 (quinn multiplexing uses 32-byte files):
             // release the slot immediately so ~2000 streams are not serialized
-            // through 128 awaiting_fin_ack slots waiting for client ACKs.
+            // through awaiting_fin_ack slots waiting for client ACKs.
             if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
                 dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
                 slot.* = .{};
@@ -4985,6 +4996,9 @@ pub const Server = struct {
     }
 
     fn enqueueHttp09Pending(conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
+            if (entry.stream_id == stream_id) return true;
+        }
         if (conn.http09_pending_count >= http09_pending_max) return false;
         const entry = &conn.http09_pending[conn.http09_pending_count];
         entry.stream_id = stream_id;
@@ -5030,14 +5044,27 @@ pub const Server = struct {
         return null;
     }
 
-    fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) void {
+    fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
         if (self.openHttp09OutSlot(conn, stream_id, fs_path)) {
             self.drainHttp09Pending(conn);
-            return;
+            return true;
         }
-        if (!enqueueHttp09Pending(conn, stream_id, fs_path)) {
-            dbg("io: http/0.9 pending queue full (stream_id={})\n", .{stream_id});
+        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return true;
         }
+        // Slots and pending may have freed since the first attempt (CC flush).
+        self.drainHttp09Pending(conn);
+        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return true;
+        }
+        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return true;
+        }
+        dbg("io: http/0.9 open queued failed (stream_id={} pending={})\n", .{ stream_id, conn.http09_pending_count });
+        return false;
     }
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
@@ -5051,7 +5078,14 @@ pub const Server = struct {
         // Quinn may send a zero-length STREAM+FIN after the request bytes.
         if (sf.data.len == 0) {
             if (!sf.fin) return;
-            if (peekHttp09ReqAssembly(conn, sf.stream_id) == null) return;
+            if (peekHttp09ReqAssembly(conn, sf.stream_id)) |req_asm| {
+                const req = http09_server.parseRequest(req_asm.buf[0..req_asm.len]) catch return;
+                var path_buf: [512]u8 = undefined;
+                const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch return;
+                if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
+                req_asm.reset();
+            }
+            return;
         }
 
         // Dedup: skip if a slot for this stream already exists (active or awaiting ACK).
@@ -5061,7 +5095,10 @@ pub const Server = struct {
             if ((slot.active or slot.awaiting_fin_ack) and slot.stream_id == sf.stream_id) return;
         }
         for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
-            if (entry.stream_id == sf.stream_id) return;
+            if (entry.stream_id == sf.stream_id) {
+                self.drainHttp09Pending(conn);
+                return;
+            }
         }
 
         // Fast path: whole request in one STREAM frame (zquic client + most quinn streams).
@@ -5074,7 +5111,7 @@ pub const Server = struct {
                     dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
                     return;
                 };
-                self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
+                if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
                 return;
             } else |err| {
                 if (err != error.Incomplete) {
@@ -5092,10 +5129,16 @@ pub const Server = struct {
             dbg("io: http09 req assembly slots full (stream_id={})\n", .{sf.stream_id});
             return;
         };
-        if (sf.offset == 0) req_asm.len = 0;
-        if (sf.offset > req_asm.len) return; // gap — wait for retransmit
-        @memcpy(req_asm.buf[sf.offset..end], sf.data);
-        if (end > req_asm.len) req_asm.len = end;
+        if (sf.offset == 0 and sf.data.len > 0) {
+            if (req_asm.len == 0 or sf.data.len >= req_asm.len) {
+                @memcpy(req_asm.buf[0..sf.data.len], sf.data);
+                req_asm.len = sf.data.len;
+            }
+        } else {
+            if (sf.offset > req_asm.len) return; // gap — wait for retransmit
+            @memcpy(req_asm.buf[sf.offset..end], sf.data);
+            if (end > req_asm.len) req_asm.len = end;
+        }
 
         const req = http09_server.parseRequest(req_asm.buf[0..req_asm.len]) catch |err| {
             if (err == error.Incomplete) return;
@@ -5103,8 +5146,6 @@ pub const Server = struct {
             req_asm.reset();
             return;
         };
-        req_asm.reset();
-        dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
 
         var path_buf: [512]u8 = undefined;
         const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
@@ -5112,7 +5153,9 @@ pub const Server = struct {
             return;
         };
 
-        self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
+        if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
+        req_asm.reset();
+        dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
