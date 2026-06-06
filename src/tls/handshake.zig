@@ -545,13 +545,15 @@ fn appendClientHelloSignatureAlgorithms(ext_buf: []u8, ep: usize) usize {
     var p = ep;
     writeU16(ext_buf[p..], EXT_SIGNATURE_ALGORITHMS);
     p += 2;
-    writeU16(ext_buf[p..], 6); // list_len(2) + 2× u16 schemes
+    writeU16(ext_buf[p..], 8); // ext data: list_len(2) + 3× u16 schemes
     p += 2;
-    writeU16(ext_buf[p..], 4);
+    writeU16(ext_buf[p..], 6); // signature list length in bytes
     p += 2;
     writeU16(ext_buf[p..], SIG_ECDSA_SECP256R1_SHA256);
     p += 2;
     writeU16(ext_buf[p..], SIG_ECDSA_SECP384R1_SHA384);
+    p += 2;
+    writeU16(ext_buf[p..], SIG_RSA_PSS_RSAE_SHA256);
     p += 2;
     return p;
 }
@@ -1098,14 +1100,16 @@ fn buildClientHelloInner(
     writeU16(ext_buf[ep..], TLS_VERSION_13);
     ep += 2;
 
-    // supported_groups
+    // supported_groups: X25519 + secp256r1 (rustls/quinn interop expects both)
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
     ep += 2;
-    writeU16(ext_buf[ep..], 4); // 2 (list_len) + 2 (group)
+    writeU16(ext_buf[ep..], 6); // 2 (list_len) + 2× u16 groups
     ep += 2;
-    writeU16(ext_buf[ep..], 2); // list len
+    writeU16(ext_buf[ep..], 4); // list len
     ep += 2;
     writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_SECP256R1);
     ep += 2;
 
     // key_share: X25519
