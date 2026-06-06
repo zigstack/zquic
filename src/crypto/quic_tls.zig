@@ -127,6 +127,20 @@ pub const TransportParamsOpts = struct {
     /// willing to store for the peer. RFC 9000 §18.2 default is 2; we
     /// advertise a larger pool so the peer can rotate freely.
     active_connection_id_limit: u64 = 4,
+    /// `max_udp_payload_size` (0x03): largest UDP payload we are willing to
+    /// receive on this connection. Bounded by [1200, 65527] per RFC 9000
+    /// §18.2; values outside that range MUST be treated as TRANSPORT_PARAMETER_ERROR
+    /// by a compliant peer. Default 0 = omit (peer assumes the §18.2 default
+    /// of 65527). Callers should pass the connection's configured
+    /// `max_udp_payload` so the peer doesn't send packets we can't reassemble
+    /// on links with a smaller MTU.
+    max_udp_payload_size: u64 = 0,
+    /// `disable_active_migration` (0x0c): length-0 flag. When true we tell
+    /// the peer not to use addresses other than the one used during the
+    /// handshake. zquic supports active migration (gated on the `--migrate`
+    /// example flag), so the default is false — embedders that know they
+    /// won't migrate can opt in.
+    disable_active_migration: bool = false,
 };
 
 fn writeParamVarint(
@@ -188,6 +202,18 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     // active_connection_id_limit (0x0e): we will accept this many distinct
     // CIDs from the peer; lets the peer rotate / migrate without exhausting.
     pos = try writeParamVarint(out, pos, 0x0e, opts.active_connection_id_limit);
+    // max_udp_payload_size (0x03): the largest UDP payload we are willing to
+    // receive on this connection (RFC 9000 §18.2). Only emitted when the
+    // caller passes a non-zero value; an absent param signals the §18.2
+    // default of 65527 to the peer.
+    if (opts.max_udp_payload_size != 0) {
+        pos = try writeParamVarint(out, pos, 0x03, opts.max_udp_payload_size);
+    }
+    // disable_active_migration (0x0c): length-0 flag indicating we will not
+    // initiate active migration. Only emitted when the caller opts in.
+    if (opts.disable_active_migration) {
+        pos = try writeParamBytes(out, pos, 0x0c, &[_]u8{});
+    }
 
     if (opts.original_destination_cid) |odcid| {
         pos = try writeParamBytes(out, pos, 0x00, odcid);
@@ -350,6 +376,53 @@ test "transport params: truncated value is rejected" {
     // id=0x04 (initial_max_data), len=4, but only 2 bytes of payload follow.
     const bytes = [_]u8{ 0x04, 0x04, 0x44, 0x80 };
     try testing.expectError(error.BufferTooShort, parseTransportParams(&bytes));
+}
+
+test "transport params: max_udp_payload_size emitted only when opted in" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+
+    // Default opts → 0x03 absent → peer falls back to the §18.2 default 65527.
+    {
+        const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
+        const parsed = try parseTransportParams(buf[0..n]);
+        try testing.expectEqual(@as(u64, 65527), parsed.max_udp_payload_size);
+    }
+    // Opt in with our actual receive MTU; round-trip the exact value.
+    {
+        const n = try buildTransportParams(&buf, .{
+            .initial_source_cid = &cid,
+            .max_udp_payload_size = 1500,
+        });
+        const parsed = try parseTransportParams(buf[0..n]);
+        try testing.expectEqual(@as(u64, 1500), parsed.max_udp_payload_size);
+    }
+}
+
+test "transport params: disable_active_migration emitted only when opted in" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+
+    // Default opts → 0x0c absent → peer reads false.
+    {
+        const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
+        const parsed = try parseTransportParams(buf[0..n]);
+        try testing.expectEqual(false, parsed.disable_active_migration);
+    }
+    // Opt in → 0x0c emitted as a length-0 flag → peer reads true.
+    {
+        const n = try buildTransportParams(&buf, .{
+            .initial_source_cid = &cid,
+            .disable_active_migration = true,
+        });
+        const parsed = try parseTransportParams(buf[0..n]);
+        try testing.expect(parsed.disable_active_migration);
+        // Bytes-on-wire check: the emitted frame is `0x0c 0x00` (id varint
+        // 0x0c, length varint 0). The buffer must contain that exact pair.
+        try testing.expect(std.mem.indexOf(u8, buf[0..n], &.{ 0x0c, 0x00 }) != null);
+    }
 }
 
 /// Tracks CRYPTO stream offsets per encryption level for reassembly.
