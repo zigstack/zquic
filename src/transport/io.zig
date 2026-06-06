@@ -1097,15 +1097,28 @@ pub const ConnState = struct {
     address_validated: bool = false,
 
     // ── Connection-level flow control (RFC 9000 §4) ───────────────────────────
-    // Both sides advertise initial_max_data = 64 MiB in transport parameters.
-    // fc_send_max tracks how many cumulative bytes we may send (peer's window);
-    // it is raised by MAX_DATA frames from the peer.
+    // fc_send_max is the peer's connection-level receive window. The default
+    // here is the speculative ceiling we use until the handshake completes;
+    // `applyPeerTransportParams` overwrites it with the peer's advertised
+    // `initial_max_data` (RFC 9000 §18.2). The peer raises it later via
+    // MAX_DATA frames.
     // fc_bytes_sent / fc_bytes_recv track cumulative stream-data bytes sent and
     // received; used to check credit and decide when to advertise more window.
     fc_send_max: u64 = 64 * 1024 * 1024,
     fc_recv_max: u64 = 64 * 1024 * 1024,
     fc_bytes_sent: u64 = 0,
     fc_bytes_recv: u64 = 0,
+
+    // ── Per-stream initial limits the peer advertised (RFC 9000 §18.2) ────────
+    // Currently captured but not yet enforced on the send path; per-stream
+    // gating is queued as a follow-up to this PR (see issue #138 §"Flow
+    // control"). Stored zero-initialised — `applyPeerTransportParams` updates
+    // them on handshake completion.
+    peer_initial_max_stream_data_bidi_local: u64 = 0,
+    peer_initial_max_stream_data_bidi_remote: u64 = 0,
+    peer_initial_max_stream_data_uni: u64 = 0,
+    peer_max_streams_bidi: u64 = 0,
+    peer_max_streams_uni: u64 = 0,
 
     // ── Graceful teardown ─────────────────────────────────────────────────────
     // draining is set when CONNECTION_CLOSE is sent or received; once set, all
@@ -1219,6 +1232,32 @@ pub const ConnState = struct {
 
         self.has_app_keys = true;
         self.qlog.keyUpdated("1rtt", "tls");
+    }
+
+    /// Apply transport parameters received from the peer (RFC 9000 §18).
+    /// Seeds connection-level send credit and tracks per-stream limits so
+    /// outgoing STREAM frames stay within the peer's flow-control window.
+    /// Idempotent: a no-op when `qtp` is empty (peer omitted the extension).
+    ///
+    /// This is intentionally a small subset of §18.2. Idle-timeout, RTT
+    /// (`max_ack_delay`, `ack_delay_exponent`), and CID-pool sizing are
+    /// applied in follow-ups so each gap from issue #138 lands as its own
+    /// reviewable diff.
+    pub fn applyPeerTransportParams(self: *ConnState, qtp: []const u8) void {
+        if (qtp.len == 0) return;
+        const parsed = quic_tls_mod.parseTransportParams(qtp) catch |err| {
+            dbg("io: peer transport-params parse error: {} ({} bytes)\n", .{ err, qtp.len });
+            return;
+        };
+        if (parsed.initial_max_data > 0) {
+            self.fc_send_max = parsed.initial_max_data;
+            dbg("io: applied peer initial_max_data={}\n", .{parsed.initial_max_data});
+        }
+        self.peer_initial_max_stream_data_bidi_local = parsed.initial_max_stream_data_bidi_local;
+        self.peer_initial_max_stream_data_bidi_remote = parsed.initial_max_stream_data_bidi_remote;
+        self.peer_initial_max_stream_data_uni = parsed.initial_max_stream_data_uni;
+        self.peer_max_streams_bidi = parsed.initial_max_streams_bidi;
+        self.peer_max_streams_uni = parsed.initial_max_streams_uni;
     }
 };
 
@@ -2242,6 +2281,12 @@ pub const Server = struct {
             return;
         };
         conn.sh_len = sh_len;
+
+        // Apply peer's transport parameters now that ClientHello has been parsed.
+        // Done before the server flight is sent so any size-driven adjustments
+        // (none today, but follow-ups will need it) are in effect on the first
+        // outgoing 1-RTT packet (RFC 9000 §7.4.1).
+        conn.applyPeerTransportParams(conn.tls.peer_qtp[0..conn.tls.peer_qtp_len]);
 
         // Handshake secrets are available; derive QUIC handshake keys.
         conn.packet_cipher = packetCipherFromTls(conn.tls.ch.cipher_suite);
@@ -6119,6 +6164,9 @@ pub const Client = struct {
                 fpos += dlen;
                 continue;
             };
+            // Apply server's transport parameters from EncryptedExtensions
+            // before any 1-RTT data is exchanged (RFC 9000 §7.4.1).
+            self.conn.applyPeerTransportParams(self.tls.peer_qtp[0..self.tls.peer_qtp_len]);
             // App secrets are now derived; update QUIC 1-RTT keys.
             self.conn.deriveAppKeys(&self.tls.secrets);
 

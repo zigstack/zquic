@@ -421,6 +421,36 @@ pub fn buildServerHello(
     return pos;
 }
 
+/// Locate the `quic_transport_parameters` TLS extension body inside a complete
+/// `EncryptedExtensions` handshake message (including its 4-byte handshake
+/// header). Returns null on any malformation rather than erroring — the caller
+/// treats absence as "fall back to RFC defaults".
+pub fn extractQuicTpFromEncryptedExtensions(msg: []const u8) ?[]const u8 {
+    // Handshake message header: msg_type(1) + length(3).
+    if (msg.len < 4) return null;
+    if (msg[0] != MSG_ENCRYPTED_EXTENSIONS) return null;
+    const body_len = readU24(msg[1..]);
+    if (4 + body_len > msg.len) return null;
+    const body = msg[4 .. 4 + body_len];
+    // EncryptedExtensions body: extensions<6..2^16-1> (2-byte length prefix).
+    if (body.len < 2) return null;
+    const ext_total = (@as(usize, body[0]) << 8) | body[1];
+    if (2 + ext_total > body.len) return null;
+    var p: usize = 2;
+    const end = 2 + ext_total;
+    while (p + 4 <= end) {
+        const ext_type = (@as(u16, body[p]) << 8) | body[p + 1];
+        const ext_len = (@as(usize, body[p + 2]) << 8) | body[p + 3];
+        p += 4;
+        if (p + ext_len > end) return null;
+        if (ext_type == EXT_QUIC_TRANSPORT_PARAMS) {
+            return body[p .. p + ext_len];
+        }
+        p += ext_len;
+    }
+    return null;
+}
+
 // ── EncryptedExtensions builder ───────────────────────────────────────────────
 
 /// Build a TLS 1.3 EncryptedExtensions message (raw, no record header).
@@ -1146,6 +1176,11 @@ pub const ServerHandshake = struct {
     /// Client leaf (DER) when the client sends a `Certificate` message (mutual TLS).
     peer_leaf_cert_der: [max_peer_leaf_cert_bytes]u8 = undefined,
     peer_leaf_cert_der_len: u16 = 0,
+    /// Encoded QUIC transport parameters extension body from the client's
+    /// ClientHello message (RFC 9001 §8.2). Populated in `processClientHello`.
+    /// See `ClientHandshake.peer_qtp` for the size rationale.
+    peer_qtp: [512]u8 = undefined,
+    peer_qtp_len: u16 = 0,
 
     pub fn init() ServerHandshake {
         return .{
@@ -1173,6 +1208,15 @@ pub const ServerHandshake = struct {
         out_initial: []u8,
     ) !usize {
         self.ch = try parseClientHello(ch_bytes);
+
+        // Capture the peer's QUIC transport parameters before `ch_bytes`
+        // ownership escapes us (see ClientHandshake.peer_qtp for rationale).
+        if (self.ch.quic_transport_params) |qtp| {
+            if (qtp.len <= self.peer_qtp.len and qtp.offset + qtp.len <= ch_bytes.len) {
+                @memcpy(self.peer_qtp[0..qtp.len], ch_bytes[qtp.offset .. qtp.offset + qtp.len]);
+                self.peer_qtp_len = @intCast(qtp.len);
+            }
+        }
 
         // Add ClientHello to transcript
         self.transcript.update(ch_bytes);
@@ -1367,6 +1411,13 @@ pub const ClientHandshake = struct {
     /// Server leaf certificate (DER) from the first `Certificate` message in the server flight.
     peer_leaf_cert_der: [max_peer_leaf_cert_bytes]u8 = undefined,
     peer_leaf_cert_der_len: u16 = 0,
+    /// Encoded QUIC transport parameters extension body from the server's
+    /// EncryptedExtensions message (RFC 9001 §8.2). Captured in
+    /// `processServerFlight`. `peer_qtp_len == 0` means absent or oversize
+    /// (peers exceeding 512 bytes are silently dropped — the spec ceiling
+    /// is 65535, but no real-world deployment exceeds a few hundred).
+    peer_qtp: [512]u8 = undefined,
+    peer_qtp_len: u16 = 0,
 
     pub fn init() ClientHandshake {
         return .{
@@ -1534,6 +1585,17 @@ pub const ClientHandshake = struct {
             switch (msg_type) {
                 MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE_VERIFY, MSG_CERTIFICATE_REQUEST => {
                     if (msg_type == MSG_CERTIFICATE_REQUEST) saw_certificate_request = true;
+                    if (msg_type == MSG_ENCRYPTED_EXTENSIONS) {
+                        // Best-effort: extract the peer's QUIC transport parameters
+                        // extension. Failures are silent — `peer_qtp_len == 0` then
+                        // signals the caller to fall back to RFC defaults.
+                        if (extractQuicTpFromEncryptedExtensions(msg)) |qtp| {
+                            if (qtp.len <= self.peer_qtp.len) {
+                                @memcpy(self.peer_qtp[0..qtp.len], qtp);
+                                self.peer_qtp_len = @intCast(qtp.len);
+                            }
+                        }
+                    }
                     self.transcript.update(msg);
                 },
                 MSG_CERTIFICATE => {

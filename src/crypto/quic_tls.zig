@@ -188,6 +188,150 @@ pub fn buildClientTransportParams(out: []u8) (varint.EncodeError || varint.Decod
     return buildTransportParams(out, .{ .initial_source_cid = &placeholder_cid });
 }
 
+/// Subset of RFC 9000 §18.2 transport parameters relevant for runtime behavior.
+///
+/// Only the fields whose absence would cause us to violate the peer's limits
+/// or compute a wrong PTO are surfaced here. Connection-id parameters
+/// (`original_destination`, `initial_source`, `retry_source`) are validated
+/// elsewhere as part of the handshake check; we do not retain them here.
+pub const PeerTransportParams = struct {
+    /// 0x04 — peer's connection-level receive window. Caps the cumulative
+    /// stream-data bytes we may have in flight to the peer (RFC 9000 §4.1).
+    /// Default 0 (per spec) — peer must advertise a non-zero value before
+    /// we may send any STREAM data.
+    initial_max_data: u64 = 0,
+    /// 0x05 — peer's per-stream receive window for streams the peer opens
+    /// and we send on (locally-initiated bidi from peer's perspective →
+    /// remotely-initiated bidi from ours).
+    initial_max_stream_data_bidi_local: u64 = 0,
+    /// 0x06 — peer's per-stream receive window for streams we initiate
+    /// (remotely-initiated bidi from peer's perspective → locally-initiated
+    /// bidi from ours).
+    initial_max_stream_data_bidi_remote: u64 = 0,
+    /// 0x07 — peer's per-stream receive window for unidirectional streams
+    /// we initiate.
+    initial_max_stream_data_uni: u64 = 0,
+    /// 0x08 — max bidirectional streams the peer permits us to open.
+    initial_max_streams_bidi: u64 = 0,
+    /// 0x09 — max unidirectional streams the peer permits us to open.
+    initial_max_streams_uni: u64 = 0,
+    /// 0x01 — peer's idle timeout in milliseconds. The connection's effective
+    /// idle timeout is `min(local, peer)` per RFC 9000 §10.1.
+    max_idle_timeout_ms: u64 = 0,
+    /// 0x0a — exponent for ACK-Delay encoding in the peer's ACK frames
+    /// (RFC 9000 §13.2.5). Defaults to 3 if absent.
+    ack_delay_exponent: u8 = 3,
+    /// 0x0b — peer's max_ack_delay in milliseconds. Used by our PTO
+    /// calculation (RFC 9002 §6.2.1). Defaults to 25 ms if absent.
+    max_ack_delay_ms: u64 = 25,
+    /// 0x0c — peer requested no active migration. Empty (length-0) value.
+    disable_active_migration: bool = false,
+    /// 0x0e — number of distinct CIDs the peer is willing to store for us.
+    /// Defaults to 2 if absent.
+    active_connection_id_limit: u64 = 2,
+    /// 0x03 — peer's max receive UDP payload size. Defaults to 65527 if absent.
+    max_udp_payload_size: u64 = 65527,
+};
+
+/// Parse the encoded `quic_transport_parameters` TLS extension body
+/// (RFC 9000 §18). Unknown ids are skipped per §18.1. Reserved transport
+/// parameters (id mod 31 == 27) are accepted and ignored.
+pub fn parseTransportParams(bytes: []const u8) varint.DecodeError!PeerTransportParams {
+    var out: PeerTransportParams = .{};
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const id_r = try varint.decode(bytes[pos..]);
+        pos += id_r.len;
+        if (pos >= bytes.len) return error.BufferTooShort;
+        const len_r = try varint.decode(bytes[pos..]);
+        pos += len_r.len;
+        const value_len = try varint.lenToUsize(len_r.value);
+        if (pos + value_len > bytes.len) return error.BufferTooShort;
+        const value = bytes[pos .. pos + value_len];
+        pos += value_len;
+
+        switch (id_r.value) {
+            0x01 => out.max_idle_timeout_ms = readVarintField(value) catch continue,
+            0x03 => out.max_udp_payload_size = readVarintField(value) catch continue,
+            0x04 => out.initial_max_data = readVarintField(value) catch continue,
+            0x05 => out.initial_max_stream_data_bidi_local = readVarintField(value) catch continue,
+            0x06 => out.initial_max_stream_data_bidi_remote = readVarintField(value) catch continue,
+            0x07 => out.initial_max_stream_data_uni = readVarintField(value) catch continue,
+            0x08 => out.initial_max_streams_bidi = readVarintField(value) catch continue,
+            0x09 => out.initial_max_streams_uni = readVarintField(value) catch continue,
+            0x0a => {
+                const v = readVarintField(value) catch continue;
+                if (v <= 20) out.ack_delay_exponent = @intCast(v);
+            },
+            0x0b => out.max_ack_delay_ms = readVarintField(value) catch continue,
+            0x0c => out.disable_active_migration = (value_len == 0),
+            0x0e => out.active_connection_id_limit = readVarintField(value) catch continue,
+            else => {}, // unknown / reserved / connection-id params are not surfaced here
+        }
+    }
+    return out;
+}
+
+/// Decode a single varint that occupies `value` exactly.
+/// Returns an error if the buffer is empty or has trailing bytes.
+fn readVarintField(value: []const u8) varint.DecodeError!u64 {
+    if (value.len == 0) return error.BufferTooShort;
+    const r = try varint.decode(value);
+    if (r.len != value.len) return error.NonMinimalEncoding;
+    return r.value;
+}
+
+test "transport params: round-trip varint fields" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expectEqual(@as(u64, 30_000), parsed.max_idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 67_108_864), parsed.initial_max_data);
+    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_bidi_local);
+    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_uni);
+    try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_bidi);
+    try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_uni);
+    // Defaults for params we don't currently emit.
+    try testing.expectEqual(@as(u8, 3), parsed.ack_delay_exponent);
+    try testing.expectEqual(@as(u64, 25), parsed.max_ack_delay_ms);
+    try testing.expectEqual(false, parsed.disable_active_migration);
+    try testing.expectEqual(@as(u64, 2), parsed.active_connection_id_limit);
+}
+
+test "transport params: unknown ids are skipped" {
+    const testing = std.testing;
+    // id=0x21 (unknown, 1-byte varint), len=2, value=2 opaque bytes.
+    // Followed by id=0x04 (initial_max_data), len=2, value=0x44 0x80 (varint = 0x0480 = 1152).
+    const bytes = [_]u8{ 0x21, 0x02, 0xaa, 0xbb, 0x04, 0x02, 0x44, 0x80 };
+    const parsed = try parseTransportParams(&bytes);
+    try testing.expectEqual(@as(u64, 0x0480), parsed.initial_max_data);
+}
+
+test "transport params: disable_active_migration is a length-0 flag" {
+    const testing = std.testing;
+    const bytes = [_]u8{ 0x0c, 0x00 };
+    const parsed = try parseTransportParams(&bytes);
+    try testing.expect(parsed.disable_active_migration);
+}
+
+test "transport params: ack_delay_exponent above 20 is clamped to default" {
+    const testing = std.testing;
+    // id=0x0a, len=1, value=21 (illegal — RFC 9000 §18.2 bounds it to 20).
+    const bytes = [_]u8{ 0x0a, 0x01, 0x15 };
+    const parsed = try parseTransportParams(&bytes);
+    try testing.expectEqual(@as(u8, 3), parsed.ack_delay_exponent);
+}
+
+test "transport params: truncated value is rejected" {
+    const testing = std.testing;
+    // id=0x04 (initial_max_data), len=4, but only 2 bytes of payload follow.
+    const bytes = [_]u8{ 0x04, 0x04, 0x44, 0x80 };
+    try testing.expectError(error.BufferTooShort, parseTransportParams(&bytes));
+}
+
 /// Tracks CRYPTO stream offsets per encryption level for reassembly.
 pub const CryptoStream = struct {
     /// Bytes received so far (next expected offset)
