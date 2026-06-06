@@ -5223,6 +5223,13 @@ pub const Client = struct {
     migrate_done: bool = false,
     /// 0-RTT early data keys (null until a PSK+early_data ClientHello is built).
     early_km: ?KeyMaterial = null,
+    /// Cipher suite negotiated for 0-RTT packet protection (RFC 8446 §4.6.1).
+    /// Captured from the resumption ticket when early keys are derived so the
+    /// 0-RTT send path uses the correct AEAD even though `self.tls.cipher_suite`
+    /// still holds its pre-ServerHello default at the time 0-RTT goes out.
+    /// Defaults to TLS_AES_128_GCM_SHA256 (the only suite our 0-RTT key
+    /// derivation supports today).
+    early_cipher_suite: u16 = 0x1301,
     /// Packet number space for 0-RTT packets (separate from 1-RTT PN space).
     zerortt_pn: u64 = 0,
 
@@ -5818,6 +5825,7 @@ pub const Client = struct {
         self.client_hs_tail_len = 0;
         // Clear 0-RTT state so the new connection starts fresh.
         self.early_km = null;
+        self.early_cipher_suite = tls_hs.TLS_AES_128_GCM_SHA256;
         self.zerortt_pn = 0;
     }
 
@@ -6015,8 +6023,21 @@ pub const Client = struct {
             // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(compat.milliTimestamp());
             const len = if (self.config.early_data) ed_blk: {
-                // 0-RTT: PSK + early_data extension
-                if (self.ticket_store.get(now_ms)) |ticket| {
+                // 0-RTT: PSK + early_data extension.
+                //
+                // PSK-cipher binding (RFC 8446 §4.6.1): a PSK is bound to a
+                // single cipher suite; resumption that selects a different
+                // cipher MUST be rejected.  Our 0-RTT key derivation today
+                // only supports TLS_AES_128_GCM_SHA256 (16-byte key, SHA-256
+                // HKDF — see `session.EarlyDataKeys`).  Tickets issued under
+                // any other suite cannot be used as 0-RTT; fall through to
+                // 1-RTT resumption instead of silently sending packets the
+                // server can't decrypt.
+                if (self.ticket_store.get(now_ms)) |ticket| ed_inner: {
+                    if (ticket.cipher_suite != tls_hs.TLS_AES_128_GCM_SHA256) {
+                        dbg("io: 0-RTT skipped — ticket cipher 0x{x:0>4} not supported (only AES-128-GCM-SHA256 today)\n", .{ticket.cipher_suite});
+                        break :ed_inner;
+                    }
                     var psk_bytes: [32]u8 = .{0} ** 32;
                     @memcpy(&psk_bytes, ticket.resumption_secret[0..@min(ticket.resumption_secret_len, 32)]);
                     const psk_info = tls_hs.PskInfo{
@@ -6024,7 +6045,7 @@ pub const Client = struct {
                         .obfuscated_age = ticket.ageMs(now_ms),
                         .psk = psk_bytes,
                     };
-                    dbg("io: client building ClientHello with PSK + early_data (ticket_len={})\n", .{ticket.ticket_len});
+                    dbg("io: client building ClientHello with PSK + early_data (ticket_len={} cipher=0x{x:0>4})\n", .{ ticket.ticket_len, ticket.cipher_suite });
                     const result = try self.tls.buildClientHelloMsgWithPskAndEarlyData(
                         &self.client_hello_bytes,
                         quic_tp,
@@ -6047,15 +6068,19 @@ pub const Client = struct {
                     };
                     ekm.initCachedContexts();
                     self.early_km = ekm;
+                    // Remember the ticket's cipher so the 0-RTT send path
+                    // protects each packet under the correct AEAD instead of
+                    // whatever cipher `self.tls.cipher_suite` happens to
+                    // default to before ServerHello arrives.
+                    self.early_cipher_suite = ticket.cipher_suite;
                     dbg("io: client derived 0-RTT early keys\n", .{});
                     break :ed_blk result.n;
-                } else {
-                    dbg("io: early_data enabled but no valid ticket — full handshake\n", .{});
-                    break :ed_blk if (self.config.chacha20)
-                        try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
-                    else
-                        try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
                 }
+                dbg("io: early_data enabled but no valid 0-RTT ticket — full handshake\n", .{});
+                break :ed_blk if (self.config.chacha20)
+                    try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
+                else
+                    try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
             } else if (self.config.resumption) psk_blk: {
                 // 1-RTT resumption: PSK only, no early_data extension
                 if (self.ticket_store.get(now_ms)) |ticket| {
@@ -6213,7 +6238,7 @@ pub const Client = struct {
                 self.zerortt_pn,
                 &km,
                 self.conn.quicVersion(),
-                packetCipherFromTls(self.tls.cipher_suite),
+                packetCipherFromTls(self.early_cipher_suite),
             ) catch continue;
             self.zerortt_pn += 1;
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -7032,9 +7057,14 @@ pub const Client = struct {
             .resumption_secret_len = @intCast(rs_len),
             .max_early_data_size = 16384,
             .received_at_ms = @intCast(compat.milliTimestamp()),
+            // Bind the PSK to the cipher suite negotiated by the handshake
+            // that produced this ticket (RFC 8446 §4.6.1).  Resumption
+            // attempts under a different cipher MUST be rejected, and 0-RTT
+            // keys MUST be derived with this suite's hash + AEAD.
+            .cipher_suite = self.tls.cipher_suite,
         };
         self.ticket_store.store(ticket);
-        dbg("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
+        dbg("io: stored session ticket (lifetime={}s cipher=0x{x:0>4})\n", .{ lifetime_s, self.tls.cipher_suite });
     }
 
     /// Respond to a server-sent PATH_CHALLENGE with a matching PATH_RESPONSE.

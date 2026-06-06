@@ -66,6 +66,13 @@ pub const SessionTicket = struct {
     max_early_data_size: u32,
     /// Timestamp (ms since epoch) when the ticket was received.
     received_at_ms: u64,
+    /// TLS 1.3 cipher suite under which this ticket was issued (RFC 8446
+    /// §4.6.1 / §4.2.11.1).  A PSK is bound to a single cipher suite —
+    /// resumption attempts that select a different cipher suite MUST be
+    /// rejected, and 0-RTT keys MUST be derived with the same hash + AEAD.
+    /// Defaults to TLS_AES_128_GCM_SHA256 (0x1301) for backward compatibility
+    /// with tickets serialised before this field existed.
+    cipher_suite: u16 = 0x1301,
 
     /// Returns true if this ticket is still within its lifetime.
     pub fn isValid(self: *const SessionTicket, now_ms: u64) bool {
@@ -96,9 +103,10 @@ pub const SessionTicket = struct {
     ///   [resumption_secret_len]u8
     ///   u32 max_early_data_size
     ///   u64 received_at_ms
+    ///   u16 cipher_suite          (added; older deserialise() defaults to AES-128-GCM-SHA256)
     pub fn serialise(self: *const SessionTicket, buf: []u8) error{BufferTooSmall}!usize {
         const needed = 4 + 1 + self.nonce_len + 2 + self.ticket_len +
-            1 + self.resumption_secret_len + 4 + 8;
+            1 + self.resumption_secret_len + 4 + 8 + 2;
         if (buf.len < needed) return error.BufferTooSmall;
         var pos: usize = 0;
         std.mem.writeInt(u32, buf[pos..][0..4], self.lifetime_s, .big);
@@ -119,10 +127,15 @@ pub const SessionTicket = struct {
         pos += 4;
         std.mem.writeInt(u64, buf[pos..][0..8], self.received_at_ms, .big);
         pos += 8;
+        std.mem.writeInt(u16, buf[pos..][0..2], self.cipher_suite, .big);
+        pos += 2;
         return pos;
     }
 
     /// Deserialise from the wire format produced by `serialise`.
+    /// Tickets serialised before the `cipher_suite` field was added omit the
+    /// trailing two bytes; they default to TLS_AES_128_GCM_SHA256 (the only
+    /// cipher whose 0-RTT keys this implementation currently derives).
     pub fn deserialise(buf: []const u8) error{ BufferTooShort, DataTooLong }!SessionTicket {
         if (buf.len < 4 + 1 + 2 + 1 + 4 + 8) return error.BufferTooShort;
         var pos: usize = 0;
@@ -155,6 +168,14 @@ pub const SessionTicket = struct {
         const max_early = std.mem.readInt(u32, buf[pos..][0..4], .big);
         pos += 4;
         const received_at = std.mem.readInt(u64, buf[pos..][0..8], .big);
+        pos += 8;
+        // Optional cipher_suite tail.  Pre-field tickets terminate here and
+        // default to AES-128-GCM-SHA256 (the only suite whose 0-RTT keys we
+        // can derive today).
+        const cs: u16 = if (pos + 2 <= buf.len)
+            std.mem.readInt(u16, buf[pos..][0..2], .big)
+        else
+            0x1301; // TLS_AES_128_GCM_SHA256
         return SessionTicket{
             .lifetime_s = lifetime_s,
             .nonce = nonce,
@@ -165,6 +186,7 @@ pub const SessionTicket = struct {
             .resumption_secret_len = rsl,
             .max_early_data_size = max_early,
             .received_at_ms = received_at,
+            .cipher_suite = cs,
         };
     }
 };
@@ -210,6 +232,17 @@ pub const TicketStore = struct {
 // ---------------------------------------------------------------------------
 
 /// 0-RTT key material derived from a PSK.
+///
+/// **Only TLS_AES_128_GCM_SHA256 is supported today.** The field sizes are
+/// fixed to AES-128 dimensions (16-byte key, 16-byte HP key, 12-byte IV) and
+/// the derivation uses SHA-256.  Per RFC 9001 §5.6 / RFC 8446 §4.6.1 a PSK
+/// is bound to a single cipher suite, and the early traffic secret MUST be
+/// derived with that cipher suite's hash.  To support AES-256-GCM-SHA384 or
+/// ChaCha20-Poly1305-SHA256 0-RTT we would need:
+///   - 32-byte `key` / `hp` slots (a tagged union, or a parallel struct);
+///   - SHA-384 HKDF for AES-256 (and SHA-384-sized zeros in `Extract`).
+/// Callers must verify the ticket's `cipher_suite` is 0x1301 before invoking
+/// `deriveEarlyKeysFromSecret`.
 pub const EarlyDataKeys = struct {
     /// Write key (client → server for 0-RTT).
     key: [16]u8,
@@ -234,6 +267,12 @@ pub fn deriveEarlyTrafficSecret(psk: [32]u8, ch_hash: [32]u8) [32]u8 {
 }
 
 /// Derive QUIC 0-RTT keys from the client_early_traffic_secret.
+///
+/// **AES-128-GCM-SHA256 only.** See `EarlyDataKeys` for the rationale and
+/// what would need to change to support AES-256 or ChaCha20.  Callers MUST
+/// have verified the ticket's negotiated cipher suite is 0x1301 before
+/// reaching this function; mis-derived keys are silently wrong on the wire
+/// and the peer will reject them with an AEAD tag failure.
 pub fn deriveEarlyKeysFromSecret(early_traffic_secret: [32]u8) EarlyDataKeys {
     var key: [16]u8 = undefined;
     var iv: [12]u8 = undefined;
@@ -337,6 +376,7 @@ test "session: ticket serialise/deserialise round-trip" {
         .resumption_secret_len = 32,
         .max_early_data_size = 16384,
         .received_at_ms = 1_700_000_000_000,
+        .cipher_suite = 0x1303, // TLS_CHACHA20_POLY1305_SHA256
     };
 
     var buf: [2048]u8 = undefined;
@@ -350,6 +390,35 @@ test "session: ticket serialise/deserialise round-trip" {
     try testing.expectEqualSlices(u8, ticket.ticket[0..ticket.ticket_len], restored.ticket[0..restored.ticket_len]);
     try testing.expectEqual(ticket.max_early_data_size, restored.max_early_data_size);
     try testing.expectEqual(ticket.received_at_ms, restored.received_at_ms);
+    try testing.expectEqual(ticket.cipher_suite, restored.cipher_suite);
+}
+
+test "session: deserialise of pre-cipher_suite ticket defaults to AES-128-GCM" {
+    const testing = std.testing;
+    // Build a ticket serialisation that omits the trailing cipher_suite
+    // field, mirroring the on-disk format from before the field was added.
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    std.mem.writeInt(u32, buf[pos..][0..4], 3600, .big);
+    pos += 4;
+    buf[pos] = 0; // nonce_len
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 4, .big); // ticket_len
+    pos += 2;
+    @memcpy(buf[pos .. pos + 4], "tckt");
+    pos += 4;
+    buf[pos] = 0; // resumption_secret_len
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 16384, .big); // max_early_data_size
+    pos += 4;
+    std.mem.writeInt(u64, buf[pos..][0..8], 1_700_000_000_000, .big); // received_at
+    pos += 8;
+    // NB: no cipher_suite tail.
+
+    const restored = try SessionTicket.deserialise(buf[0..pos]);
+    try testing.expectEqual(@as(u16, 0x1301), restored.cipher_suite);
+    try testing.expectEqual(@as(usize, 4), restored.ticket_len);
+    try testing.expectEqualSlices(u8, "tckt", restored.ticket[0..restored.ticket_len]);
 }
 
 test "session: ticket validity" {
