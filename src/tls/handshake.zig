@@ -50,6 +50,11 @@ pub const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 pub const EXT_KEY_SHARE: u16 = 0x0033;
 pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = quic_tls.TRANSPORT_PARAMS_EXT_TYPE;
+pub const EXT_QUIC_TRANSPORT_PARAMS_DRAFT: u16 = quic_tls.TRANSPORT_PARAMS_EXT_TYPE_DRAFT;
+
+fn isQuicTransportParamsExt(ext_type: u16) bool {
+    return ext_type == EXT_QUIC_TRANSPORT_PARAMS or ext_type == EXT_QUIC_TRANSPORT_PARAMS_DRAFT;
+}
 pub const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 pub const EXT_EARLY_DATA: u16 = 0x002a;
@@ -94,6 +99,8 @@ pub const ClientHelloData = struct {
     x25519_key: ?[32]u8 = null,
     cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
     quic_transport_params: ?struct { offset: usize, len: usize } = null,
+    /// TLS extension type the client used for QUIC transport parameters.
+    quic_transport_params_ext_type: u16 = EXT_QUIC_TRANSPORT_PARAMS,
     alpn_h3: bool = false,
     alpn_h09: bool = false,
     /// True if the client sent the early_data extension (0-RTT request).
@@ -270,10 +277,11 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
                     }
                 }
             },
-            EXT_QUIC_TRANSPORT_PARAMS => {
+            EXT_QUIC_TRANSPORT_PARAMS, EXT_QUIC_TRANSPORT_PARAMS_DRAFT => {
                 // Store offset into original data slice
                 const offset = (data.ptr + 4 + @as(usize, @intCast(body_len - (body.len - p)))) - data.ptr;
                 result.quic_transport_params = .{ .offset = offset, .len = ext_len };
+                result.quic_transport_params_ext_type = ext_type;
             },
             EXT_ALPN => {
                 // u16 list_len, then u8 proto_len, proto
@@ -443,7 +451,7 @@ pub fn extractQuicTpFromEncryptedExtensions(msg: []const u8) ?[]const u8 {
         const ext_len = (@as(usize, body[p + 2]) << 8) | body[p + 3];
         p += 4;
         if (p + ext_len > end) return null;
-        if (ext_type == EXT_QUIC_TRANSPORT_PARAMS) {
+        if (isQuicTransportParamsExt(ext_type)) {
             return body[p .. p + ext_len];
         }
         p += ext_len;
@@ -459,6 +467,7 @@ pub fn extractQuicTpFromEncryptedExtensions(msg: []const u8) ?[]const u8 {
 pub fn buildEncryptedExtensions(
     out: []u8,
     quic_transport_params: []const u8,
+    tp_ext_type: u16,
     alpn: ?[]const u8,
     accept_early_data: bool,
 ) !usize {
@@ -466,8 +475,8 @@ pub fn buildEncryptedExtensions(
     var ext_buf: [2048]u8 = undefined;
     var ep: usize = 0;
 
-    // QUIC transport parameters extension
-    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    // QUIC transport parameters extension — echo the type the peer offered (RFC 9001 §8.2).
+    writeU16(ext_buf[ep..], tp_ext_type);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
     ep += 2;
@@ -1280,7 +1289,13 @@ pub const ServerHandshake = struct {
         // EncryptedExtensions: mirror rustls/quinn — only extensions the client offered.
         const ee_alpn = eeAlpnMatchingClientOffer(&self.ch, alpn);
         const ee_early = eeAcceptEarlyData(&self.ch, self.accept_psk);
-        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, ee_alpn, ee_early);
+        const ee_len = try buildEncryptedExtensions(
+            out[pos..],
+            quic_tp,
+            self.ch.quic_transport_params_ext_type,
+            ee_alpn,
+            ee_early,
+        );
         self.transcript.update(out[pos .. pos + ee_len]);
         pos += ee_len;
 
@@ -1799,11 +1814,20 @@ test "handshake: EncryptedExtensions wire encoding omits unsolicited ALPN" {
     var buf_alpn: [512]u8 = undefined;
     var buf_no_alpn: [512]u8 = undefined;
     const tp = [_]u8{ 0x05, 0x00, 0x00, 0x00, 0x00 }; // minimal QUIC TP blob
-    const with_alpn = try buildEncryptedExtensions(&buf_alpn, &tp, ALPN_H3, false);
-    const without_alpn = try buildEncryptedExtensions(&buf_no_alpn, &tp, null, false);
+    const with_alpn = try buildEncryptedExtensions(&buf_alpn, &tp, EXT_QUIC_TRANSPORT_PARAMS, ALPN_H3, false);
+    const without_alpn = try buildEncryptedExtensions(&buf_no_alpn, &tp, EXT_QUIC_TRANSPORT_PARAMS, null, false);
     try testing.expect(eeExtensionsContainType(buf_alpn[0..with_alpn], EXT_ALPN));
     try testing.expect(!eeExtensionsContainType(buf_no_alpn[0..without_alpn], EXT_ALPN));
     try testing.expect(eeExtensionsContainType(buf_no_alpn[0..without_alpn], EXT_QUIC_TRANSPORT_PARAMS));
+}
+
+test "handshake: EncryptedExtensions echoes client QUIC TP extension type (quinn/rustls)" {
+    const testing = std.testing;
+    var buf: [512]u8 = undefined;
+    const tp = [_]u8{ 0x05, 0x00, 0x00, 0x00, 0x00 };
+    const ee_len = try buildEncryptedExtensions(&buf, &tp, EXT_QUIC_TRANSPORT_PARAMS_DRAFT, null, false);
+    try testing.expect(eeExtensionsContainType(buf[0..ee_len], EXT_QUIC_TRANSPORT_PARAMS_DRAFT));
+    try testing.expect(!eeExtensionsContainType(buf[0..ee_len], EXT_QUIC_TRANSPORT_PARAMS));
 }
 
 fn eeExtensionsContainType(ee_msg: []const u8, ext_type: u16) bool {
