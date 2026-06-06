@@ -533,6 +533,29 @@ fn eeAcceptEarlyData(ch: *const ClientHelloData, accept_psk: bool) bool {
     return ch.has_early_data and accept_psk;
 }
 
+/// Pick EE ALPN from server preference and client offers (quinn interop uses hq-interop).
+fn negotiateEeAlpn(ch: *const ClientHelloData, preferred: ?[]const u8) ?[]const u8 {
+    if (eeAlpnMatchingClientOffer(ch, preferred)) |a| return a;
+    if (ch.alpn_h09) return ALPN_H09;
+    return null;
+}
+
+/// RFC 8446 §4.2.3: TLS 1.3 ClientHello MUST include signature_algorithms.
+fn appendClientHelloSignatureAlgorithms(ext_buf: []u8, ep: usize) usize {
+    var p = ep;
+    writeU16(ext_buf[p..], EXT_SIGNATURE_ALGORITHMS);
+    p += 2;
+    writeU16(ext_buf[p..], 6); // list_len(2) + 2× u16 schemes
+    p += 2;
+    writeU16(ext_buf[p..], 4);
+    p += 2;
+    writeU16(ext_buf[p..], SIG_ECDSA_SECP256R1_SHA256);
+    p += 2;
+    writeU16(ext_buf[p..], SIG_ECDSA_SECP384R1_SHA384);
+    p += 2;
+    return p;
+}
+
 // ── Certificate builder ───────────────────────────────────────────────────────
 
 /// Build a TLS 1.3 Certificate message with one DER certificate.
@@ -903,6 +926,8 @@ pub fn buildClientHelloWithPsk(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
+    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
+
     writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
@@ -1097,6 +1122,8 @@ fn buildClientHelloInner(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
+    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
+
     // QUIC transport params
     writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
     ep += 2;
@@ -1287,7 +1314,7 @@ pub const ServerHandshake = struct {
         var pos: usize = 0;
 
         // EncryptedExtensions: mirror rustls/quinn — only extensions the client offered.
-        const ee_alpn = eeAlpnMatchingClientOffer(&self.ch, alpn);
+        const ee_alpn = negotiateEeAlpn(&self.ch, alpn);
         const ee_early = eeAcceptEarlyData(&self.ch, self.accept_psk);
         const ee_len = try buildEncryptedExtensions(
             out[pos..],
@@ -1800,6 +1827,12 @@ test "handshake: EE ALPN only when client offered (rustls/quinn)" {
     ch.alpn_h3 = false;
     ch.alpn_h09 = true;
     try testing.expectEqualSlices(u8, ALPN_H09, eeAlpnMatchingClientOffer(&ch, ALPN_H09).?);
+}
+
+test "handshake: negotiateEeAlpn falls back to hq-interop for quinn interop" {
+    const testing = std.testing;
+    var ch: ClientHelloData = .{ .alpn_h09 = true };
+    try testing.expectEqualSlices(u8, ALPN_H09, negotiateEeAlpn(&ch, ALPN_H3).?);
 }
 
 test "handshake: EE early_data only on accepted PSK (rustls decide_if_early_data_allowed)" {
