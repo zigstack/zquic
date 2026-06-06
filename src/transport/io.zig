@@ -814,6 +814,17 @@ const Http09OutSlot = struct {
     }
 };
 
+/// Parsed HTTP/0.9 request waiting for a free [`Http09OutSlot`].
+/// Quinn's multiplexing test opens ~2000 streams at once; we serve 64
+/// concurrently and queue the rest until a slot frees up.
+const http09_pending_max = 2048;
+
+const Http09PendingOpen = struct {
+    stream_id: u64 = 0,
+    path_len: u16 = 0,
+    path: [512]u8 = undefined,
+};
+
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
 /// the QUIC stream offset independently (HEADERS frame bytes are counted too).
@@ -1094,6 +1105,9 @@ pub const ConnState = struct {
     /// Number of currently active HTTP/0.9 response slots (maintained by the server).
     /// Avoids O(2000) scan in the event-loop poll-timeout calculation.
     http09_active_count: u32 = 0,
+    /// HTTP/0.9 opens waiting for a free outbound slot (quinn multiplexing).
+    http09_pending: [http09_pending_max]Http09PendingOpen = undefined,
+    http09_pending_count: u16 = 0,
     /// Number of currently active HTTP/3 response slots.
     http3_active_count: u32 = 0,
 
@@ -3681,6 +3695,7 @@ pub const Server = struct {
                         slot.awaiting_fin_ack = false;
                     }
                 }
+                self.drainHttp09Pending(conn);
                 // Loss detection + RTT estimation (RFC 9002).
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
@@ -4270,6 +4285,7 @@ pub const Server = struct {
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.active = false;
             dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
+            self.drainHttp09Pending(conn);
         }
     }
 
@@ -4659,6 +4675,64 @@ pub const Server = struct {
         if (sf.fin) slot.fin_received = true;
     }
 
+    fn openHttp09OutSlot(_: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
+            dbg("io: file not found: {s}\n", .{fs_path});
+            return false;
+        };
+        const file_end = file.getEndPos() catch {
+            file.close();
+            return false;
+        };
+
+        for (&conn.http09_slots) |*slot| {
+            if (slot.active or slot.awaiting_fin_ack) continue;
+            slot.* = .{
+                .active = true,
+                .stream_id = stream_id,
+                .file = file,
+                .stream_offset = 0,
+                .file_end = file_end,
+            };
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
+            conn.http09_active_count += 1;
+            dbg("io: http09 stream_id={} opened (size={})\n", .{ stream_id, file_end });
+            return true;
+        }
+        file.close();
+        return false;
+    }
+
+    fn enqueueHttp09Pending(conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        if (conn.http09_pending_count >= http09_pending_max) return false;
+        const entry = &conn.http09_pending[conn.http09_pending_count];
+        entry.stream_id = stream_id;
+        const path_len = @min(fs_path.len, entry.path.len);
+        @memcpy(entry.path[0..path_len], fs_path[0..path_len]);
+        entry.path_len = @intCast(path_len);
+        conn.http09_pending_count += 1;
+        dbg("io: http09 stream_id={} queued (pending={})\n", .{ stream_id, conn.http09_pending_count });
+        return true;
+    }
+
+    fn drainHttp09Pending(self: *Server, conn: *ConnState) void {
+        var i: u16 = 0;
+        while (i < conn.http09_pending_count) {
+            const entry = conn.http09_pending[i];
+            const path = entry.path[0..entry.path_len];
+            if (self.openHttp09OutSlot(conn, entry.stream_id, path)) {
+                conn.http09_pending_count -= 1;
+                if (i < conn.http09_pending_count) {
+                    conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         _ = src;
         dbg("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
@@ -4693,35 +4767,13 @@ pub const Server = struct {
             return;
         };
 
-        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
-            dbg("io: file not found: {s}\n", .{fs_path});
-            return;
-        };
-        const file_end = file.getEndPos() catch {
-            file.close();
-            return;
-        };
-
-        for (&conn.http09_slots) |*slot| {
-            if (slot.active or slot.awaiting_fin_ack) continue;
-            slot.* = .{
-                .active = true,
-                .stream_id = sf.stream_id,
-                .file = file,
-                .stream_offset = 0,
-                .file_end = file_end,
-            };
-            // Store the file path so we can reopen it for retransmission if a
-            // pre-FIN packet is lost after the file has been closed.
-            const path_len = @min(fs_path.len, slot.file_path.len);
-            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
-            slot.file_path_len = path_len;
-            conn.http09_active_count += 1;
-            dbg("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
+        if (self.openHttp09OutSlot(conn, sf.stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
             return;
         }
-        dbg("io: http/0.9 out slots full\n", .{});
-        file.close();
+        if (!enqueueHttp09Pending(conn, sf.stream_id, fs_path)) {
+            dbg("io: http/0.9 pending queue full (stream_id={})\n", .{sf.stream_id});
+        }
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
