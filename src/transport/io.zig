@@ -314,6 +314,12 @@ fn skipAckBody(data: []const u8, is_ecn: bool) usize {
 /// Build an Initial packet with the given payload.
 /// `version` selects QUIC v1 (0x00000001) or v2 (0x6b3343cf).
 /// Returns bytes written.
+///
+/// AEAD: **always AES-128-GCM with SHA-256-derived keys** (RFC 9001 §5.2).
+/// Initial keys are derived deterministically from the client's first
+/// destination connection id; cipher negotiation has not happened yet at
+/// this point, so the choice is fixed by the spec.  This function therefore
+/// takes no `cipher` parameter — it would have no valid value.
 pub fn buildInitialPacket(
     out: []u8,
     dcid: ConnectionId,
@@ -437,6 +443,11 @@ fn addressEqual(a: compat.Address, b: compat.Address) bool {
     return a.eql(b);
 }
 
+/// Build a 1-RTT short-header packet under AES-128-GCM (the §18.2 default
+/// suite).  Convenience wrapper for callers that have no cipher context and
+/// know they only run AES-128 (tests, raw encode helpers).  All production
+/// callers should use `build1RttPacketFull` and pass the connection's
+/// negotiated cipher.
 pub fn build1RttPacket(
     out: []u8,
     dcid: ConnectionId,
@@ -447,6 +458,8 @@ pub fn build1RttPacket(
     return build1RttPacketWithPhase(out, dcid, payload, pn, km, false);
 }
 
+/// Build a 1-RTT short-header packet under AES-128-GCM with an explicit
+/// key-phase bit (RFC 9001 §6).  See `build1RttPacket` for cipher caveat.
 pub fn build1RttPacketWithPhase(
     out: []u8,
     dcid: ConnectionId,
@@ -455,9 +468,21 @@ pub fn build1RttPacketWithPhase(
     km: *const KeyMaterial,
     key_phase: bool,
 ) !usize {
-    return build1RttPacketFull(out, dcid, payload, pn, km, key_phase, false);
+    return build1RttPacketFull(out, dcid, payload, pn, km, key_phase, .aes128_gcm);
 }
 
+/// Build a 1-RTT short-header packet under the connection's negotiated AEAD
+/// (RFC 9001 §5.1, §5.4).  Dispatches on `cipher`:
+///   - `.aes128_gcm`        → AES-128-GCM payload, AES-128-ECB header protection
+///   - `.aes256_gcm`        → AES-256-GCM payload, AES-256-ECB header protection
+///   - `.chacha20_poly1305` → ChaCha20-Poly1305 payload, ChaCha20-based HP
+/// Prior to this change the function took a `chacha20: bool` flag and
+/// silently routed AES-256-negotiated 1-RTT packets through AES-128 keys,
+/// mirroring the Handshake bug fixed by #136.  All callers thread the
+/// connection's `packet_cipher` (set from the negotiated TLS cipher suite
+/// in `applyAppKeys`) so the AEAD stays consistent with the key material
+/// derived by `tls_hs.deriveQuicKeys` (which populates both 16- and 32-byte
+/// key slots).
 pub fn build1RttPacketFull(
     out: []u8,
     dcid: ConnectionId,
@@ -465,7 +490,7 @@ pub fn build1RttPacketFull(
     pn: u64,
     km: *const KeyMaterial,
     key_phase: bool,
-    chacha20: bool,
+    cipher: PacketCipher,
 ) !usize {
     var hdr_buf: [64]u8 = undefined;
     var hp: usize = 0;
@@ -478,10 +503,11 @@ pub fn build1RttPacketFull(
     @memcpy(hdr_buf[hp .. hp + dcid.len], dcid.slice());
     hp += dcid.len;
 
-    if (chacha20) {
-        return initial_mod.protectPacketChaCha20(out, hdr_buf[0..hp], pn, 0, payload, km);
-    }
-    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+    // `protectLongHeaderPacket` keys off the header's high bit (long vs short)
+    // to pick the header-protection first-byte mask, so it correctly handles
+    // both packet shapes despite the name.  Using it here gives us full
+    // cipher dispatch (AES-128 / AES-256 / ChaCha20) in one call.
+    return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
 /// Decrypt a 1-RTT packet, selecting AES or ChaCha20 based on the cipher flag.
@@ -3827,7 +3853,7 @@ pub const Server = struct {
             conn.app_pn,
             &conn.app_server_km,
             conn.key_phase_bit,
-            conn.use_chacha20,
+            conn.packet_cipher,
         ) catch |err| {
             dbg("io: build1RttPacketFull error payload_len={}: {}\n", .{ effective_payload.len, err });
             return;
@@ -5534,7 +5560,7 @@ pub const Client = struct {
                     self.conn.app_pn,
                     &self.conn.app_client_km,
                     self.conn.key_phase_bit,
-                    self.conn.use_chacha20,
+                    self.conn.packet_cipher,
                 ) catch return;
                 self.conn.app_pn += 1;
                 _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -5557,7 +5583,7 @@ pub const Client = struct {
                     self.conn.app_pn,
                     &self.conn.app_client_km,
                     self.conn.key_phase_bit,
-                    self.conn.use_chacha20,
+                    self.conn.packet_cipher,
                 ) catch return;
                 self.conn.app_pn += 1;
                 _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -5584,7 +5610,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch {
             if (owned_buf) |b| self.allocator.free(b);
             return;
@@ -5658,7 +5684,7 @@ pub const Client = struct {
                 self.conn.app_pn,
                 &self.conn.app_client_km,
                 self.conn.key_phase_bit,
-                self.conn.use_chacha20,
+                self.conn.packet_cipher,
             ) catch return;
             const pn = self.conn.app_pn;
             self.conn.app_pn += 1;
@@ -6999,7 +7025,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(
@@ -7095,7 +7121,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -7113,7 +7139,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -7429,7 +7455,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch |err| {
             dbg("io: migrate: PING build failed: {}\n", .{err});
             return;
@@ -7479,7 +7505,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -7527,7 +7553,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -7566,7 +7592,7 @@ pub const Client = struct {
             self.conn.app_pn,
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -7704,7 +7730,7 @@ pub const Client = struct {
                     self.conn.app_pn,
                     &self.conn.app_client_km,
                     self.conn.key_phase_bit,
-                    self.conn.use_chacha20,
+                    self.conn.packet_cipher,
                 ) catch continue;
                 self.conn.app_pn += 1;
 
@@ -7759,7 +7785,7 @@ pub const Client = struct {
                             self.conn.app_pn,
                             &self.conn.app_client_km,
                             self.conn.key_phase_bit,
-                            self.conn.use_chacha20,
+                            self.conn.packet_cipher,
                         )) |pkt_len| {
                             self.conn.app_pn += 1;
                             _ = compat.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -8123,4 +8149,45 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
     const new_sid: u64 = 4_096;
     try std.testing.expect(!conn.applyPeerMaxStreamData(new_sid, 9_999));
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
+}
+
+test "build1RttPacketFull: cipher param actually selects the AEAD (regression for AES-128 fallthrough)" {
+    // Before this PR, `build1RttPacketFull` took `chacha20: bool` and
+    // ran the AES branch (which is hard-coded AES-128) for everything
+    // not flagged as ChaCha20.  That meant an AES-256-GCM connection
+    // was silently protected under AES-128 keys — same class of bug
+    // that #136 fixed for Handshake packets.
+    //
+    // This test pins the cipher param to actually flow through to the
+    // AEAD: AES-128 vs AES-256 must produce different wire bytes when
+    // run over the same secret-expanded KeyMaterial.
+
+    var km: KeyMaterial = .{};
+    km.secret = [_]u8{0xA5} ** 32;
+    km.expand();
+
+    const dcid = try ConnectionId.fromSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    const payload = [_]u8{0x42} ** 32;
+    const pn: u64 = 7;
+
+    var buf_aes128: [256]u8 = undefined;
+    var buf_aes256: [256]u8 = undefined;
+    var buf_chacha: [256]u8 = undefined;
+
+    const n_aes128 = try build1RttPacketFull(&buf_aes128, dcid, &payload, pn, &km, false, .aes128_gcm);
+    const n_aes256 = try build1RttPacketFull(&buf_aes256, dcid, &payload, pn, &km, false, .aes256_gcm);
+    const n_chacha = try build1RttPacketFull(&buf_chacha, dcid, &payload, pn, &km, false, .chacha20_poly1305);
+
+    // All three produce the same packet length: header is identical and the
+    // AEAD tag is 16 bytes for every cipher in the §5.3 matrix.
+    try std.testing.expectEqual(n_aes128, n_aes256);
+    try std.testing.expectEqual(n_aes128, n_chacha);
+
+    // But the protected bytes must differ — that's the bit the old bool
+    // signature silently elided.  If the cipher param were ignored, the
+    // AES-128 and AES-256 outputs would be byte-identical because the
+    // AES-128 path keys off `km.key` (the 16-byte slot) regardless.
+    try std.testing.expect(!std.mem.eql(u8, buf_aes128[0..n_aes128], buf_aes256[0..n_aes256]));
+    try std.testing.expect(!std.mem.eql(u8, buf_aes128[0..n_aes128], buf_chacha[0..n_chacha]));
+    try std.testing.expect(!std.mem.eql(u8, buf_aes256[0..n_aes256], buf_chacha[0..n_chacha]));
 }
