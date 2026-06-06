@@ -620,7 +620,7 @@ fn migrationPreferredFromTp(pa: quic_tls_mod.PreferredAddressTp) migration_mod.P
 }
 
 /// Result of decrypting a 1-RTT packet with PN reconstruction.
-const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
+const Decrypt1RttResult = struct { pt_len: usize, pn: u64, wire_len: usize };
 
 /// Decrypt a 1-RTT short-header packet with full packet-number
 /// reconstruction (RFC 9000 §17.1) under the connection's negotiated AEAD
@@ -645,6 +645,7 @@ fn unprotect1RttPacketWithPnTracking(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
+    payload_end: usize,
     km: *const KeyMaterial,
     cipher: PacketCipher,
     expected_recv_pn: ?u64,
@@ -653,12 +654,12 @@ fn unprotect1RttPacketWithPnTracking(
         dst,
         buf,
         pn_start,
-        buf.len,
+        payload_end,
         km,
         expected_recv_pn,
         cipher,
     );
-    return .{ .pt_len = r.pt_len, .pn = r.pn };
+    return .{ .pt_len = r.pt_len, .pn = r.pn, .wire_len = payload_end };
 }
 
 /// Decrypt a 1-RTT packet without expected-PN tracking.  Thin wrapper used
@@ -731,11 +732,12 @@ fn tryUnprotect1RttWithPnCandidates(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
+    payload_end: usize,
     km: *const KeyMaterial,
     cipher: PacketCipher,
     largest: ?u64,
 ) ?Decrypt1RttResult {
-    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, largest)) |r| {
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, largest)) |r| {
         return r;
     } else |_| {}
 
@@ -743,13 +745,13 @@ fn tryUnprotect1RttWithPnCandidates(
         const floor = if (hi > 1024) hi - 1024 else 0;
         var exp: u64 = hi;
         while (exp > floor) : (exp -= 1) {
-            if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, exp)) |r| {
+            if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, exp)) |r| {
                 return r;
             } else |_| {}
         }
     }
 
-    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, null)) |r| {
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, null)) |r| {
         return r;
     } else |_| {}
     return null;
@@ -763,6 +765,7 @@ fn decrypt1RttWithKeyUpdate(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
+    payload_end: usize,
     incoming_phase: bool,
     recv_km: *KeyMaterial,
     recv_km_prev: *?KeyMaterial,
@@ -771,19 +774,19 @@ fn decrypt1RttWithKeyUpdate(
     const cipher = conn.packet_cipher;
     const expected = conn.app_recv_pn;
 
-    if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, recv_km, cipher, expected)) |r| {
+    if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, recv_km, cipher, expected)) |r| {
         return r;
     }
 
     if (recv_km_prev.*) |prev| {
-        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, &prev, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, &prev, cipher, expected)) |r| {
             return r;
         }
     }
 
     if (incoming_phase != conn.peer_key_phase) {
         var nk = if (conn.use_v2) recv_km.nextGenV2() else recv_km.nextGen();
-        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, &nk, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, &nk, cipher, expected)) |r| {
             recv_km_prev.* = recv_km.*;
             recv_km.* = nk;
             if (conn.key_update_pending) {
@@ -938,7 +941,7 @@ const Http09ReqAssembly = struct {
     }
 };
 
-const http09_req_asm_max = 128;
+const http09_req_asm_max = 512;
 
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
@@ -2213,6 +2216,12 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        const sent_pn = conn.app_pn - 1;
+        const last = &conn.ld.sent[conn.ld.sent_count - 1];
+        if (last.pn != sent_pn) {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
         const buf = owned_buf orelse blk: {
             // First send: copy the embedder-supplied data onto the heap so we
             // own it until the carrying packet is acked (the embedder's slice
@@ -2220,7 +2229,6 @@ pub const Server = struct {
             const dup = self.allocator.dupe(u8, data) catch return;
             break :blk dup;
         };
-        const last = &conn.ld.sent[conn.ld.sent_count - 1];
         // Defence-in-depth: free any pre-existing data so we don't leak if
         // some unrelated path already attached one.
         if (last.stream_data) |old| self.allocator.free(old);
@@ -2232,6 +2240,15 @@ pub const Server = struct {
         // Charge fresh-send bytes against the connection-level limit.
         // Retransmits reuse already-charged bytes (RFC 9000 §4.1).
         if (is_fresh) conn.fc_bytes_sent +|= data.len;
+    }
+
+    fn http09StreamPacketRecorded(_: *Server, conn: *ConnState, stream_id: u64, offset: u64, pn_before: u64) bool {
+        if (conn.app_pn <= pn_before or conn.ld.sent_count == 0) return false;
+        const last = &conn.ld.sent[conn.ld.sent_count - 1];
+        return last.pn == conn.app_pn - 1 and
+            last.has_stream_data and
+            last.stream_id == stream_id and
+            last.stream_offset == offset;
     }
 
     pub fn deinit(self: *Server) void {
@@ -2299,7 +2316,9 @@ pub const Server = struct {
             var poll_timeout_ms: i32 = 2000;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
-                    if (conn.http09_active_count > 0 or conn.http3_active_count > 0) {
+                    if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
+                        conn.http3_active_count > 0)
+                    {
                         poll_timeout_ms = 50;
                         break;
                     }
@@ -3620,7 +3639,16 @@ pub const Server = struct {
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         dbg("io: process1RttPacket buf_len={}\n", .{buf.len});
-        // Find connection by scanning CID prefix
+        var pos: usize = 0;
+        while (pos < buf.len) {
+            const step = self.processOneServer1RttPacket(buf[pos..], src) orelse break;
+            if (step == 0) break;
+            pos += step;
+        }
+    }
+
+    /// Decrypt and handle one 1-RTT packet (RFC 9000 §12.2 coalescing).
+    fn processOneServer1RttPacket(self: *Server, buf: []const u8, src: compat.Address) ?usize {
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
                 if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
@@ -3632,85 +3660,81 @@ pub const Server = struct {
                     conn.cidPoolFind(candidate) != null;
                 if (!cid_match) continue;
 
-                // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
                 const pn_start = 1 + cid_len;
 
-                // Detect peer-initiated key update via the UNPROTECTED key phase bit.
-                // Must remove HP first before reading bit 2 (RFC 9001 §5.4.1).
                 const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.packet_cipher) orelse continue;
                 const incoming_phase = (unprotected_first & 0x04) != 0;
 
-                // Try current recv keys first. Only use next key generation when the
-                // current keys fail and the Key Phase bit indicates an update — avoids
-                // mis-sampled HP flipping keys before the first post-handshake packet.
-                // Use PN-tracking decryption so packet number decompression is correct
-                // even when the client's PN space grows beyond 1-byte truncation range.
-                var srv_decrypted_pn: u64 = 0;
-                const pt_len: usize = decrypt: {
-                    const r = decrypt1RttWithKeyUpdate(
-                        conn,
-                        &plaintext,
-                        buf,
-                        pn_start,
-                        incoming_phase,
-                        &conn.app_client_km,
-                        &conn.app_client_km_prev,
-                        &conn.app_server_km,
-                    ) catch {
-                        // RFC 9000 §10.3: Stateless Reset detection.
-                        if (buf.len >= 21 and conn.stateless_reset_token_set) {
-                            const tail = buf[buf.len - 16 ..];
-                            var tail_arr: [16]u8 = undefined;
-                            @memcpy(&tail_arr, tail);
-                            if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
-                                dbg("io: Stateless Reset detected — entering draining\n", .{});
-                                conn.draining = true;
-                                return;
-                            }
+                const min_end = pn_start + 1 + 16;
+                if (buf.len < min_end) continue;
+
+                var decrypted_opt: ?Decrypt1RttResult = decrypt1RttWithKeyUpdate(
+                    conn,
+                    &plaintext,
+                    buf,
+                    pn_start,
+                    buf.len,
+                    incoming_phase,
+                    &conn.app_client_km,
+                    &conn.app_client_km_prev,
+                    &conn.app_server_km,
+                ) catch null;
+
+                if (decrypted_opt == null and buf.len > min_end) {
+                    var end = min_end;
+                    while (end < buf.len) : (end += 1) {
+                        decrypted_opt = decrypt1RttWithKeyUpdate(
+                            conn,
+                            &plaintext,
+                            buf,
+                            pn_start,
+                            end,
+                            incoming_phase,
+                            &conn.app_client_km,
+                            &conn.app_client_km_prev,
+                            &conn.app_server_km,
+                        ) catch null;
+                        if (decrypted_opt != null) break;
+                    }
+                }
+
+                const decrypted = decrypted_opt orelse {
+                    if (buf.len >= 21 and conn.stateless_reset_token_set) {
+                        const tail = buf[buf.len - 16 ..];
+                        var tail_arr: [16]u8 = undefined;
+                        @memcpy(&tail_arr, tail);
+                        if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
+                            dbg("io: Stateless Reset detected — entering draining\n", .{});
+                            conn.draining = true;
+                            return buf.len;
                         }
-                        dbg(
-                            "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
-                            .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
-                        );
-                        continue;
-                    };
-                    srv_decrypted_pn = r.pn;
-                    break :decrypt r.pt_len;
+                    }
+                    dbg(
+                        "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
+                        .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
+                    );
+                    continue;
                 };
-                // Update server's received PN so future decompression stays accurate.
+
+                const srv_decrypted_pn = decrypted.pn;
+                const pt_len = decrypted.pt_len;
                 if (srv_decrypted_pn > (conn.app_recv_pn orelse 0)) {
                     conn.app_recv_pn = srv_decrypted_pn;
                 }
 
-                // ECN: count this 1-RTT packet as ECT(0) — we mark all outgoing
-                // packets ECT(0) via IP_TOS, so the peer does the same.
                 conn.ecn_ect0_recv += 1;
-
                 conn.peer_key_phase = incoming_phase;
 
-                if (conn.phase == .waiting_finished) {
-                    // Client Finished may still be in flight; 1-RTT can arrive first.
-                    // Process STREAM requests immediately — buffering only 8 datagrams
-                    // drops quinn's ~2000-stream multiplexing burst.
-                    self.processAppFrames(conn, plaintext[0..pt_len], src);
-                    if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
-                        self.flushConnAppAck(conn, src);
-                        _ = conn.app_recv_ack.observe(srv_decrypted_pn);
-                    }
-                    return;
-                }
-
-                // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
                 if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
                     self.flushConnAppAck(conn, src);
                     _ = conn.app_recv_ack.observe(srv_decrypted_pn);
                 }
-                return;
+                return decrypted.wire_len;
             }
         }
-        dbg("io: process1RttPacket: no matching connection found\n", .{});
+        return null;
     }
 
     /// Trigger a local key update: rotate send keys and emit a packet with
@@ -4458,28 +4482,27 @@ pub const Server = struct {
             };
             return;
         }
-        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
-        // Patch stream metadata into the last recorded SentPacket so that the
-        // loss detector can surface it for retransmission if this packet is lost.
-        if (conn.ld.sent_count > 0) {
-            const last = &conn.ld.sent[conn.ld.sent_count - 1];
-            last.has_stream_data = true;
-            last.stream_id = slot.stream_id;
-            last.stream_offset = old_offset;
+        const pn_before = conn.app_pn;
+        self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null);
+        if (!self.http09StreamPacketRecorded(conn, slot.stream_id, old_offset, pn_before)) {
+            slot.stream_offset -= @intCast(n);
+            slot.file.seekTo(slot.stream_offset) catch |err| {
+                dbg("io: http09 seekTo rewind failed stream_id={}: {}\n", .{ slot.stream_id, err });
+            };
+            return;
         }
         if (fin) {
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.file.close();
             // Single-chunk HTTP/0.9 (quinn multiplexing uses 32-byte files):
             // release the slot immediately so ~2000 streams are not serialized
-            // through 64 awaiting_fin_ack slots waiting for client ACKs.
+            // through 128 awaiting_fin_ack slots waiting for client ACKs.
             if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
                 dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
                 slot.* = .{};
                 self.drainHttp09Pending(conn);
                 return;
             }
-            // Multi-chunk: keep FIN frame for retransmission until ACKed.
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
             slot.fin_frame_len = frame_len;
             slot.fin_pkt_pn = conn.app_pn - 1;
@@ -4501,7 +4524,7 @@ pub const Server = struct {
     fn flushPendingHttp09Responses(self: *Server) void {
         // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
         // enough to drain responses before the client idle timeout.
-        var budget: usize = 128;
+        var budget: usize = 512;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -7384,6 +7407,7 @@ pub const Client = struct {
             &plaintext,
             buf,
             pn_start,
+            buf.len,
             incoming_phase,
             &self.conn.app_server_km,
             &self.conn.app_server_km_prev,
@@ -9002,7 +9026,7 @@ test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 r
 
         var recv_buf: [256]u8 = undefined;
         const pn_start: usize = 1 + dcid.len;
-        const r = try unprotect1RttPacketWithPnTracking(&recv_buf, send_buf[0..n], pn_start, &km, cipher, null);
+        const r = try unprotect1RttPacketWithPnTracking(&recv_buf, send_buf[0..n], pn_start, n, &km, cipher, null);
         try std.testing.expectEqual(@as(u64, pn), r.pn);
         try std.testing.expectEqualSlices(u8, &plaintext, recv_buf[0..r.pt_len]);
     }
