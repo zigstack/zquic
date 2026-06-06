@@ -604,6 +604,62 @@ fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMate
     return buf[0] ^ (mask[0] & 0x1f); // short header: mask the low 5 bits
 }
 
+/// Serialize a RETIRE_CONNECTION_ID frame (type 0x19, RFC 9000 §19.16).
+fn buildRetireConnectionIdFrame(out: []u8, seq: u64) !usize {
+    if (seq == 0) return error.InvalidRetireSeq;
+    out[0] = 0x19;
+    const enc = try varint.encode(out[1..], seq);
+    return 1 + enc.len;
+}
+
+const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
+
+/// Decrypt an inbound 1-RTT packet with RFC 9001 §6 key-update handling.
+/// `recv_km` / `recv_km_prev` / `send_km` are the endpoint's receive and
+/// send key slots for this direction (server: recv=app_client_km).
+fn decrypt1RttWithKeyUpdate(
+    conn: *ConnState,
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    incoming_phase: bool,
+    recv_km: *KeyMaterial,
+    recv_km_prev: *?KeyMaterial,
+    send_km: *KeyMaterial,
+) !Decrypt1RttResult {
+    const cipher = conn.packet_cipher;
+    const expected = conn.app_recv_pn;
+
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, recv_km, cipher, expected)) |r| {
+        return r;
+    } else |_| {}
+
+    if (recv_km_prev.*) |prev| {
+        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &prev, cipher, expected)) |r| {
+            return r;
+        } else |_| {}
+    }
+
+    if (incoming_phase != conn.peer_key_phase) {
+        var nk = if (conn.use_v2) recv_km.nextGenV2() else recv_km.nextGen();
+        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &nk, cipher, expected)) |r| {
+            recv_km_prev.* = recv_km.*;
+            recv_km.* = nk;
+            if (conn.key_update_pending) {
+                conn.key_update_pending = false;
+                conn.key_update_init_pn = null;
+                recv_km_prev.* = null;
+            } else {
+                send_km.* = if (conn.use_v2) send_km.nextGenV2() else send_km.nextGen();
+                conn.key_phase_bit = !conn.key_phase_bit;
+            }
+            return r;
+        } else |_| {}
+    }
+
+    return error.DecryptFailed;
+}
+
 // ── QUIC packet decryption ────────────────────────────────────────────────────
 
 /// Decrypt a Handshake or 1-RTT packet payload.
@@ -1118,6 +1174,17 @@ pub const ConnState = struct {
     // Tracks the key phase bit seen in the last successfully decrypted
     // 1-RTT packet; used to detect peer-initiated key updates.
     peer_key_phase: bool = false,
+    // Previous-generation 1-RTT receive keys (RFC 9001 §6.3).  Kept after a
+    // key update so out-of-order packets protected under the old keys still
+    // decrypt.  Cleared once the update is confirmed (peer Key Phase flip).
+    app_client_km_prev: ?KeyMaterial = null,
+    app_server_km_prev: ?KeyMaterial = null,
+    // Earliest time (ms) we may initiate another key update (RFC 9001 §6.5:
+    // endpoints SHOULD limit updates to once every 3 RTTs).
+    key_update_cooldown_until_ms: i64 = 0,
+    // PN of the first packet sent under a locally-initiated key update.
+    // Used to detect peer confirmation via ACK + Key Phase observation.
+    key_update_init_pn: ?u64 = null,
 
     // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
     // Non-null while waiting for a PATH_RESPONSE from the new address.
@@ -1162,6 +1229,17 @@ pub const ConnState = struct {
     // counts as one, so the peer may issue up to (limit - 1) additional before
     // we error with CONNECTION_ID_LIMIT_ERROR (0x09).
     peer_cid_count: u64 = 1,
+    // Sequence number of the peer CID currently in `remote_cid` (0 for the
+    // handshake-assigned CID).  Used to emit RETIRE_CONNECTION_ID when we
+    // switch to a NEW_CONNECTION_ID-issued alternate (RFC 9000 §5.1.2).
+    remote_cid_seq: u64 = 0,
+    // Peer-issued CIDs beyond the handshake CID, keyed by sequence number
+    // (RFC 9000 §5.1.1).  `remote_cid` always holds the active DCID; this
+    // pool holds spares received via NEW_CONNECTION_ID.
+    peer_cid_pool: [8]?CidPoolEntry = [_]?CidPoolEntry{null} ** 8,
+    // Peer's `active_connection_id_limit` transport parameter (RFC 9000 §18.2).
+    // Defaults to 2 per §18.2 when the peer omits the param.
+    peer_active_cid_limit: u64 = 2,
 
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
@@ -1171,6 +1249,12 @@ pub const ConnState = struct {
     anti_amp_bytes_recv: u64 = 0,
     anti_amp_bytes_sent: u64 = 0,
     address_validated: bool = false,
+    // Set when a pre-validation send was blocked by the 3× rule; cleared
+    // (and the pending flight retried) once more client bytes arrive.
+    anti_amp_deferred: bool = false,
+    // Resume offset for a partially-sent Handshake flight deferred by the
+    // amplification limit (bytes into `flight_bytes`).
+    anti_amp_hs_offset: usize = 0,
 
     // ── Connection-level flow control (RFC 9000 §4) ───────────────────────────
     // fc_send_max is the peer's connection-level receive window. The default
@@ -1377,6 +1461,9 @@ pub const ConnState = struct {
         self.peer_max_idle_timeout_ms = parsed.max_idle_timeout_ms;
         self.peer_max_ack_delay_ms = parsed.max_ack_delay_ms;
         self.peer_disable_active_migration = parsed.disable_active_migration;
+        if (parsed.active_connection_id_limit > 0) {
+            self.peer_active_cid_limit = parsed.active_connection_id_limit;
+        }
         if (parsed.preferred_address) |pa| {
             self.peer_preferred_address = pa;
             dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
@@ -1422,6 +1509,106 @@ pub const ConnState = struct {
                 return seq;
             }
         }
+        return null;
+    }
+
+    /// RFC 9001 §6.5: minimum spacing between locally-initiated key updates.
+    fn keyUpdateCooldownMs(self: *const ConnState) u64 {
+        const srt = @as(u64, @intFromFloat(@max(self.rtt.srtt_ms, 0.0)));
+        if (srt == 0) return 0;
+        return 3 * srt;
+    }
+
+    /// True when a locally-initiated key update may begin (RFC 9001 §6 / §6.5).
+    pub fn canInitiateKeyUpdate(self: *const ConnState, now_ms: i64) bool {
+        if (self.key_update_pending) return false;
+        if (now_ms < self.key_update_cooldown_until_ms) return false;
+        return true;
+    }
+
+    /// RFC 9000 §8.1: may the server send `pkt_len` more bytes to this
+    /// unvalidated address without exceeding the 3× amplification limit?
+    pub fn canSendAntiAmp(self: *const ConnState, pkt_len: usize) bool {
+        if (self.address_validated) return true;
+        if (self.anti_amp_bytes_recv == 0) return false;
+        return self.anti_amp_bytes_sent + @as(u64, @intCast(pkt_len)) <= self.anti_amp_bytes_recv * 3;
+    }
+
+    /// Count of unretired local CIDs we have advertised (seq 0 + pool).
+    pub fn localCidCount(self: *const ConnState) u64 {
+        var n: u64 = 1;
+        for (self.cid_pool) |slot| {
+            if (slot != null) n += 1;
+        }
+        return n;
+    }
+
+    /// Count of unretired peer-issued CIDs we are holding (seq 0 + pool).
+    pub fn peerCidCountHeld(self: *const ConnState) u64 {
+        var n: u64 = 1;
+        for (self.peer_cid_pool) |slot| {
+            if (slot != null) n += 1;
+        }
+        return n;
+    }
+
+    /// Insert a peer-issued CID into `peer_cid_pool`.  Returns false when the
+    /// pool is full (caller should treat as CONNECTION_ID_LIMIT_ERROR).
+    pub fn peerCidInsert(self: *ConnState, seq: u64, cid: ConnectionId, token: [16]u8) bool {
+        for (&self.peer_cid_pool) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.seq == seq) {
+                    slot.* = .{ .cid = cid, .seq = seq, .reset_token = token };
+                    return true;
+                }
+            }
+        }
+        for (&self.peer_cid_pool) |*slot| {
+            if (slot.* == null) {
+                slot.* = .{ .cid = cid, .seq = seq, .reset_token = token };
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove a peer-issued CID from the pool by sequence number.
+    pub fn peerCidRemoveSeq(self: *ConnState, seq: u64) bool {
+        if (seq == 0) return false;
+        for (&self.peer_cid_pool) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.seq == seq) {
+                    slot.* = null;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Look up a peer-issued spare CID by sequence number.
+    pub fn peerCidFind(self: *const ConnState, seq: u64) ?ConnectionId {
+        for (self.peer_cid_pool) |slot| {
+            if (slot) |entry| {
+                if (entry.seq == seq) return entry.cid;
+            }
+        }
+        return null;
+    }
+
+    /// Pick the lowest-sequence spare peer CID for migration (RFC 9000 §9.5).
+    pub fn peerCidLowestSpare(self: *const ConnState) ?struct { seq: u64, cid: ConnectionId } {
+        var best_seq: ?u64 = null;
+        var best_cid: ?ConnectionId = null;
+        for (self.peer_cid_pool) |slot| {
+            if (slot) |entry| {
+                if (best_seq == null or entry.seq < best_seq.?) {
+                    best_seq = entry.seq;
+                    best_cid = entry.cid;
+                }
+            }
+        }
+        if (best_seq) |s| return .{ .seq = s, .cid = best_cid.? };
         return null;
     }
 
@@ -2227,6 +2414,7 @@ pub const Server = struct {
         conn.anti_amp_bytes_recv += buf.len;
         // If Retry was accepted, the address is already validated.
         if (verified_odcid != null) conn.address_validated = true;
+        self.tryFlushDeferredServerSend(conn, src);
 
         if (conn.init_keys == null) conn.deriveInitialKeys(ip.dcid);
         const init_km = &conn.init_keys.?;
@@ -2748,8 +2936,9 @@ pub const Server = struct {
                 conn.quicVersion(),
             ) catch return;
 
-            if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+            if (!conn.canSendAntiAmp(pkt_len)) {
                 dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+                conn.anti_amp_deferred = true;
                 return;
             }
             const init_pn_sent = conn.init_pn;
@@ -2788,8 +2977,9 @@ pub const Server = struct {
                     conn.packet_cipher,
                 ) catch break; // not enough room — send what we have, rest goes separately
 
-                if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+                if (!conn.canSendAntiAmp(pkt_len)) {
                     dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
+                    conn.anti_amp_deferred = true;
                     break;
                 }
                 conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
@@ -2817,6 +3007,30 @@ pub const Server = struct {
                     dbg("io: sendto Initial failed: {}\n", .{err});
                 };
             }
+        }
+    }
+
+    /// Retry server flight packets that were deferred by the RFC 9000 §8.1
+    /// anti-amplification limit once more client bytes have arrived.
+    fn tryFlushDeferredServerSend(self: *Server, conn: *ConnState, src: compat.Address) void {
+        if (conn.address_validated) {
+            conn.anti_amp_deferred = false;
+            conn.anti_amp_hs_offset = 0;
+            return;
+        }
+        if (!conn.anti_amp_deferred and conn.anti_amp_hs_offset == 0) return;
+
+        if (!conn.init_resend_valid and conn.sh_len > 0 and conn.init_keys != null) {
+            self.sendInitialServerHello(conn, src);
+        }
+        if (conn.has_hs_keys and conn.flight_len > 0) {
+            self.sendHandshakeServerFlightFrom(conn, src, conn.anti_amp_hs_offset);
+            if (conn.anti_amp_hs_offset >= conn.flight_len) {
+                conn.anti_amp_hs_offset = 0;
+            }
+        }
+        if (conn.init_resend_valid and conn.anti_amp_hs_offset == 0) {
+            conn.anti_amp_deferred = false;
         }
     }
 
@@ -2848,8 +3062,9 @@ pub const Server = struct {
         ) catch return;
 
         // Anti-amplification (RFC 9000 §8.1): do not exceed 3× received bytes.
-        if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+        if (!conn.canSendAntiAmp(pkt_len)) {
             dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+            conn.anti_amp_deferred = true;
             return;
         }
 
@@ -2905,8 +3120,10 @@ pub const Server = struct {
                 conn.packet_cipher,
             ) catch return;
 
-            if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+            if (!conn.canSendAntiAmp(pkt_len)) {
                 dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
+                conn.anti_amp_deferred = true;
+                conn.anti_amp_hs_offset = offset;
                 return;
             }
 
@@ -2924,6 +3141,11 @@ pub const Server = struct {
             };
 
             offset += chunk_len;
+            conn.anti_amp_hs_offset = offset;
+        }
+        if (offset >= flight.len) {
+            conn.anti_amp_hs_offset = 0;
+            if (conn.init_resend_valid) conn.anti_amp_deferred = false;
         }
     }
 
@@ -2941,6 +3163,7 @@ pub const Server = struct {
 
         // Anti-amplification: track Handshake bytes received (RFC 9000 §8.1).
         conn.anti_amp_bytes_recv += buf.len;
+        self.tryFlushDeferredServerSend(conn, src);
 
         // If already connected, the client may be retransmitting its Finished because
         // our HANDSHAKE_DONE was lost. Re-send it so the client can make progress.
@@ -3204,61 +3427,35 @@ pub const Server = struct {
                 // even when the client's PN space grows beyond 1-byte truncation range.
                 var srv_decrypted_pn: u64 = 0;
                 const pt_len: usize = decrypt: {
-                    if (unprotect1RttPacketWithPnTracking(
+                    const r = decrypt1RttWithKeyUpdate(
+                        conn,
                         &plaintext,
                         buf,
                         pn_start,
+                        incoming_phase,
                         &conn.app_client_km,
-                        conn.packet_cipher,
-                        conn.app_recv_pn,
-                    )) |r| {
-                        srv_decrypted_pn = r.pn;
-                        break :decrypt r.pt_len;
-                    } else |_| {}
-                    if (incoming_phase != conn.peer_key_phase) {
-                        var nk = if (conn.use_v2) conn.app_client_km.nextGenV2() else conn.app_client_km.nextGen();
-                        if (unprotect1RttPacketWithPnTracking(
-                            &plaintext,
-                            buf,
-                            pn_start,
-                            &nk,
-                            conn.packet_cipher,
-                            conn.app_recv_pn,
-                        )) |r| {
-                            conn.app_client_km = nk;
-                            if (!conn.key_update_pending) {
-                                // Peer (client) initiated a key update — also rotate our send
-                                // keys so the server's outgoing packets carry the new phase bit
-                                // (RFC 9001 §6.1: both endpoints must use the new phase).
-                                conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
-                                conn.key_phase_bit = !conn.key_phase_bit;
+                        &conn.app_client_km_prev,
+                        &conn.app_server_km,
+                    ) catch {
+                        // RFC 9000 §10.3: Stateless Reset detection.
+                        if (buf.len >= 21 and conn.stateless_reset_token_set) {
+                            const tail = buf[buf.len - 16 ..];
+                            var tail_arr: [16]u8 = undefined;
+                            @memcpy(&tail_arr, tail);
+                            if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
+                                dbg("io: Stateless Reset detected — entering draining\n", .{});
+                                conn.draining = true;
+                                return;
                             }
-                            // Either path: server-initiated or peer-initiated, the client
-                            // receive key has been advanced to match the new phase.
-                            // Clear the pending flag — the update is now confirmed.
-                            conn.key_update_pending = false;
-                            srv_decrypted_pn = r.pn;
-                            break :decrypt r.pt_len;
-                        } else |_| {}
-                    }
-                    // RFC 9000 §10.3: Stateless Reset detection.
-                    // If the packet is ≥21 bytes and ends with our stored token,
-                    // the peer is signalling a reset without connection state.
-                    if (buf.len >= 21 and conn.stateless_reset_token_set) {
-                        const tail = buf[buf.len - 16 ..];
-                        var tail_arr: [16]u8 = undefined;
-                        @memcpy(&tail_arr, tail);
-                        if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
-                            dbg("io: Stateless Reset detected — entering draining\n", .{});
-                            conn.draining = true;
-                            return;
                         }
-                    }
-                    dbg(
-                        "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
-                        .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
-                    );
-                    continue;
+                        dbg(
+                            "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
+                            .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
+                        );
+                        continue;
+                    };
+                    srv_decrypted_pn = r.pn;
+                    break :decrypt r.pt_len;
                 };
                 // Update server's received PN so future decompression stays accurate.
                 if (srv_decrypted_pn > (conn.app_recv_pn orelse 0)) {
@@ -3270,7 +3467,6 @@ pub const Server = struct {
                 conn.ecn_ect0_recv += 1;
 
                 conn.peer_key_phase = incoming_phase;
-                conn.key_update_pending = false;
 
                 if (conn.phase == .waiting_finished) {
                     // Client Finished may still be in flight; 1-RTT can arrive first.
@@ -3295,12 +3491,17 @@ pub const Server = struct {
     /// the new key phase bit set.  Called after handshake when key_update
     /// is enabled (quic-interop-runner "keyupdate" test case).
     fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: compat.Address) void {
-        // Rotate to next generation keys (version-appropriate label).
+        const now_ms = compat.milliTimestamp();
+        if (!conn.canInitiateKeyUpdate(now_ms)) {
+            dbg("io: key update deferred (pending={} cooldown={})\n", .{ conn.key_update_pending, conn.key_update_cooldown_until_ms });
+            return;
+        }
         conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
         conn.key_phase_bit = !conn.key_phase_bit;
         conn.key_update_pending = true;
+        conn.key_update_init_pn = conn.app_pn;
+        conn.key_update_cooldown_until_ms = now_ms + @as(i64, @intCast(conn.keyUpdateCooldownMs()));
 
-        // Send a PING so the peer can verify the new keys.
         const ping_frame = [_]u8{0x01};
         self.send1Rtt(conn, &ping_frame, src);
     }
@@ -3738,11 +3939,52 @@ pub const Server = struct {
                 const seq_r = varint.decode(frames[pos..]) catch return;
                 pos += seq_r.len;
                 dbg("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
-                if (conn.cidPoolRetireSeq(seq_r.value)) {
-                    // Refill the freed slot so the peer keeps `active_connection_id_limit`
-                    // CIDs available without having to wait for the next round-trip.
-                    self.sendNewConnectionId(conn, src);
+                if (seq_r.value == 0) {
+                    self.sendConnectionClose(conn, 0x0a, "retire connection id seq 0", src);
+                    return;
                 }
+                if (!conn.cidPoolRetireSeq(seq_r.value)) {
+                    dbg("io: RETIRE_CONNECTION_ID unknown seq={}\n", .{seq_r.value});
+                    continue;
+                }
+                if (conn.localCidCount() < 2) {
+                    self.sendConnectionClose(conn, 0x09, "connection id limit", src);
+                    return;
+                }
+                self.sendNewConnectionId(conn, src);
+                continue;
+            }
+            if (ft == 0x18) {
+                // NEW_CONNECTION_ID from client (RFC 9000 §19.15) — rare but valid
+                // when the client advertises alternates.  Enforce our limit and store.
+                const seq_r = varint.decode(frames[pos..]) catch return;
+                pos += seq_r.len;
+                const rpt_r = varint.decode(frames[pos..]) catch return;
+                pos += rpt_r.len;
+                if (pos >= frames.len) return;
+                const cid_len_byte = frames[pos];
+                pos += 1;
+                if (pos + cid_len_byte + 16 > frames.len) return;
+                const new_cid = ConnectionId.fromSlice(frames[pos .. pos + cid_len_byte]) catch return;
+                pos += cid_len_byte;
+                pos += 16; // stateless reset token
+                if (rpt_r.value > 0) {
+                    var s: u64 = 0;
+                    while (s < rpt_r.value) : (s += 1) {
+                        if (s != 0) _ = conn.peerCidRemoveSeq(s);
+                    }
+                }
+                if (conn.peerCidCountHeld() >= conn.peer_active_cid_limit) {
+                    self.sendConnectionClose(conn, 0x09, "connection id limit", src);
+                    return;
+                }
+                var token: [16]u8 = undefined;
+                @memset(&token, 0);
+                if (!conn.peerCidInsert(seq_r.value, new_cid, token)) {
+                    self.sendConnectionClose(conn, 0x09, "connection id limit", src);
+                    return;
+                }
+                conn.peer_cid_count += 1;
                 continue;
             }
             if (ft >= 0x08 and ft <= 0x0f) {
@@ -4200,6 +4442,16 @@ pub const Server = struct {
         dbg("io: sent NEW_CONNECTION_ID seq={}\n", .{seq});
     }
 
+    /// Send RETIRE_CONNECTION_ID for a peer-issued CID we no longer use
+    /// (RFC 9000 §5.1.2).  Sequence number zero MUST NOT be retired.
+    fn sendRetireConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: compat.Address) void {
+        if (seq == 0) return;
+        var buf: [16]u8 = undefined;
+        const len = buildRetireConnectionIdFrame(&buf, seq) catch return;
+        self.send1Rtt(conn, buf[0..len], dst);
+        dbg("io: sent RETIRE_CONNECTION_ID seq={}\n", .{seq});
+    }
+
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
     fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
         // Grow by 1000 streams per MAX_STREAMS — large enough that bursts of
@@ -4228,14 +4480,20 @@ pub const Server = struct {
     /// Rotates app_server_km and flips key_phase_bit, then sends a PING
     /// so the client sees the new Key Phase bit and can rotate its keys.
     fn initiateServerKeyUpdate(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        const now_ms = compat.milliTimestamp();
+        if (!conn.canInitiateKeyUpdate(now_ms)) {
+            dbg("io: server key update deferred (pending={} cooldown={})\n", .{ conn.key_update_pending, conn.key_update_cooldown_until_ms });
+            return;
+        }
         conn.app_server_km = if (conn.use_v2)
             conn.app_server_km.nextGenV2()
         else
             conn.app_server_km.nextGen();
         conn.key_phase_bit = !conn.key_phase_bit;
         conn.key_update_pending = true;
+        conn.key_update_init_pn = conn.app_pn;
         conn.server_key_update_pn = conn.app_pn;
-        // Send a PING to deliver the first packet with the new Key Phase bit.
+        conn.key_update_cooldown_until_ms = now_ms + @as(i64, @intCast(conn.keyUpdateCooldownMs()));
         const padded = [_]u8{ 0x01, 0x00, 0x00 }; // PING + PADDING
         self.send1Rtt(conn, &padded, dst);
         dbg("io: server initiated key update → key_phase={}\n", .{conn.key_phase_bit});
@@ -6655,41 +6913,15 @@ pub const Client = struct {
         if (buf.len == 834) {
             dbg("io: client 834-byte packet key phase: incoming={} current_peer={}\n", .{ incoming_phase, self.conn.peer_key_phase });
         }
-        if (incoming_phase != self.conn.peer_key_phase) {
-            // Server's key phase changed — rotate our receive keys to match.
-            // This covers two cases:
-            //   1. Server-initiated key update (key_update_pending=false): rotate
-            //      receive keys AND our own send keys so outgoing packets use the
-            //      new phase (RFC 9001 §6.1: "MUST respond with the same Key Phase").
-            //   2. Server confirming our client-initiated key update
-            //      (key_update_pending=true): rotate receive keys and clear the flag.
-            if (buf.len == 834) {
-                dbg("io: client 834-byte packet rotating to next key generation\n", .{});
-            }
-            self.conn.app_server_km = if (self.conn.use_v2)
-                self.conn.app_server_km.nextGenV2()
-            else
-                self.conn.app_server_km.nextGen();
-            if (self.conn.key_update_pending) {
-                // Server has confirmed our client-initiated key update.
-                self.conn.key_update_pending = false;
-            } else {
-                // Server-initiated key update: rotate our own send keys so we
-                // respond with the new key phase (RFC 9001 §6.1).
-                self.conn.app_client_km = if (self.conn.use_v2)
-                    self.conn.app_client_km.nextGenV2()
-                else
-                    self.conn.app_client_km.nextGen();
-                self.conn.key_phase_bit = !self.conn.key_phase_bit;
-            }
-        }
-        const decrypt_result = unprotect1RttPacketWithPnTracking(
+        const decrypt_result = decrypt1RttWithKeyUpdate(
+            &self.conn,
             &plaintext,
             buf,
             pn_start,
+            incoming_phase,
             &self.conn.app_server_km,
-            self.conn.packet_cipher,
-            self.conn.app_recv_pn,
+            &self.conn.app_server_km_prev,
+            &self.conn.app_client_km,
         ) catch |err| {
             if (buf.len == 834) {
                 dbg("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{ err, self.conn.app_recv_pn });
@@ -6713,7 +6945,6 @@ pub const Client = struct {
         self.conn.last_recv_ms = compat.milliTimestamp();
 
         self.conn.peer_key_phase = incoming_phase;
-        self.conn.key_update_pending = false;
 
         var pos: usize = 0;
         while (pos < pt_len) {
@@ -6927,7 +7158,7 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x18) {
-                // NEW_CONNECTION_ID — store for use when migrating (RFC 9000 §19.15).
+                // NEW_CONNECTION_ID — store for migration (RFC 9000 §19.15 / §5.1.2).
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
                 const rpt_r = varint.decode(plaintext[pos..pt_len]) catch return;
@@ -6938,36 +7169,44 @@ pub const Client = struct {
                 if (pos + cid_len_byte + 16 > pt_len) return;
                 const new_cid = ConnectionId.fromSlice(plaintext[pos .. pos + cid_len_byte]) catch return;
                 pos += cid_len_byte;
-                // Store the stateless reset token for this CID so we can detect resets.
-                if (pos + 16 <= pt_len) {
-                    @memcpy(&self.conn.stateless_reset_token, plaintext[pos .. pos + 16]);
-                    self.conn.stateless_reset_token_set = true;
-                }
+                var token: [16]u8 = undefined;
+                @memcpy(&token, plaintext[pos .. pos + 16]);
                 pos += 16;
-                // RFC 9000 §5.1.1: enforce our advertised active_connection_id_limit.
-                // We use the default of 2 per RFC 9000 §18.2 (we don't send the
-                // param).  Retire-prior-to (rpt_r.value) would reduce the count
-                // if we actually retired CIDs; since we don't rotate, we just
-                // cap total issuances.
-                const cid_limit: u64 = 2;
-                self.conn.peer_cid_count += 1;
-                if (self.conn.peer_cid_count > cid_limit) {
-                    dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued {} CIDs, limit={}\n", .{ self.conn.peer_cid_count, cid_limit });
-                    // We don't currently send CONNECTION_CLOSE from the client
-                    // path; drop the frame and let the server time out.
+                // §5.1.2: retire unused peer CIDs with seq < retire_prior_to.
+                if (rpt_r.value > 0) {
+                    var s: u64 = 0;
+                    while (s < rpt_r.value) : (s += 1) {
+                        if (s == self.conn.remote_cid_seq) continue;
+                        if (self.conn.peerCidRemoveSeq(s)) {
+                            self.sendRetireConnectionId(s);
+                        }
+                    }
+                }
+                if (self.conn.peerCidCountHeld() >= self.conn.peer_active_cid_limit) {
+                    dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued too many CIDs (limit={})\n", .{self.conn.peer_active_cid_limit});
                     return;
                 }
-                if (seq_r.value == 1) {
-                    self.conn.next_remote_cid = new_cid;
-                    dbg("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
+                if (!self.conn.peerCidInsert(seq_r.value, new_cid, token)) {
+                    dbg("io: peer CID pool full on NEW_CONNECTION_ID seq={}\n", .{seq_r.value});
+                    return;
+                }
+                @memcpy(&self.conn.stateless_reset_token, &token);
+                self.conn.stateless_reset_token_set = true;
+                if (self.conn.next_remote_cid == null) {
+                    if (self.conn.peerCidLowestSpare()) |spare| {
+                        self.conn.next_remote_cid = spare.cid;
+                        dbg("io: client stored next_remote_cid seq={}\n", .{spare.seq});
+                    }
                 }
                 continue;
             }
             if (ft == 0x19) {
-                // RETIRE_CONNECTION_ID — server retires one of our CIDs.
+                // RETIRE_CONNECTION_ID — server retires one of our issued CIDs.
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
                 dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
+                if (seq_r.value == 0) return;
+                _ = self.conn.cidPoolRetireSeq(seq_r.value);
                 continue;
             }
             if (ft == 0x16 or ft == 0x17) {
@@ -7123,6 +7362,27 @@ pub const Client = struct {
     }
 
     /// Respond to a server-sent PATH_CHALLENGE with a matching PATH_RESPONSE.
+    /// Send RETIRE_CONNECTION_ID for a peer-issued CID we no longer use
+    /// (RFC 9000 §5.1.2).  Sequence number zero MUST NOT be retired.
+    fn sendRetireConnectionId(self: *Client, seq: u64) void {
+        if (seq == 0) return;
+        var buf: [16]u8 = undefined;
+        const len = buildRetireConnectionIdFrame(&buf, seq) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            buf[0..len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        dbg("io: client sent RETIRE_CONNECTION_ID seq={}\n", .{seq});
+    }
+
     /// Initiate a key update from the client side (RFC 9001 §6).
     ///
     /// Rotates the client's send keys to the next generation, flips the key
@@ -7131,17 +7391,21 @@ pub const Client = struct {
     /// the new phase too — satisfying the quic-interop-runner "keyupdate"
     /// test case requirement that both sides emit key-phase-1 packets.
     fn initiateClientKeyUpdate(self: *Client) void {
+        const now_ms = compat.milliTimestamp();
+        if (!self.conn.canInitiateKeyUpdate(now_ms)) {
+            dbg("io: client key update deferred (pending={} cooldown={})\n", .{ self.conn.key_update_pending, self.conn.key_update_cooldown_until_ms });
+            return;
+        }
         self.conn.app_client_km = if (self.conn.use_v2)
             self.conn.app_client_km.nextGenV2()
         else
             self.conn.app_client_km.nextGen();
         self.conn.key_phase_bit = !self.conn.key_phase_bit;
         self.conn.key_update_pending = true;
+        self.conn.key_update_init_pn = self.conn.app_pn;
+        self.conn.key_update_cooldown_until_ms = now_ms + @as(i64, @intCast(self.conn.keyUpdateCooldownMs()));
 
-        // Send a PING so the server can verify the new key phase.
-        const ping_frame = [_]u8{0x01};
-        var padded: [3]u8 = .{ 0x01, 0x00, 0x00 };
-        _ = ping_frame;
+        const padded: [3]u8 = .{ 0x01, 0x00, 0x00 };
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,
@@ -7490,10 +7754,19 @@ pub const Client = struct {
             return;
         };
         self.conn.app_pn += 1;
-        // Update remote_cid so ALL subsequent packets (including HTTP requests) use
-        // the new server CID advertised via NEW_CONNECTION_ID (RFC 9000 §9.5).
+        // Update remote_cid so ALL subsequent packets use the NEW_CONNECTION_ID
+        // alternate (RFC 9000 §9.5).  Retire the old peer CID per §5.1.2.
         if (self.conn.next_remote_cid != null) {
-            self.conn.remote_cid = migration_dcid;
+            if (self.conn.peerCidLowestSpare()) |spare| {
+                const old_seq = self.conn.remote_cid_seq;
+                if (old_seq != 0) self.sendRetireConnectionId(old_seq);
+                self.conn.remote_cid = spare.cid;
+                self.conn.remote_cid_seq = spare.seq;
+                _ = self.conn.peerCidRemoveSeq(spare.seq);
+                self.conn.next_remote_cid = if (self.conn.peerCidLowestSpare()) |next| next.cid else null;
+            } else {
+                self.conn.remote_cid = migration_dcid;
+            }
         }
         _ = compat.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
             dbg("io: migrate: PING send failed: {}\n", .{err});
@@ -8260,4 +8533,63 @@ test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 r
         try std.testing.expectEqual(@as(u64, pn), r.pn);
         try std.testing.expectEqualSlices(u8, &plaintext, recv_buf[0..r.pt_len]);
     }
+}
+
+test "canSendAntiAmp: 3× rule before address validation" {
+    var conn = makeConnForStreamTest();
+    conn.anti_amp_bytes_recv = 100;
+    conn.anti_amp_bytes_sent = 250;
+    try std.testing.expect(conn.canSendAntiAmp(50)); // 250+50 = 300 = 3×100
+    try std.testing.expect(!conn.canSendAntiAmp(51)); // would exceed
+    conn.address_validated = true;
+    try std.testing.expect(conn.canSendAntiAmp(10_000)); // no limit after validation
+    conn.address_validated = false;
+    conn.anti_amp_bytes_recv = 0;
+    try std.testing.expect(!conn.canSendAntiAmp(1)); // can't send until recv > 0
+}
+
+test "canInitiateKeyUpdate: pending and cooldown gate (RFC 9001 §6.5)" {
+    var conn = makeConnForStreamTest();
+    conn.rtt.srtt_ms = 100.0;
+    try std.testing.expect(conn.canInitiateKeyUpdate(0));
+    conn.key_update_pending = true;
+    try std.testing.expect(!conn.canInitiateKeyUpdate(999_999));
+    conn.key_update_pending = false;
+    conn.key_update_cooldown_until_ms = 500;
+    try std.testing.expect(!conn.canInitiateKeyUpdate(400));
+    try std.testing.expect(conn.canInitiateKeyUpdate(500));
+    try std.testing.expectEqual(@as(u64, 300), conn.keyUpdateCooldownMs());
+}
+
+test "peer CID pool: insert, retire_prior_to, lowest spare" {
+    var conn = makeConnForStreamTest();
+    const cid1 = try ConnectionId.fromSlice(&[_]u8{ 0xAA, 0xBB });
+    const cid2 = try ConnectionId.fromSlice(&[_]u8{ 0xCC, 0xDD });
+    const tok: [16]u8 = .{0x11} ** 16;
+    try std.testing.expect(conn.peerCidInsert(1, cid1, tok));
+    try std.testing.expect(conn.peerCidInsert(3, cid2, tok));
+    try std.testing.expectEqual(@as(u64, 3), conn.peerCidCountHeld());
+    try std.testing.expect(conn.peerCidRemoveSeq(1));
+    try std.testing.expectEqual(@as(u64, 2), conn.peerCidCountHeld());
+    try std.testing.expect(conn.peerCidInsert(2, cid1, tok));
+    const spare = conn.peerCidLowestSpare().?;
+    try std.testing.expectEqual(@as(u64, 2), spare.seq);
+    try std.testing.expect(ConnectionId.eql(cid1, spare.cid));
+}
+
+test "buildRetireConnectionIdFrame: rejects seq 0" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.InvalidRetireSeq, buildRetireConnectionIdFrame(&buf, 0));
+    const n = try buildRetireConnectionIdFrame(&buf, 42);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u8, 0x19), buf[0]);
+}
+
+test "localCidCount: seq 0 plus pool entries" {
+    var conn = makeConnForStreamTest();
+    try std.testing.expectEqual(@as(u64, 1), conn.localCidCount());
+    const cid = try ConnectionId.fromSlice(&[_]u8{0x01});
+    const tok: [16]u8 = .{0} ** 16;
+    _ = conn.cidPoolReserve(cid, tok);
+    try std.testing.expectEqual(@as(u64, 2), conn.localCidCount());
 }
