@@ -510,106 +510,97 @@ pub fn build1RttPacketFull(
     return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
-/// Decrypt a 1-RTT packet, selecting AES or ChaCha20 based on the cipher flag.
-/// Decrypt a 1-RTT packet with proper packet number decompression
-/// expected_recv_pn: the last received packet number in this packet number space (null if first packet)
-/// Returns both plaintext length and the decompressed packet number.
+/// Decrypt a 1-RTT short-header packet with full packet-number
+/// reconstruction (RFC 9000 §17.1) under the connection's negotiated AEAD
+/// (RFC 9001 §5.1, §5.3).  `cipher` selects across the full §5.3 matrix:
+///
+///   - `.aes128_gcm`        → AES-128-GCM + AES-128-ECB header protection
+///   - `.aes256_gcm`        → AES-256-GCM + AES-256-ECB header protection
+///   - `.chacha20_poly1305` → ChaCha20-Poly1305 + ChaCha20-based HP
+///
+/// Forwards to `unprotectLongHeaderPacket`, which already handles all three
+/// suites and keys off the header high bit to pick the long/short HP
+/// first-byte mask — correct for short headers despite the name.  Prior to
+/// this change the function took a `chacha20: bool` and ran the AES branch
+/// (hard-coded AES-128) for anything not flagged ChaCha20, so an AES-256
+/// connection silently decrypted 1-RTT under AES-128 keys (the inbound
+/// twin of the bug #157 closed on the send side).
+///
+/// `expected_recv_pn` is the largest packet number previously received in
+/// the application packet-number space, or `null` for the very first
+/// packet.  Used to disambiguate the truncated wire PN.
 fn unprotect1RttPacketWithPnTracking(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
     km: *const KeyMaterial,
-    chacha20: bool,
+    cipher: PacketCipher,
     expected_recv_pn: ?u64,
 ) !struct { pt_len: usize, pn: u64 } {
-    // Compute HP mask once — reused for both first-byte and PN field unmasking.
-    const mask = computeHpMask(buf, pn_start, km, chacha20) orelse return error.BufferTooShort;
-    const first_byte_mask: u8 = 0x1f; // short header: protect low 5 bits
-
-    // Unmask first byte to discover actual PN length (1–4 bytes).
-    const actual_pn_len: usize = ((buf[0] ^ (mask[0] & first_byte_mask)) & 0x03) + 1;
-    const aad_end = pn_start + actual_pn_len;
-
-    // Build a small mutable AAD buffer containing only the header bytes that
-    // need unmasking.  Maximum size: 1 (first byte) + 20 (max DCID) + 4 (max PN) = 25.
-    // This replaces the previous 1600-byte full-packet copy.
-    var aad_buf: [32]u8 = undefined;
-    if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
-    @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
-
-    // Remove header protection from the local copy.
-    aad_buf[0] ^= mask[0] & first_byte_mask;
-    for (aad_buf[pn_start..aad_end], 1..) |*b, i| {
-        b.* ^= mask[i];
-    }
-
-    // Decode truncated packet number from the unmasked bytes.
-    var truncated_pn: u64 = 0;
-    for (aad_buf[pn_start..aad_end]) |b| {
-        truncated_pn = (truncated_pn << 8) | b;
-    }
-
-    // Decompress full packet number relative to the last received PN.
-    const pn_len_bits: u3 = @intCast(actual_pn_len - 1);
-    const pn = initial_mod.decompressPacketNumber(truncated_pn, expected_recv_pn, pn_len_bits);
-
-    // Decrypt: ciphertext is read directly from the receive buffer — no copy.
-    const nonce = aead_mod.buildNonce(km.iv, pn);
-    const ciphertext = buf[aad_end..];
-    if (ciphertext.len < 16) return error.BufferTooShort;
-    const plaintext_len = ciphertext.len - 16;
-    if (dst.len < plaintext_len) return error.BufferTooSmall;
-
-    const aad = aad_buf[0..aad_end];
-    if (chacha20) {
-        try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
-    } else {
-        try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
-    }
-    return .{ .pt_len = plaintext_len, .pn = pn };
+    const r = try initial_mod.unprotectLongHeaderPacket(
+        dst,
+        buf,
+        pn_start,
+        buf.len,
+        km,
+        expected_recv_pn,
+        cipher,
+    );
+    return .{ .pt_len = r.pt_len, .pn = r.pn };
 }
 
+/// Decrypt a 1-RTT packet without expected-PN tracking.  Thin wrapper used
+/// by tests and raw decode helpers; production receive paths must use
+/// `unprotect1RttPacketWithPnTracking` so the truncated wire PN is
+/// reconstructed against the largest previously received PN.
 pub fn unprotect1RttPacket(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
     km: *const KeyMaterial,
-    chacha20: bool,
+    cipher: PacketCipher,
 ) !usize {
-    if (chacha20) {
-        return initial_mod.unprotectPacketChaCha20(dst, buf, pn_start, buf.len, km);
-    }
-    // No expected-PN tracking on this thin wrapper (test/helper path).
-    const r = try initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km, null);
+    const r = try initial_mod.unprotectLongHeaderPacket(dst, buf, pn_start, buf.len, km, null, cipher);
     return r.pt_len;
 }
 
-/// Compute the 16-byte header-protection mask for a 1-RTT short-header packet.
-/// Encapsulates the AES-128 / ChaCha20 choice so callers only call this once.
-/// Returns null when `buf` is too short to contain the HP sample.
-fn computeHpMask(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?[16]u8 {
+/// Compute the 16-byte header-protection mask for a 1-RTT short-header
+/// packet under the negotiated AEAD (RFC 9001 §5.4).  Returns null when
+/// `buf` is too short to contain the HP sample.
+fn computeHpMask(buf: []const u8, pn_start: usize, km: *const KeyMaterial, cipher: PacketCipher) ?[16]u8 {
     const sample_start = pn_start + initial_mod.hp_sample_offset;
     if (buf.len < sample_start + initial_mod.hp_sample_len) return null;
     var sample: [initial_mod.hp_sample_len]u8 = undefined;
     @memcpy(&sample, buf[sample_start .. sample_start + initial_mod.hp_sample_len]);
     var mask: [16]u8 = undefined;
-    if (chacha20) {
-        const counter = std.mem.readInt(u32, sample[0..4], .little);
-        const cc_nonce = sample[4..16].*;
-        var full_mask: [64]u8 = undefined;
-        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-        @memcpy(&mask, full_mask[0..16]);
-    } else {
-        mask = km.hp_ctx.hpMask(sample);
+    switch (cipher) {
+        // The cached AES context is keyed from `km.hp` (16 bytes) at
+        // `initCachedContexts` time, so it's correct for AES-128.  For
+        // AES-256 we run a one-shot AES-256-ECB block over the sample
+        // using `km.hp32` (32 bytes) — `tls_hs.deriveQuicKeys` populates
+        // both slots unconditionally so the 32-byte key is always present.
+        .aes128_gcm => mask = km.hp_ctx.hpMask(sample),
+        .aes256_gcm => {
+            var cipher_ctx = std.crypto.core.aes.Aes256.initEnc(km.hp32);
+            cipher_ctx.encrypt(&mask, &sample);
+        },
+        .chacha20_poly1305 => {
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const cc_nonce = sample[4..16].*;
+            var full_mask: [64]u8 = undefined;
+            std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+            @memcpy(&mask, full_mask[0..16]);
+        },
     }
     return mask;
 }
 
-/// Return the unprotected first byte of a 1-RTT short-header packet.
-/// Removes AES-128 header protection to reveal the Key Phase bit (0x04).
-/// Returns null if the packet is too short to sample.
-fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?u8 {
-    const mask = computeHpMask(buf, pn_start, km, chacha20) orelse return null;
+/// Return the unprotected first byte of a 1-RTT short-header packet under
+/// the negotiated AEAD's header-protection scheme.  Used to read the Key
+/// Phase bit (0x04) before committing to a full decrypt.  Returns null if
+/// the packet is too short to sample.
+fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMaterial, cipher: PacketCipher) ?u8 {
+    const mask = computeHpMask(buf, pn_start, km, cipher) orelse return null;
     return buf[0] ^ (mask[0] & 0x1f); // short header: mask the low 5 bits
 }
 
@@ -1263,9 +1254,12 @@ pub const ConnState = struct {
 
     // AEAD for Handshake / 0-RTT / 1-RTT (Initial always AES-128-GCM).
     packet_cipher: PacketCipher = .aes128_gcm,
-    // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
+    // Mirror of `packet_cipher == .chacha20_poly1305`.  Kept around for the
+    // remaining 1-RTT *send-side* callers (which still take `chacha20: bool`)
+    // and the debug log in `processLongHeaderPacket`.  Receive-side paths
+    // now read `packet_cipher` directly so the full §5.3 AEAD matrix
+    // (incl. AES-256) is honored on inbound packets.
     use_chacha20: bool = false,
-
     // QUIC version in use for this connection (true = QUIC v2 / RFC 9369).
     // Controls initial-secret derivation, long-header type bits, and Retry tag.
     use_v2: bool = false,
@@ -3200,7 +3194,7 @@ pub const Server = struct {
 
                 // Detect peer-initiated key update via the UNPROTECTED key phase bit.
                 // Must remove HP first before reading bit 2 (RFC 9001 §5.4.1).
-                const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.use_chacha20) orelse continue;
+                const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.packet_cipher) orelse continue;
                 const incoming_phase = (unprotected_first & 0x04) != 0;
 
                 // Try current recv keys first. Only use next key generation when the
@@ -3215,7 +3209,7 @@ pub const Server = struct {
                         buf,
                         pn_start,
                         &conn.app_client_km,
-                        conn.use_chacha20,
+                        conn.packet_cipher,
                         conn.app_recv_pn,
                     )) |r| {
                         srv_decrypted_pn = r.pn;
@@ -3228,7 +3222,7 @@ pub const Server = struct {
                             buf,
                             pn_start,
                             &nk,
-                            conn.use_chacha20,
+                            conn.packet_cipher,
                             conn.app_recv_pn,
                         )) |r| {
                             conn.app_client_km = nk;
@@ -6651,7 +6645,7 @@ pub const Client = struct {
         // Detect key phase flip from server using the UNPROTECTED header byte.
         // The Key Phase bit (0x04) is masked by header protection, so we must
         // remove HP first before reading it (RFC 9001 §5.4.1).
-        const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.use_chacha20) orelse {
+        const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.packet_cipher) orelse {
             if (buf.len == 834) {
                 dbg("io: client 834-byte packet FAILED peekUnprotectedFirstByte!\n", .{});
             }
@@ -6694,7 +6688,7 @@ pub const Client = struct {
             buf,
             pn_start,
             &self.conn.app_server_km,
-            self.conn.use_chacha20,
+            self.conn.packet_cipher,
             self.conn.app_recv_pn,
         ) catch |err| {
             if (buf.len == 834) {
@@ -8225,4 +8219,45 @@ test "build1RttPacketFull: cipher param actually selects the AEAD (regression fo
     try std.testing.expect(!std.mem.eql(u8, buf_aes128[0..n_aes128], buf_aes256[0..n_aes256]));
     try std.testing.expect(!std.mem.eql(u8, buf_aes128[0..n_aes128], buf_chacha[0..n_chacha]));
     try std.testing.expect(!std.mem.eql(u8, buf_aes256[0..n_aes256], buf_chacha[0..n_chacha]));
+}
+
+test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 round-trip)" {
+    // Pre-fix, the receive wrapper took `chacha20: bool` and routed AES-256
+    // connections through the AES-128 keying path — the inbound twin of the
+    // send-side bug closed by #157.  This test exercises the full §5.3
+    // matrix via a 1-RTT round-trip: build under each cipher, decrypt via
+    // the receive wrapper with the same cipher, assert plaintext recovery.
+
+    var km: KeyMaterial = .{};
+    km.secret = [_]u8{0xA5} ** 32;
+    km.expand();
+
+    const dcid = try ConnectionId.fromSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    const plaintext = [_]u8{0x42} ** 32;
+    const pn: u64 = 7;
+
+    inline for (.{ initial_mod.PacketCipher.aes128_gcm, initial_mod.PacketCipher.aes256_gcm, initial_mod.PacketCipher.chacha20_poly1305 }) |cipher| {
+        var send_buf: [256]u8 = undefined;
+        const n = try initial_mod.protectLongHeaderPacket(
+            &send_buf,
+            blk: {
+                // Build the short header inline to mirror build1RttPacketFull.
+                var hdr: [64]u8 = undefined;
+                hdr[0] = 0x40;
+                @memcpy(hdr[1 .. 1 + dcid.len], dcid.slice());
+                break :blk hdr[0 .. 1 + dcid.len];
+            },
+            pn,
+            0, // pn_len wire = 0 → 1 byte
+            &plaintext,
+            &km,
+            cipher,
+        );
+
+        var recv_buf: [256]u8 = undefined;
+        const pn_start: usize = 1 + dcid.len;
+        const r = try unprotect1RttPacketWithPnTracking(&recv_buf, send_buf[0..n], pn_start, &km, cipher, null);
+        try std.testing.expectEqual(@as(u64, pn), r.pn);
+        try std.testing.expectEqualSlices(u8, &plaintext, recv_buf[0..r.pt_len]);
+    }
 }
