@@ -37,16 +37,16 @@ These must be green before relying on zquic as the libp2p QUIC transport.
 
 ## P1 — next after P0
 
-- [ ] **DPLPMTUD** (RFC 8899) — probe size, PLPMTU state, PMTUD black-hole recovery.
-- [ ] **Preferred address emit** — advertise TP 0x0d when server has a stable
+- [x] **DPLPMTUD** (RFC 8899) — probe size, PLPMTU state, PMTUD black-hole recovery.
+- [x] **Preferred address emit** — advertise TP 0x0d when server has a stable
   preferred path (symmetric with #156 receive path).
-- [ ] **Automatic key update** — initiate on packet/time threshold (today:
+- [x] **Automatic key update** — initiate on packet/time threshold (today:
   peer-initiated + manual client trigger only).
-- [ ] **0-RTT non-AES-128** — derive early keys for ChaCha20 / AES-256 from
+- [x] **0-RTT non-AES-128** — derive early keys for ChaCha20 / AES-256 from
   stored ticket cipher suite.
-- [ ] **ECN beyond 1-RTT** — ECT marking on Initial / Handshake sends; validate
+- [x] **ECN beyond 1-RTT** — ECT marking on Initial / Handshake sends; validate
   against quinn interop ECN test.
-- [ ] **Wire `MigrationManager`** — centralize path validation, anti-amp, and
+- [x] **Wire `MigrationManager`** — centralize path validation, anti-amp, and
   preferred-address policy instead of scattered checks in `io.zig`.
 
 ## P2 — later

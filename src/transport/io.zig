@@ -40,8 +40,12 @@ const recovery = @import("../loss/recovery.zig");
 const build_options = @import("build_options");
 const batch_io = @import("batch_io.zig");
 const path_mtu_mod = @import("path_mtu.zig");
+const migration_mod = @import("migration.zig");
 const raw_app_stream = @import("raw_app_stream.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
+
+/// Locally-initiate a key update after this many 1-RTT packets (RFC 9001 §6).
+const auto_key_update_packet_threshold: u64 = 1_000_000;
 
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
 /// in production builds all calls are removed by the optimizer with zero overhead.
@@ -522,6 +526,29 @@ fn pad1RttPayload(payload: []const u8, pad_buf: []u8) []const u8 {
     return pad_buf[0..min_len];
 }
 
+fn keyMaterialFromEarlyKeys(cets: [32]u8, early: session_mod.EarlyDataKeys) KeyMaterial {
+    var km = KeyMaterial{ .secret = cets };
+    @memcpy(km.key[0..16], early.key[0..16]);
+    @memcpy(km.key32[0..32], early.key[0..32]);
+    km.iv = early.iv;
+    @memcpy(km.hp[0..16], early.hp[0..16]);
+    @memcpy(km.hp32[0..32], early.hp[0..32]);
+    km.initCachedContexts();
+    return km;
+}
+
+fn migrationPreferredFromTp(pa: quic_tls_mod.PreferredAddressTp) migration_mod.PreferredAddress {
+    return .{
+        .ipv4 = pa.ipv4,
+        .ipv4_port = pa.ipv4_port,
+        .ipv6 = pa.ipv6,
+        .ipv6_port = pa.ipv6_port,
+        .connection_id = pa.connection_id,
+        .connection_id_len = pa.connection_id_len,
+        .stateless_reset_token = pa.stateless_reset_token,
+    };
+}
+
 /// Result of decrypting a 1-RTT packet with PN reconstruction.
 const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
 
@@ -982,6 +1009,8 @@ pub const ConnState = struct {
     max_udp_payload: u16 = default_conn_path_mtu.max_udp_payload,
     /// Largest HTTP/0.9 or HTTP/3 file read per STREAM frame (from `max_udp_payload`).
     app_stream_chunk: usize = default_conn_path_mtu.app_stream_chunk,
+    /// RFC 8899 PLPMTUD state for this path.
+    plpmtu: path_mtu_mod.PlPmtuState = path_mtu_mod.PlPmtuState.init(default_conn_path_mtu.max_udp_payload),
 
     // Initial packet keys (derived from DCID)
     init_keys: ?InitialSecrets = null,
@@ -1125,9 +1154,8 @@ pub const ConnState = struct {
     // Used to detect peer confirmation via ACK + Key Phase observation.
     key_update_init_pn: ?u64 = null,
 
-    // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
-    // Non-null while waiting for a PATH_RESPONSE from the new address.
-    path_challenge_data: ?[8]u8 = null,
+    /// Path validation, anti-amplification, and preferred-address policy.
+    migration: migration_mod.MigrationManager = .{},
 
     // ── Stream limit enforcement (RFC 9000 §4.6) ──────────────────────────────
     // The server advertises initial_max_streams_bidi=1000 and
@@ -1183,10 +1211,8 @@ pub const ConnState = struct {
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
     // completed), the server MUST NOT send more than 3× the bytes received.
-    // These counters track raw UDP payload bytes exchanged during the handshake.
-    // Once address_validated is set, the limit no longer applies.
-    anti_amp_bytes_recv: u64 = 0,
-    anti_amp_bytes_sent: u64 = 0,
+    // Byte accounting lives in `migration.anti_amp`. Once address_validated is
+    // set, the limit no longer applies.
     address_validated: bool = false,
     // Set when a pre-validation send was blocked by the 3× rule; cleared
     // (and the pending flight retried) once more client bytes arrive.
@@ -1274,6 +1300,8 @@ pub const ConnState = struct {
     // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
     early_km: KeyMaterial = undefined,
     has_early_keys: bool = false,
+    /// AEAD for inbound 0-RTT (may differ from handshake/1-RTT cipher).
+    early_packet_cipher: PacketCipher = .aes128_gcm,
 
     // AEAD for Handshake / 0-RTT / 1-RTT (Initial always AES-128-GCM).
     packet_cipher: PacketCipher = .aes128_gcm,
@@ -1287,12 +1315,16 @@ pub const ConnState = struct {
     // Controls initial-secret derivation, long-header type bits, and Retry tag.
     use_v2: bool = false,
 
-    // ECN counters for received 1-RTT packets (RFC 9000 §13.4).
+    // ECN counters for received packets (RFC 9000 §13.4).
     // We mark all outgoing packets ECT(0); these counts track what was received
     // so that ACK-ECN frames (type 0x03) report accurate ECN feedback to the peer.
+    init_ecn_ect0_recv: u64 = 0,
+    hs_ecn_ect0_recv: u64 = 0,
     ecn_ect0_recv: u64 = 0,
     ecn_ect1_recv: u64 = 0,
     ecn_ce_recv: u64 = 0,
+    /// 1-RTT packets sent since the last locally-initiated key update.
+    packets_since_key_update: u64 = 0,
 
     // Peer-reported ECN counters from ACK frames carrying ECN feedback
     // (RFC 9002 §B.4 / RFC 9000 §13.4).  When `peer_ecn_ce` increases for a
@@ -1382,6 +1414,17 @@ pub const ConnState = struct {
     /// (`max_ack_delay`, `ack_delay_exponent`), and CID-pool sizing are
     /// applied in follow-ups so each gap from issue #138 lands as its own
     /// reviewable diff.
+    /// Sync `max_udp_payload` / `app_stream_chunk` from `plpmtu`.
+    pub fn syncPathMtuFields(self: *ConnState) void {
+        self.max_udp_payload = self.plpmtu.effectiveMtu();
+        self.app_stream_chunk = self.plpmtu.appStreamChunk();
+    }
+
+    /// Record one sent 1-RTT packet for automatic key-update thresholding.
+    pub fn note1RttSent(self: *ConnState) void {
+        self.packets_since_key_update += 1;
+    }
+
     pub fn applyPeerTransportParams(self: *ConnState, qtp: []const u8) void {
         if (qtp.len == 0) return;
         const parsed = quic_tls_mod.parseTransportParams(qtp) catch |err| {
@@ -1403,8 +1446,13 @@ pub const ConnState = struct {
         if (parsed.active_connection_id_limit > 0) {
             self.peer_active_cid_limit = parsed.active_connection_id_limit;
         }
+        if (parsed.max_udp_payload_size > 0) {
+            self.plpmtu.applyPeerMax(parsed.max_udp_payload_size);
+            self.syncPathMtuFields();
+        }
         if (parsed.preferred_address) |pa| {
             self.peer_preferred_address = pa;
+            self.migration.setPreferredAddress(migrationPreferredFromTp(pa));
             dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
         }
     }
@@ -1469,8 +1517,7 @@ pub const ConnState = struct {
     /// unvalidated address without exceeding the 3× amplification limit?
     pub fn canSendAntiAmp(self: *const ConnState, pkt_len: usize) bool {
         if (self.address_validated) return true;
-        if (self.anti_amp_bytes_recv == 0) return false;
-        return self.anti_amp_bytes_sent + @as(u64, @intCast(pkt_len)) <= self.anti_amp_bytes_recv * 3;
+        return self.migration.anti_amp.canSend(pkt_len);
     }
 
     /// Count of unretired local CIDs we have advertised (seq 0 + pool).
@@ -1682,6 +1729,7 @@ fn clientSend1RttImmediate(
         conn.packet_cipher,
     ) catch return;
     conn.app_pn += 1;
+    conn.note1RttSent();
     _ = compat.sendto(sock, send_buf[0..pkt_len], 0, &conn.peer.any, conn.peer.getOsSockLen()) catch {};
 }
 
@@ -1731,6 +1779,8 @@ pub const ServerConfig = struct {
     request_client_certificate: bool = false,
     /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
     max_udp_payload: ?u16 = null,
+    /// Optional preferred address to advertise in transport parameters (TP 0x0d).
+    preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
 };
 
 /// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
@@ -1925,6 +1975,8 @@ pub const Server = struct {
     /// Run loss recovery, flush pending HTTP responses, and reap idle connections — same work as an idle `run()` iteration without reading the socket.
     pub fn processPendingWork(self: *Server) void {
         self.checkPto();
+        self.maybeSendPlpmtuProbes();
+        self.maybeAutoKeyUpdates();
         self.flushPendingHttp09Responses();
         self.http09RetransmitPendingFins();
         self.flushPendingHttp3Responses();
@@ -2322,6 +2374,7 @@ pub const Server = struct {
                 const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
                 conn.max_udp_payload = pm.max_udp_payload;
                 conn.app_stream_chunk = pm.app_stream_chunk;
+                conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
                 if (self.config.cubic) {
                     conn.cc = congestion.CongestionController.init(.cubic);
                 }
@@ -2399,7 +2452,7 @@ pub const Server = struct {
         }
 
         // Anti-amplification (RFC 9000 §8.1): track received bytes.
-        conn.anti_amp_bytes_recv += buf.len;
+        conn.migration.anti_amp.onRecv(buf.len);
         // If Retry was accepted, the address is already validated.
         if (verified_odcid != null) conn.address_validated = true;
         self.tryFlushDeferredServerSend(conn, src);
@@ -2425,6 +2478,7 @@ pub const Server = struct {
             return;
         };
         const pt_len = dec.pt_len;
+        conn.init_ecn_ect0_recv += 1;
 
         // Compatible version negotiation (RFC 9368): if the server is configured
         // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
@@ -2511,7 +2565,7 @@ pub const Server = struct {
             payload_end,
             &conn.early_km,
             conn.zerortt_recv_pn,
-            conn.packet_cipher,
+            conn.early_packet_cipher,
         ) catch |err| {
             dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
@@ -2758,16 +2812,9 @@ pub const Server = struct {
                 var psk: [32]u8 = .{0} ** 32;
                 @memcpy(&psk, conn.tls.ch.psk_identity[0..32]);
                 const cets = session_mod.deriveEarlyTrafficSecret(psk, conn.tls.ch_hash);
-                const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                conn.early_km = KeyMaterial{
-                    .secret = cets,
-                    .key = early_keys.key,
-                    .key32 = .{0} ** 32,
-                    .iv = early_keys.iv,
-                    .hp = early_keys.hp,
-                    .hp32 = .{0} ** 32,
-                };
-                conn.early_km.initCachedContexts();
+                const early_keys = session_mod.deriveEarlyKeysFromSecret(cets, conn.tls.ch.cipher_suite);
+                conn.early_km = keyMaterialFromEarlyKeys(cets, early_keys);
+                conn.early_packet_cipher = packetCipherFromTls(conn.tls.ch.cipher_suite);
                 conn.has_early_keys = true;
                 dbg("io: server derived 0-RTT early keys\n", .{});
             }
@@ -2856,6 +2903,7 @@ pub const Server = struct {
             // server doesn't actively migrate, the param is omitted (we
             // still accept incoming migration if the peer initiates).
             .max_udp_payload_size = conn.max_udp_payload,
+            .preferred_address = self.config.preferred_address,
         }) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
@@ -2931,7 +2979,7 @@ pub const Server = struct {
             }
             const init_pn_sent = conn.init_pn;
             conn.init_pn += 1;
-            conn.anti_amp_bytes_sent += pkt_len;
+            conn.migration.anti_amp.onSent(pkt_len);
             coalesced_len = pkt_len;
             conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
         }
@@ -2972,7 +3020,7 @@ pub const Server = struct {
                 }
                 conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
                 conn.hs_pn += 1;
-                conn.anti_amp_bytes_sent += pkt_len;
+                conn.migration.anti_amp.onSent(pkt_len);
                 coalesced_len += pkt_len;
                 offset += chunk_len;
             }
@@ -3058,7 +3106,7 @@ pub const Server = struct {
 
         const init_pn_sent = conn.init_pn;
         conn.init_pn += 1;
-        conn.anti_amp_bytes_sent += pkt_len;
+        conn.migration.anti_amp.onSent(pkt_len);
         conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
         conn.init_resend.store(send_buf[0..pkt_len]);
@@ -3116,7 +3164,7 @@ pub const Server = struct {
             }
 
             conn.hs_pn += 1;
-            conn.anti_amp_bytes_sent += pkt_len;
+            conn.migration.anti_amp.onSent(pkt_len);
             conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
@@ -3150,7 +3198,7 @@ pub const Server = struct {
         if (!conn.has_hs_keys) return;
 
         // Anti-amplification: track Handshake bytes received (RFC 9000 §8.1).
-        conn.anti_amp_bytes_recv += buf.len;
+        conn.migration.anti_amp.onRecv(buf.len);
         self.tryFlushDeferredServerSend(conn, src);
 
         // If already connected, the client may be retransmitting its Finished because
@@ -3185,6 +3233,7 @@ pub const Server = struct {
             conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
+        conn.hs_ecn_ect0_recv += 1;
         if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
             conn.hs_recv_pn = dec.pn;
 
@@ -3244,6 +3293,7 @@ pub const Server = struct {
         conn.phase = .connected;
         // Handshake complete → peer address is validated (RFC 9000 §8.1).
         conn.address_validated = true;
+        conn.migration.trustActivePath();
 
         const pending_n = conn.pending_1rtt_n;
         conn.pending_1rtt_n = 0;
@@ -3273,7 +3323,10 @@ pub const Server = struct {
 
         var send_buf: [256]u8 = undefined;
         var frames_buf: [64]u8 = undefined;
-        const ack_len = buildAckFrame(&frames_buf, pn, 0) catch return;
+        const ack_len = if (conn.hs_ecn_ect0_recv > 0)
+            buildAckEcnFrame(&frames_buf, pn, 0, conn.hs_ecn_ect0_recv, 0, 0) catch return
+        else
+            buildAckFrame(&frames_buf, pn, 0) catch return;
 
         const hs_pn_sent = conn.hs_pn;
         const pkt_len = buildHandshakePacket(
@@ -3509,17 +3562,16 @@ pub const Server = struct {
         //   1. Eagerly update conn.peer so HTTP responses go to the new path immediately.
         //   2. Send PATH_CHALLENGE so the interop runner can verify we validated the path.
         //
-        // We intentionally do NOT guard on path_challenge_data == null.  If a previous
+        // We intentionally do NOT guard on pending_challenge == null.  If a previous
         // challenge is still in flight (PATH_RESPONSE not yet received) when the next
         // rebind fires, we overwrite it with a fresh challenge for the new address.
-        // This keeps data flowing: guarding on path_challenge_data == null would leave
+        // This keeps data flowing: guarding on pending_challenge == null would leave
         // conn.peer pointing at the OLD (now-dead) port for the duration of the second
         // rebind, causing a download stall and eventual 60 s timeout.
         if (!addressEqual(conn.peer, src)) {
             var challenge: [8]u8 = undefined;
             compat.random.bytes(&challenge);
-            // Overwrite any pending challenge — a fresh one is needed for the new path.
-            conn.path_challenge_data = challenge;
+            conn.migration.notePathChallenge(challenge);
             // Eagerly update peer so all subsequent sends reach the new address.
             conn.peer = src;
             self.sendPathChallenge(conn, challenge, src);
@@ -3654,6 +3706,12 @@ pub const Server = struct {
                 if (ld_result.bytes_acked > 0) {
                     conn.cc.onAck(ld_result.bytes_acked);
                 }
+                if (conn.plpmtu.probe_pn) |probe_pn| {
+                    if (largest_ack >= probe_pn) {
+                        conn.plpmtu.onProbeAcked(probe_pn);
+                        conn.syncPathMtuFields();
+                    }
+                }
                 // Remove lost-packet bytes from bytes_in_flight (RFC 9002 §7.5:
                 // lost packets are no longer "in flight").
                 if (ld_result.lost_bytes > 0) {
@@ -3686,6 +3744,12 @@ pub const Server = struct {
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
                     const lp = lost_buf[li];
+                    if (conn.plpmtu.probing) {
+                        if (conn.plpmtu.probe_pn == lp.pn) {
+                            conn.plpmtu.onProbeLost();
+                            conn.syncPathMtuFields();
+                        }
+                    }
                     conn.cc.onLoss(lp.pn);
                     // Retransmit: if the lost packet carried stream data, rewind
                     // the corresponding slot so the data is re-sent.
@@ -3915,13 +3979,9 @@ pub const Server = struct {
                 // PATH_RESPONSE — validate against pending challenge.
                 const pr = transport_frames.PathResponse.parse(frames[pos..]) catch return;
                 pos += pr.consumed;
-                if (conn.path_challenge_data) |expected| {
-                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
-                        // Path validated — migrate to the new address.
-                        conn.peer = src;
-                        conn.path_challenge_data = null;
-                        dbg("io: connection migrated to new address\n", .{});
-                    }
+                if (conn.migration.handlePathResponse(pr.frame.data)) {
+                    conn.peer = src;
+                    dbg("io: connection migrated to new address\n", .{});
                 }
                 continue;
             }
@@ -4094,6 +4154,7 @@ pub const Server = struct {
             return;
         };
         conn.app_pn += 1;
+        conn.note1RttSent();
         conn.qlog.packetSent(.one_rtt, conn.app_pn - 1, pkt_len);
         if (has_fin) {
             dbg("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
@@ -4246,6 +4307,39 @@ pub const Server = struct {
                 }
             }
             if (!progressed) break;
+        }
+    }
+
+    /// RFC 8899: probe a larger UDP payload when PLPMTUD state allows it.
+    fn maybeSendPlpmtuProbes(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
+        var probe_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const overhead: usize = 48;
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (conn.phase != .connected or conn.draining) continue;
+            const probe_size = conn.plpmtu.maybeProbeSize(now_ms) orelse continue;
+            if (probe_size <= overhead) continue;
+            const target_payload = @as(usize, probe_size) - overhead;
+            if (target_payload > probe_buf.len) continue;
+            probe_buf[0] = 0x01;
+            if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
+            const pn = conn.app_pn;
+            conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+            self.send1Rtt(conn, probe_buf[0..target_payload], conn.peer);
+        }
+    }
+
+    /// Initiate a key update when the packet threshold is reached (RFC 9001 §6).
+    fn maybeAutoKeyUpdates(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (conn.phase != .connected or conn.draining) continue;
+            if (conn.packets_since_key_update < auto_key_update_packet_threshold) continue;
+            if (!conn.canInitiateKeyUpdate(now_ms)) continue;
+            self.initiateServerKeyUpdate(conn, conn.peer);
+            conn.packets_since_key_update = 0;
         }
     }
 
@@ -5578,6 +5672,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
         conn.max_udp_payload = pm.max_udp_payload;
         conn.app_stream_chunk = pm.app_stream_chunk;
+        conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             // Pre-derive v2 keys so processInitialPacket can detect and handle
@@ -5655,6 +5750,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
         conn.max_udp_payload = pm.max_udp_payload;
         conn.app_stream_chunk = pm.app_stream_chunk;
+        conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
@@ -5733,6 +5829,8 @@ pub const Client = struct {
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
     pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
         const now = compat.milliTimestamp();
+        self.maybeSendPlpmtuProbe();
+        self.maybeAutoKeyUpdate();
         if (self.conn.phase == .initial and self.initial_pkt_len > 0 and
             now - self.last_initial_retransmit_ms >= 500)
         {
@@ -5887,6 +5985,44 @@ pub const Client = struct {
         }
     }
 
+    /// RFC 8899: probe a larger UDP payload when PLPMTUD state allows it.
+    fn maybeSendPlpmtuProbe(self: *Client) void {
+        if (self.conn.phase != .connected or self.conn.draining) return;
+        const now_ms = compat.milliTimestamp();
+        const probe_size = self.conn.plpmtu.maybeProbeSize(now_ms) orelse return;
+        const overhead: usize = 48;
+        if (probe_size <= overhead) return;
+        const target_payload = @as(usize, probe_size) - overhead;
+        var probe_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        if (target_payload > probe_buf.len) return;
+        probe_buf[0] = 0x01;
+        if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
+        const pn = self.conn.app_pn;
+        self.conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            probe_buf[0..target_payload],
+            pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return;
+        self.conn.app_pn += 1;
+        self.conn.note1RttSent();
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+    }
+
+    fn maybeAutoKeyUpdate(self: *Client) void {
+        if (self.conn.phase != .connected or self.conn.draining) return;
+        const now_ms = compat.milliTimestamp();
+        if (self.conn.packets_since_key_update < auto_key_update_packet_threshold) return;
+        if (!self.conn.canInitiateKeyUpdate(now_ms)) return;
+        self.initiateClientKeyUpdate();
+        self.conn.packets_since_key_update = 0;
+    }
+
     /// Probe Timeout (PTO) handler (RFC 9002 §6.2) — client side.
     ///
     /// Mirrors `Server.checkPto`, but operates on the single `self.conn`
@@ -5929,6 +6065,7 @@ pub const Client = struct {
             ) catch return;
             const pn = self.conn.app_pn;
             self.conn.app_pn += 1;
+            self.conn.note1RttSent();
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return;
             self.conn.last_pto_ms = now_ms;
             self.conn.pto_count +|= 1;
@@ -6067,6 +6204,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
         self.conn.max_udp_payload = pm.max_udp_payload;
         self.conn.app_stream_chunk = pm.app_stream_chunk;
+        self.conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         self.conn.init_keys = InitialSecrets.derive(dcid.slice());
 
         // Fresh TLS handshake state.
@@ -6319,11 +6457,7 @@ pub const Client = struct {
                 // any other suite cannot be used as 0-RTT; fall through to
                 // 1-RTT resumption instead of silently sending packets the
                 // server can't decrypt.
-                if (self.ticket_store.get(now_ms)) |ticket| ed_inner: {
-                    if (ticket.cipher_suite != tls_hs.TLS_AES_128_GCM_SHA256) {
-                        dbg("io: 0-RTT skipped — ticket cipher 0x{x:0>4} not supported (only AES-128-GCM-SHA256 today)\n", .{ticket.cipher_suite});
-                        break :ed_inner;
-                    }
+                if (self.ticket_store.get(now_ms)) |ticket| {
                     var psk_bytes: [32]u8 = .{0} ** 32;
                     @memcpy(&psk_bytes, ticket.resumption_secret[0..@min(ticket.resumption_secret_len, 32)]);
                     const psk_info = tls_hs.PskInfo{
@@ -6343,17 +6477,8 @@ pub const Client = struct {
                     const ch_hash = tls_hs.peekHash(self.tls.transcript);
                     var cets: [32]u8 = undefined;
                     keys_mod.hkdfExpandLabel(&cets, &result.early_secret, "c e traffic", &ch_hash);
-                    const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                    var ekm = KeyMaterial{
-                        .secret = cets,
-                        .key = early_keys.key,
-                        .key32 = .{0} ** 32,
-                        .iv = early_keys.iv,
-                        .hp = early_keys.hp,
-                        .hp32 = .{0} ** 32,
-                    };
-                    ekm.initCachedContexts();
-                    self.early_km = ekm;
+                    const early_keys = session_mod.deriveEarlyKeysFromSecret(cets, ticket.cipher_suite);
+                    self.early_km = keyMaterialFromEarlyKeys(cets, early_keys);
                     // Remember the ticket's cipher so the 0-RTT send path
                     // protects each packet under the correct AEAD instead of
                     // whatever cipher `self.tls.cipher_suite` happens to
@@ -6674,6 +6799,7 @@ pub const Client = struct {
             }
             return; // both v1 and v2 decryption failed
         };
+        self.conn.init_ecn_ect0_recv += 1;
 
         // Extract CRYPTO frames, skipping ACK and PADDING frames.
         var pos: usize = 0;
@@ -6757,6 +6883,7 @@ pub const Client = struct {
             self.conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
+        self.conn.hs_ecn_ect0_recv += 1;
         if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
             self.conn.hs_recv_pn = dec.pn;
 
@@ -6976,6 +7103,12 @@ pub const Client = struct {
                     continue;
                 };
                 if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked);
+                if (self.conn.plpmtu.probe_pn) |probe_pn| {
+                    if (largest_ack >= probe_pn) {
+                        self.conn.plpmtu.onProbeAcked(probe_pn);
+                        self.conn.syncPathMtuFields();
+                    }
+                }
                 if (ld_result.lost_bytes > 0) self.conn.cc.subBytesInFlight(ld_result.lost_bytes);
                 // ECN-CE feedback (RFC 9002 §B.4): mirror of the server arm.
                 if (ft == 0x03) {
@@ -6998,6 +7131,12 @@ pub const Client = struct {
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
                     const lp = lost_buf[li];
+                    if (self.conn.plpmtu.probing) {
+                        if (self.conn.plpmtu.probe_pn == lp.pn) {
+                            self.conn.plpmtu.onProbeLost();
+                            self.conn.syncPathMtuFields();
+                        }
+                    }
                     self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
                         self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
@@ -7048,11 +7187,8 @@ pub const Client = struct {
                 // PATH_RESPONSE — validate pending challenge.
                 const pr = transport_frames.PathResponse.parse(plaintext[pos..]) catch return;
                 pos += pr.consumed;
-                if (self.conn.path_challenge_data) |expected| {
-                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
-                        self.conn.path_challenge_data = null;
-                        dbg("io: client path validated\n", .{});
-                    }
+                if (self.conn.migration.handlePathResponse(pr.frame.data)) {
+                    dbg("io: client path validated\n", .{});
                 }
                 continue;
             }
@@ -7287,6 +7423,7 @@ pub const Client = struct {
             self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
+        self.conn.note1RttSent();
         _ = compat.sendto(
             self.sock,
             send_buf[0..pkt_len],
@@ -8528,14 +8665,14 @@ test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 r
 
 test "canSendAntiAmp: 3× rule before address validation" {
     var conn = makeConnForStreamTest();
-    conn.anti_amp_bytes_recv = 100;
-    conn.anti_amp_bytes_sent = 250;
+    conn.migration.anti_amp.bytes_recv = 100;
+    conn.migration.anti_amp.bytes_sent = 250;
     try std.testing.expect(conn.canSendAntiAmp(50)); // 250+50 = 300 = 3×100
     try std.testing.expect(!conn.canSendAntiAmp(51)); // would exceed
     conn.address_validated = true;
     try std.testing.expect(conn.canSendAntiAmp(10_000)); // no limit after validation
     conn.address_validated = false;
-    conn.anti_amp_bytes_recv = 0;
+    conn.migration.anti_amp.bytes_recv = 0;
     try std.testing.expect(!conn.canSendAntiAmp(1)); // can't send until recv > 0
 }
 

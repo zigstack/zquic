@@ -141,6 +141,9 @@ pub const TransportParamsOpts = struct {
     /// example flag), so the default is false — embedders that know they
     /// won't migrate can opt in.
     disable_active_migration: bool = false,
+    /// `preferred_address` (0x0d): server-only; alternate address + CID + reset
+    /// token for active migration (RFC 9000 §9.6 / §18.2).
+    preferred_address: ?PreferredAddressTp = null,
 };
 
 fn writeParamVarint(
@@ -180,6 +183,26 @@ fn writeParamBytes(buf: []u8, pos: usize, id: u64, value: []const u8) (varint.En
     return w_pos;
 }
 
+/// Encode a preferred_address transport parameter body (RFC 9000 §18.2).
+pub fn encodePreferredAddress(pa: PreferredAddressTp, out: []u8) usize {
+    var pos: usize = 0;
+    @memcpy(out[pos .. pos + 4], &pa.ipv4);
+    pos += 4;
+    std.mem.writeInt(u16, out[pos..][0..2], pa.ipv4_port, .big);
+    pos += 2;
+    @memcpy(out[pos .. pos + 16], &pa.ipv6);
+    pos += 16;
+    std.mem.writeInt(u16, out[pos..][0..2], pa.ipv6_port, .big);
+    pos += 2;
+    out[pos] = pa.connection_id_len;
+    pos += 1;
+    @memcpy(out[pos .. pos + pa.connection_id_len], pa.connection_id[0..pa.connection_id_len]);
+    pos += pa.connection_id_len;
+    @memcpy(out[pos .. pos + 16], &pa.stateless_reset_token);
+    pos += 16;
+    return pos;
+}
+
 /// Build QUIC transport parameters for ClientHello or EncryptedExtensions.
 pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.EncodeError || varint.DecodeError)!usize {
     var pos: usize = 0;
@@ -213,6 +236,11 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     // initiate active migration. Only emitted when the caller opts in.
     if (opts.disable_active_migration) {
         pos = try writeParamBytes(out, pos, 0x0c, &[_]u8{});
+    }
+    if (opts.preferred_address) |pa| {
+        var pa_buf: [64]u8 = undefined;
+        const pa_len = encodePreferredAddress(pa, &pa_buf);
+        pos = try writeParamBytes(out, pos, 0x0d, pa_buf[0..pa_len]);
     }
 
     if (opts.original_destination_cid) |odcid| {
@@ -488,6 +516,30 @@ test "transport params: disable_active_migration emitted only when opted in" {
         // 0x0c, length varint 0). The buffer must contain that exact pair.
         try testing.expect(std.mem.indexOf(u8, buf[0..n], &.{ 0x0c, 0x00 }) != null);
     }
+}
+
+test "transport params: preferred_address encode round-trip" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    const pa = PreferredAddressTp{
+        .ipv4 = .{ 192, 0, 2, 1 },
+        .ipv4_port = 4433,
+        .ipv6 = .{0} ** 16,
+        .ipv6_port = 0,
+        .connection_id_len = 8,
+        .connection_id = cid ++ ([_]u8{0} ** 12),
+        .stateless_reset_token = .{0xab} ** 16,
+    };
+    const n = try buildTransportParams(&buf, .{
+        .initial_source_cid = &cid,
+        .preferred_address = pa,
+    });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expect(parsed.preferred_address != null);
+    const got = parsed.preferred_address.?;
+    try testing.expectEqual(@as(u16, 4433), got.ipv4_port);
+    try testing.expectEqual(@as(u8, 8), got.connection_id_len);
 }
 
 test "transport params: preferred_address (0x0d) parses ipv4 + cid + reset token" {
