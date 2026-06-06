@@ -135,8 +135,25 @@ pub fn protectLongHeaderPacket(
     const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
     const first_byte_mask: u8 = if (header[0] & 0x80 != 0) 0x0f else 0x1f;
     switch (cipher) {
-        .aes128_gcm, .aes256_gcm => {
+        // AES-128 HP: cached 16-byte AES context (built from `km.hp` at
+        // `initCachedContexts` time).
+        .aes128_gcm => {
             const mask = km.hp_ctx.hpMask(sample);
+            dst[0] ^= mask[0] & first_byte_mask;
+            for (pn_bytes_slice, 0..) |*b, mi| {
+                b.* ^= mask[1 + mi];
+            }
+        },
+        // AES-256 HP: RFC 9001 §5.4.3 — "Header protection has the same
+        // key length as the packet protection key."  Must use AES-256 over
+        // `km.hp32` (32 bytes), not the 16-byte cached AES-128 context.
+        // Prior to this fix, AES-256-negotiated connections silently
+        // applied HP under AES-128 with the truncated key — a wire-level
+        // bug that would fail to interop with any spec-compliant peer.
+        .aes256_gcm => {
+            const ctx = std.crypto.core.aes.Aes256.initEnc(km.hp32);
+            var mask: [16]u8 = undefined;
+            ctx.encrypt(&mask, &sample);
             dst[0] ^= mask[0] & first_byte_mask;
             for (pn_bytes_slice, 0..) |*b, mi| {
                 b.* ^= mask[1 + mi];
@@ -198,21 +215,31 @@ pub fn unprotectLongHeaderPacket(
     var sample: [hp_sample_len]u8 = undefined;
     @memcpy(&sample, buf[sample_start .. sample_start + hp_sample_len]);
 
-    // Compute HP mask and unmask first byte to discover PN length.
-    const first_byte_mask: u8 = if (buf[0] & 0x80 != 0) 0x0f else 0x1f;
-    const unmasked_first: u8 = switch (cipher) {
-        .aes128_gcm, .aes256_gcm => blk: {
-            const mask = km.hp_ctx.hpMask(sample);
-            break :blk buf[0] ^ (mask[0] & first_byte_mask);
+    // Compute the 16-byte HP mask once up front under the negotiated
+    // cipher (RFC 9001 §5.4).  Pre-fix, the AES-128 and AES-256 arms
+    // both used the 16-byte cached AES-128 context — see the matching
+    // §5.4.3 note in `protectLongHeaderPacket` for the wire-level bug.
+    const hp_mask: [16]u8 = switch (cipher) {
+        .aes128_gcm => km.hp_ctx.hpMask(sample),
+        .aes256_gcm => blk: {
+            const ctx = std.crypto.core.aes.Aes256.initEnc(km.hp32);
+            var m: [16]u8 = undefined;
+            ctx.encrypt(&m, &sample);
+            break :blk m;
         },
         .chacha20_poly1305 => blk: {
             const counter = std.mem.readInt(u32, sample[0..4], .little);
             const cc_nonce = sample[4..16].*;
             var full_mask: [64]u8 = undefined;
             std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-            break :blk buf[0] ^ (full_mask[0] & first_byte_mask);
+            var m: [16]u8 = undefined;
+            @memcpy(&m, full_mask[0..16]);
+            break :blk m;
         },
     };
+
+    const first_byte_mask: u8 = if (buf[0] & 0x80 != 0) 0x0f else 0x1f;
+    const unmasked_first: u8 = buf[0] ^ (hp_mask[0] & first_byte_mask);
     const actual_pn_len: usize = (unmasked_first & 0x03) + 1;
 
     const aad_end = pn_start + actual_pn_len;
@@ -220,24 +247,9 @@ pub fn unprotectLongHeaderPacket(
     if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
     @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
-    switch (cipher) {
-        .aes128_gcm, .aes256_gcm => {
-            const mask = km.hp_ctx.hpMask(sample);
-            aad_buf[0] ^= mask[0] & first_byte_mask;
-            for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
-                b.* ^= mask[mi];
-            }
-        },
-        .chacha20_poly1305 => {
-            const counter = std.mem.readInt(u32, sample[0..4], .little);
-            const cc_nonce = sample[4..16].*;
-            var full_mask: [64]u8 = undefined;
-            std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-            aad_buf[0] ^= full_mask[0] & first_byte_mask;
-            for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
-                b.* ^= full_mask[mi];
-            }
-        },
+    aad_buf[0] ^= hp_mask[0] & first_byte_mask;
+    for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
+        b.* ^= hp_mask[mi];
     }
 
     // Decode the truncated wire PN, then reconstruct the full PN per RFC 9000
@@ -388,6 +400,67 @@ test "initial: AES-256-GCM long-header round-trip" {
         null,
         .aes256_gcm,
     );
+    try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec.pt_len]);
+}
+
+test "initial: AES-256 HP actually uses hp32 (regression for §5.4.3 violation)" {
+    // RFC 9001 §5.4.3: "Header protection has the same key length as the
+    // packet protection key."  Before this fix, both the AES-128 and
+    // AES-256 cipher arms in `protect/unprotectLongHeaderPacket` derived
+    // the HP mask via `km.hp_ctx.hpMask(sample)` — i.e. AES-128 over the
+    // 16-byte `km.hp` field — for both ciphers.  Round-trip tests didn't
+    // catch the divergence because both sides shared the broken impl.
+    //
+    // This test pins the wire format: under .aes256_gcm, the HP mask is
+    // computed as AES-256-ECB(km.hp32, sample) — the same primitive a
+    // spec-compliant peer would apply on decrypt.  We synthesize a
+    // KeyMaterial where `km.hp` (16 bytes) and `km.hp32[0..16]` differ,
+    // encrypt, then manually reproduce the AES-256 HP and verify the
+    // protected first byte matches.
+
+    const testing = std.testing;
+    var km: KeyMaterial = .{ .secret = [_]u8{0x55} ** 32 };
+    km.expand();
+    // Deliberately desync hp vs hp32 so the buggy AES-128(hp) path would
+    // produce a different mask than the correct AES-256(hp32) path.
+    km.hp = [_]u8{0xCC} ** 16;
+    @memset(&km.hp32, 0xAA);
+    km.initCachedContexts();
+
+    const header = [_]u8{ 0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, 0x00, 0x40, 0x10 };
+    const plaintext = "aes256 hp test payload";
+
+    var dst: [512]u8 = undefined;
+    const written = try protectLongHeaderPacket(&dst, &header, 0, 0, plaintext, &km, .aes256_gcm);
+
+    // Reproduce the §5.4.2 HP sample: 4 bytes past the start of the PN,
+    // 16 bytes long.  pn_start = header.len (we passed pn_len_wire = 0,
+    // i.e. 1-byte PN).
+    const pn_start: usize = header.len;
+    const sample_start = pn_start + hp_sample_offset;
+    var sample: [hp_sample_len]u8 = undefined;
+    @memcpy(&sample, dst[sample_start .. sample_start + hp_sample_len]);
+
+    // Expected mask under AES-256-ECB(km.hp32, sample).
+    var expected_mask: [16]u8 = undefined;
+    const ctx = std.crypto.core.aes.Aes256.initEnc(km.hp32);
+    ctx.encrypt(&expected_mask, &sample);
+
+    // Long header → low-nibble mask (0x0f).  The protected first byte must
+    // equal the plain first byte XOR'd with the AES-256 mask byte.
+    const expected_first = header[0] ^ (expected_mask[0] & 0x0f);
+    try testing.expectEqual(expected_first, dst[0]);
+
+    // And it must NOT equal what the old (buggy) AES-128(km.hp) path
+    // would have produced — that's the regression we're locking in.
+    const wrong_mask = km.hp_ctx.hpMask(sample);
+    const wrong_first = header[0] ^ (wrong_mask[0] & 0x0f);
+    try testing.expect(dst[0] != wrong_first);
+
+    // And round-trip still works (asymmetric correctness implied by the
+    // oracle check above, but a positive end-to-end signal is cheap).
+    var decrypted: [128]u8 = undefined;
+    const dec = try unprotectLongHeaderPacket(&decrypted, dst[0..written], pn_start, written, &km, null, .aes256_gcm);
     try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec.pt_len]);
 }
 
