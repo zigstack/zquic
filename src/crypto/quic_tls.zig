@@ -107,7 +107,14 @@ pub fn stripRecords(out: []u8, input: []const u8) usize {
     return out_pos;
 }
 
-/// QUIC transport parameters extension type (RFC 9001 §8.2).
+/// TLS `quic_transport_parameters` extension type, RFC 9000 §18.2 / RFC 9001 §8.2.
+///
+/// 0xffa5 was the draft-29 codepoint; RFC 9000 standardized it as 0x0039
+/// (57). All current QUIC v1 implementations on the wire (quic-go used by
+/// go-libp2p, quinn used by rust-libp2p, ngtcp2, msquic) speak 0x0039,
+/// so we must too — otherwise the peer never sees our transport params
+/// in EncryptedExtensions and aborts the handshake with
+/// `tls: server did not send a quic_transport_parameters extension`.
 pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0x0039;
 /// Pre-RFC draft extension type; still accepted from peers (quinn/rustls interop).
 pub const TRANSPORT_PARAMS_EXT_TYPE_DRAFT: u16 = 0xffa5;

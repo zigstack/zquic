@@ -103,6 +103,14 @@ pub const ClientHelloData = struct {
     quic_transport_params_ext_type: u16 = EXT_QUIC_TRANSPORT_PARAMS,
     alpn_h3: bool = false,
     alpn_h09: bool = false,
+    /// Copy of the ProtocolNameList inner bytes from the client's ALPN
+    /// extension (`u8 len + proto`-repeated). Used by
+    /// [`eeAlpnMatchingClientOffer`] to honor arbitrary preferred ALPN
+    /// strings (e.g. `libp2p` for libp2p QUIC interop) without changing
+    /// the wire format. 256 bytes is enough for ~85 short protos —
+    /// well above any realistic client offer.
+    alpn_protos: [256]u8 = .{0} ** 256,
+    alpn_protos_len: usize = 0,
     /// True if the client sent the early_data extension (0-RTT request).
     has_early_data: bool = false,
     /// First PSK identity from pre_shared_key extension (ticket blob = PSK).
@@ -284,8 +292,16 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
                 result.quic_transport_params_ext_type = ext_type;
             },
             EXT_ALPN => {
-                // u16 list_len, then u8 proto_len, proto
+                // u16 list_len, then [u8 proto_len, proto]+
                 if (ext_data.len >= 2) {
+                    // Record the inner list (without the 2-byte length prefix)
+                    // so [`eeAlpnMatchingClientOffer`] can match arbitrary
+                    // preferred ALPN values, not just the two HTTP presets.
+                    const inner = ext_data[2..];
+                    const copy_len = @min(inner.len, result.alpn_protos.len);
+                    @memcpy(result.alpn_protos[0..copy_len], inner[0..copy_len]);
+                    result.alpn_protos_len = copy_len;
+
                     var ap: usize = 2;
                     while (ap + 1 <= ext_data.len) {
                         const plen = ext_data[ap];
@@ -521,10 +537,27 @@ pub fn buildEncryptedExtensions(
 
 /// ALPN for EncryptedExtensions only when the client offered it (rustls
 /// `server/hs.rs` `process_common` + client `validate_encrypted_extensions`).
+///
+/// Scans `ch.alpn_protos[0..alpn_protos_len]` — the captured client
+/// ProtocolNameList inner bytes — for an exact match against the
+/// server's preferred ALPN. This is what lets us echo arbitrary
+/// preset strings like `libp2p` (the libp2p QUIC interop ALPN, RFC 9000)
+/// without limiting the matcher to HTTP presets.
 fn eeAlpnMatchingClientOffer(ch: *const ClientHelloData, preferred: ?[]const u8) ?[]const u8 {
     const p = preferred orelse return null;
+    // Fast-path keeps the existing HTTP cases trivial.
     if (std.mem.eql(u8, p, ALPN_H3) and ch.alpn_h3) return p;
     if (std.mem.eql(u8, p, ALPN_H09) and ch.alpn_h09) return p;
+    // General case: walk the captured offer list.
+    var ap: usize = 0;
+    while (ap + 1 <= ch.alpn_protos_len) {
+        const plen = ch.alpn_protos[ap];
+        ap += 1;
+        if (ap + plen > ch.alpn_protos_len) break;
+        const proto = ch.alpn_protos[ap .. ap + plen];
+        if (std.mem.eql(u8, proto, p)) return p;
+        ap += plen;
+    }
     return null;
 }
 
@@ -1851,6 +1884,51 @@ test "handshake: negotiateEeAlpn falls back to hq-interop for quinn interop" {
     const testing = std.testing;
     var ch: ClientHelloData = .{ .alpn_h09 = true };
     try testing.expectEqualSlices(u8, ALPN_H09, negotiateEeAlpn(&ch, ALPN_H3).?);
+}
+
+test "handshake: EE ALPN echoes arbitrary preferred proto (libp2p QUIC)" {
+    const testing = std.testing;
+    // ProtocolNameList inner: u8 len + bytes, repeated. Client offers
+    // "libp2p" (6 bytes) — what go-libp2p's QUIC dialer sends.
+    var ch: ClientHelloData = .{};
+    const libp2p_proto: []const u8 = "libp2p";
+    ch.alpn_protos[0] = @intCast(libp2p_proto.len);
+    @memcpy(ch.alpn_protos[1 .. 1 + libp2p_proto.len], libp2p_proto);
+    ch.alpn_protos_len = 1 + libp2p_proto.len;
+
+    // Server prefers "libp2p" — pre-fix this returned null because the
+    // matcher only knew ALPN_H3 / ALPN_H09. Post-fix it must echo the
+    // proto so go-libp2p sees the ALPN in EncryptedExtensions and the
+    // TLS handshake completes.
+    const got = eeAlpnMatchingClientOffer(&ch, libp2p_proto).?;
+    try testing.expectEqualSlices(u8, libp2p_proto, got);
+
+    // Mismatched preferred → no echo (don't lie to the client).
+    try testing.expect(eeAlpnMatchingClientOffer(&ch, ALPN_H3) == null);
+}
+
+test "handshake: EE ALPN matcher walks multi-proto offer list" {
+    const testing = std.testing;
+    // Client offers ["h3", "libp2p"] — proves the matcher iterates past
+    // a non-match (h3) when the server prefers an unknown-to-zquic proto
+    // (libp2p). Pre-fix this returned null because the fast-path only
+    // matched ALPN_H3 (which was offered) and not the second entry.
+    var ch: ClientHelloData = .{};
+    // u8 len + bytes, repeated. First "h3", then "libp2p".
+    const offers = [_]u8{ 2, 'h', '3', 6, 'l', 'i', 'b', 'p', '2', 'p' };
+    @memcpy(ch.alpn_protos[0..offers.len], &offers);
+    ch.alpn_protos_len = offers.len;
+    // Also flag h3 because the parser would have. The fast-path must
+    // NOT short-circuit to h3 when h3 is offered but the server
+    // prefers libp2p.
+    ch.alpn_h3 = true;
+
+    try testing.expectEqualSlices(u8, "libp2p", eeAlpnMatchingClientOffer(&ch, "libp2p").?);
+    // Sanity: when the server actually prefers h3, the fast-path
+    // still returns it.
+    try testing.expectEqualSlices(u8, ALPN_H3, eeAlpnMatchingClientOffer(&ch, ALPN_H3).?);
+    // Proto the client did NOT offer is not echoed.
+    try testing.expect(eeAlpnMatchingClientOffer(&ch, "doesnotexist") == null);
 }
 
 test "handshake: EE early_data only on accepted PSK (rustls decide_if_early_data_allowed)" {
