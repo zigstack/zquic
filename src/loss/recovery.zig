@@ -22,6 +22,8 @@ const k_packet_threshold: u64 = 3;
 const k_max_ack_delay_ms: u64 = 25;
 /// Granularity timer resolution in ms
 const k_granularity_ms: u64 = 1;
+/// Persistent congestion duration multiplier (RFC 9002 §7.6.1)
+const k_persistent_congestion_threshold: u64 = 3;
 
 /// RTT estimator for a QUIC connection.
 pub const RttEstimator = struct {
@@ -72,6 +74,27 @@ pub const RttEstimator = struct {
         const with_delay: f64 = base_pto + @as(f64, @floatFromInt(max_ack_delay));
         const scaled = with_delay * std.math.pow(f64, 2.0, @floatFromInt(pto_count));
         return @intFromFloat(scaled);
+    }
+
+    /// Time-threshold loss delay in ms (RFC 9002 §6.1.2):
+    ///   loss_delay = kTimeThreshold * max(SRTT, latest_RTT), floored at kGranularity.
+    /// Before any RTT sample exists we fall back to the initial RTT so the
+    /// loss timer is still well-defined during the handshake.
+    pub fn loss_delay_ms(self: *const RttEstimator) u64 {
+        const srtt: u64 = if (self.first_rtt_sample) @intFromFloat(@max(self.srtt_ms, 0.0)) else initial_rtt_ms;
+        const base = @max(srtt, self.latest_rtt_ms);
+        const scaled = (base * k_time_threshold_num) / k_time_threshold_den;
+        return @max(scaled, k_granularity_ms);
+    }
+
+    /// Persistent-congestion duration in ms (RFC 9002 §7.6.1):
+    ///   pc_duration = (SRTT + 4*RTTVAR + max_ack_delay) * kPersistentCongestionThreshold.
+    /// Like `loss_delay_ms`, this falls back to the initial RTT before any sample.
+    pub fn persistent_congestion_duration_ms(self: *const RttEstimator, max_ack_delay: u64) u64 {
+        const srtt: f64 = if (self.first_rtt_sample) self.srtt_ms else @floatFromInt(initial_rtt_ms);
+        const rttvar: f64 = if (self.first_rtt_sample) self.rttvar_ms else @as(f64, @floatFromInt(initial_rtt_ms)) / 2.0;
+        const base: f64 = srtt + @max(4.0 * rttvar, @as(f64, @floatFromInt(k_granularity_ms))) + @as(f64, @floatFromInt(max_ack_delay));
+        return @intFromFloat(base * @as(f64, @floatFromInt(k_persistent_congestion_threshold)));
     }
 };
 
@@ -146,6 +169,16 @@ pub const LossDetector = struct {
         rtt_updated: bool,
         bytes_acked: u64,
         lost_bytes: u64,
+        /// True when the set of ack-eliciting packets declared lost by this
+        /// ACK spans a duration ≥ `persistent_congestion_duration_ms`
+        /// (RFC 9002 §7.6).  The caller should invoke
+        /// `CongestionController.onPersistentCongestion` in that case.
+        persistent_congestion: bool,
+        /// Largest packet number declared lost by this ACK, if any.  Exposed
+        /// so the caller can invoke `cc.onLoss(largest_lost_pn)` once per
+        /// ACK instead of once per lost packet — the recovery period bound
+        /// is what matters, not the individual PNs.
+        largest_lost_pn: ?u64,
     };
 
     /// Process an ACK frame. Returns packets declared lost.
@@ -205,6 +238,25 @@ pub const LossDetector = struct {
         var lost_count: usize = 0;
         var bytes_acked: u64 = 0;
         var lost_bytes: u64 = 0;
+        var largest_lost_pn: ?u64 = null;
+        // Track the earliest send_time of any ack-eliciting packet acked by
+        // this ACK.  Per RFC 9002 §7.6.2 the persistent congestion window
+        // must start at or before this time — otherwise we'd have direct
+        // evidence the path delivered something in the interval and the
+        // contiguity precondition is violated.
+        var earliest_acked_eliciting_send_time: ?u64 = null;
+        // Track the bounds of ack-eliciting packets declared lost so we can
+        // evaluate the persistent-congestion duration (RFC 9002 §7.6.1).
+        var earliest_lost_eliciting_send_time: ?u64 = null;
+        var latest_lost_eliciting_send_time: ?u64 = null;
+
+        // Compute the time-threshold loss bound once per ACK (RFC 9002
+        // §6.1.2).  A packet older than this is declared lost even if fewer
+        // than k_packet_threshold later PNs have been acked — this handles
+        // reordering windows beyond k_packet_threshold and tail drops where
+        // the gap from largest_acked back to the lost packet is large.
+        const loss_delay = rtt.loss_delay_ms();
+        const time_lost_before = now_ms -| loss_delay;
 
         var i: usize = 0;
         while (i < self.sent_count) {
@@ -213,7 +265,11 @@ pub const LossDetector = struct {
             // Packet is definitively acked: within [smallest_acked .. largest_acked].
             if (p.pn >= smallest_acked and p.pn <= largest_acked) {
                 bytes_acked += p.size;
-                // Free heap-owned retransmit buffer (raw-application path).
+                if (p.ack_eliciting) {
+                    if (earliest_acked_eliciting_send_time) |t| {
+                        if (p.send_time_ms < t) earliest_acked_eliciting_send_time = p.send_time_ms;
+                    } else earliest_acked_eliciting_send_time = p.send_time_ms;
+                }
                 if (self.sent[i].stream_data) |sd| {
                     allocator.free(sd);
                     self.sent[i].stream_data = null;
@@ -223,22 +279,33 @@ pub const LossDetector = struct {
                 continue;
             }
 
-            // Packet is below the acked range — apply k_packet_threshold loss
-            // detection only for true gaps (p.pn < smallest_acked).
-            // A packet is considered lost when k_packet_threshold or more
-            // later packets have been acknowledged (RFC 9002 §6.1.1).
-            if (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold) {
+            // Packet is below the acked range — apply RFC 9002 §6.1 loss
+            // detection for true gaps (p.pn < smallest_acked).  A packet is
+            // declared lost if EITHER:
+            //   - packet threshold: k_packet_threshold or more later PNs are
+            //     acked (RFC 9002 §6.1.1), OR
+            //   - time threshold:   it was sent before now - loss_delay
+            //     (RFC 9002 §6.1.2).
+            const packet_threshold_lost = (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold);
+            const time_threshold_lost = (p.pn < smallest_acked and p.send_time_ms <= time_lost_before);
+            if (packet_threshold_lost or time_threshold_lost) {
                 lost_bytes += p.size;
+                if (largest_lost_pn) |lpn| {
+                    if (p.pn > lpn) largest_lost_pn = p.pn;
+                } else largest_lost_pn = p.pn;
+                if (p.ack_eliciting) {
+                    if (earliest_lost_eliciting_send_time) |t| {
+                        if (p.send_time_ms < t) earliest_lost_eliciting_send_time = p.send_time_ms;
+                    } else earliest_lost_eliciting_send_time = p.send_time_ms;
+                    if (latest_lost_eliciting_send_time) |t| {
+                        if (p.send_time_ms > t) latest_lost_eliciting_send_time = p.send_time_ms;
+                    } else latest_lost_eliciting_send_time = p.send_time_ms;
+                }
                 if (lost_count < lost_buf.len) {
-                    lost_buf[lost_count] = p; // full descriptor for retransmission
-                    // Ownership of stream_data transfers from `self.sent[i]`
-                    // to `lost_buf[lost_count]`; clear the source so it isn't
-                    // freed when this slot is later overwritten.
+                    lost_buf[lost_count] = p;
                     self.sent[i].stream_data = null;
                     lost_count += 1;
                 } else {
-                    // No room to surface this loss — free the retransmit
-                    // buffer so it doesn't leak.
                     if (self.sent[i].stream_data) |sd| {
                         allocator.free(sd);
                         self.sent[i].stream_data = null;
@@ -252,11 +319,43 @@ pub const LossDetector = struct {
             i += 1;
         }
 
+        // Persistent congestion (RFC 9002 §7.6.1): the duration between the
+        // earliest and latest ack-eliciting packets declared lost spans the
+        // persistent_congestion threshold.  We only declare PC if no
+        // ack-eliciting packet was acked within that interval (otherwise the
+        // path clearly delivered something and is not in persistent
+        // congestion).  An RTT sample must exist — without one we cannot
+        // compute a meaningful threshold (RFC 9002 §7.6.2).
+        var pc = false;
+        if (rtt.first_rtt_sample) {
+            if (earliest_lost_eliciting_send_time) |t0| {
+                if (latest_lost_eliciting_send_time) |t1| {
+                    if (t1 > t0) {
+                        const span = t1 - t0;
+                        const pc_dur = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
+                        if (span >= pc_dur) {
+                            // Contiguity: no ack-eliciting packet acked by this
+                            // ACK fell inside (t0, t1).  If one did, this ACK
+                            // proves the path is delivering and PC does not
+                            // apply.
+                            const overlap = if (earliest_acked_eliciting_send_time) |ea|
+                                (ea > t0 and ea < t1)
+                            else
+                                false;
+                            if (!overlap) pc = true;
+                        }
+                    }
+                }
+            }
+        }
+
         return OnAckResult{
             .lost_count = lost_count,
             .rtt_updated = rtt_updated,
             .bytes_acked = bytes_acked,
             .lost_bytes = lost_bytes,
+            .persistent_congestion = pc,
+            .largest_lost_pn = largest_lost_pn,
         };
     }
 };
@@ -323,6 +422,99 @@ test "loss: rejects invalid first_ack_range > largest_acked" {
         error.FrameEncodingError,
         ld.onAck(5, 10, 0, 200, &rtt, &lost_buf, testing.allocator),
     );
+}
+
+test "loss: time-threshold declares old packet lost when gap < k_packet_threshold" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    // Establish an RTT sample so loss_delay is bounded and deterministic.
+    rtt.update(50, 0);
+    const loss_delay = rtt.loss_delay_ms();
+
+    // Send pn 0 at t=100 and pn 1 at t=200.  Only one later PN gets acked,
+    // so packet-threshold (kPacketThreshold=3) will NOT trip on pn 0.
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 100, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 200, .size = 100, .ack_eliciting = true, .in_flight = true });
+
+    // Ack pn 1 at a time far enough past pn 0's send to trigger time-threshold.
+    const now = 200 + loss_delay + 1;
+    var lost_buf: [4]SentPacket = undefined;
+    const r = try ld.onAck(1, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), r.lost_count);
+    try testing.expectEqual(@as(u64, 0), lost_buf[0].pn);
+    try testing.expect(r.largest_lost_pn != null);
+    try testing.expectEqual(@as(u64, 0), r.largest_lost_pn.?);
+}
+
+test "loss: persistent congestion across spread-out losses" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    // Pin a small SRTT so the PC threshold is small and easy to exceed.
+    rtt.update(10, 0);
+    const pc_dur = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
+
+    // Send 6 ack-eliciting packets spanning > pc_dur, then ack only pn 5.
+    // pns 0..2 are declared lost via packet-threshold; we space them so the
+    // span between earliest and latest ack-eliciting lost packet exceeds
+    // pc_dur.
+    const t0: u64 = 1_000;
+    const t_last = t0 + pc_dur + 50; // bound for the latest lost pn
+
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = t0, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = t0 + (pc_dur / 2), .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 2, .send_time_ms = t_last, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 3, .send_time_ms = t_last + 10, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 4, .send_time_ms = t_last + 20, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 5, .send_time_ms = t_last + 30, .size = 100, .ack_eliciting = true, .in_flight = true });
+
+    // Ack only pn 5 so packet-threshold trips on 0, 1, 2.  Use a `now`
+    // large enough that time-threshold also fires on 3 and 4.
+    const now = t_last + 30 + rtt.loss_delay_ms() + 1;
+    var lost_buf: [16]SentPacket = undefined;
+    const r = try ld.onAck(5, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    try testing.expect(r.lost_count >= 3);
+    try testing.expect(r.persistent_congestion);
+}
+
+test "loss: no persistent congestion when ack proves path is delivering" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    rtt.update(10, 0);
+    const pc_dur = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
+
+    // pn 0 sent very early, then pn 1 sent inside the PC window and acked
+    // (proving delivery), then pn 2..5 surrounding so packet-threshold
+    // declares pn 0 lost.  Span of lost ack-eliciting packets is just pn 0
+    // alone, so PC must not fire — additionally the acked pn 1 falls within
+    // the loss window if there were a second lost packet, also blocking PC.
+    const t0: u64 = 1_000;
+
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = t0, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = t0 + 5, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 2, .send_time_ms = t0 + pc_dur + 10, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 3, .send_time_ms = t0 + pc_dur + 11, .size = 100, .ack_eliciting = true, .in_flight = true });
+    _ = ld.onPacketSent(.{ .pn = 4, .send_time_ms = t0 + pc_dur + 12, .size = 100, .ack_eliciting = true, .in_flight = true });
+
+    // Ack pns 1..4 in one contiguous range.  pn 0 hits packet-threshold
+    // (largest_acked=4 ≥ 0+3) but pn 1 was acked inside the same ACK, so
+    // even if a second loss were present, PC would not apply.
+    var lost_buf: [8]SentPacket = undefined;
+    const r = try ld.onAck(4, 3, 0, t0 + pc_dur + 20, &rtt, &lost_buf, testing.allocator);
+    try testing.expect(r.lost_count >= 1);
+    try testing.expect(!r.persistent_congestion);
+}
+
+test "loss: persistent_congestion_duration falls back to initial RTT before first sample" {
+    const testing = std.testing;
+    const rtt = RttEstimator{};
+    // Before any sample, threshold should equal pc_threshold *
+    //   (initial_rtt + 4 * initial_rtt/2 + max_ack_delay)
+    //   = 3 * (333 + 666 + 25) = 3072.
+    const got = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
+    try testing.expectEqual(@as(u64, 3 * (333 + 666 + 25)), got);
 }
 
 test "loss: stream_data is freed on ack and transferred on loss" {
