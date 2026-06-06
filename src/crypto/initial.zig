@@ -56,9 +56,19 @@ pub fn decompressPacketNumber(truncated_pn: u64, expected_pn: ?u64, pn_len_bits:
     const upper_bound = expected_next + range_half;
 
     if (candidate_pn < lower_bound) {
+        // Guard against overflow when adding pn_range (very high candidate_pn).
+        if (candidate_pn > std.math.maxInt(u64) - pn_range) return candidate_pn;
         return candidate_pn + pn_range;
     }
     if (candidate_pn >= upper_bound) {
+        // Guard against underflow: only subtract pn_range when it actually
+        // fits.  RFC 9000 Appendix A's reconstruction algorithm assumes
+        // candidate_pn ≥ pn_range here, but in early-handshake / many-conn
+        // scenarios the candidate can be less than pn_range — in which case
+        // the subtraction would trap on integer overflow.  Falling back to
+        // candidate_pn is the conservative choice (the AEAD will then catch
+        // any wrong-PN guess as a decrypt failure).
+        if (candidate_pn < pn_range) return candidate_pn;
         return candidate_pn - pn_range;
     }
     return candidate_pn;
