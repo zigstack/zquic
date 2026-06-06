@@ -2612,13 +2612,18 @@ pub const Server = struct {
                 // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 if (sid_type == 0 or sid_type == 2) {
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
-                    if (sid_type == 0 and stream_count > conn.max_streams_bidi_recv) {
-                        dbg("io: 0-RTT STREAM_LIMIT_ERROR bidi stream_id={}\n", .{sf_r.frame.stream_id});
-                        break; // drop packet (cannot send CONNECTION_CLOSE in 0-RTT context)
-                    }
-                    if (sid_type == 2 and stream_count > conn.max_streams_uni_recv) {
-                        dbg("io: 0-RTT STREAM_LIMIT_ERROR uni stream_id={}\n", .{sf_r.frame.stream_id});
-                        break;
+                    if (sid_type == 0) {
+                        self.ensurePeerStreamBudget(conn, true, stream_count, src);
+                        if (stream_count > conn.max_streams_bidi_recv) {
+                            dbg("io: 0-RTT STREAM_LIMIT_ERROR bidi stream_id={}\n", .{sf_r.frame.stream_id});
+                            break;
+                        }
+                    } else {
+                        self.ensurePeerStreamBudget(conn, false, stream_count, src);
+                        if (stream_count > conn.max_streams_uni_recv) {
+                            dbg("io: 0-RTT STREAM_LIMIT_ERROR uni stream_id={}\n", .{sf_r.frame.stream_id});
+                            break;
+                        }
                     }
                 }
                 self.handleStreamData(conn, &sf_r.frame, src);
@@ -3323,6 +3328,11 @@ pub const Server = struct {
         // Send Handshake ACK + 1-RTT HANDSHAKE_DONE
         self.sendHandshakeAck(conn, src);
         self.sendHandshakeDone(conn, src);
+
+        // Quinn's multiplexing test opens ~2000 bidi streams immediately after the
+        // handshake; grant credit before the first STREAM arrives so the client
+        // is not blocked on our initial_max_streams_bidi=1000 transport param.
+        self.sendMaxStreamsToAtLeast(conn, true, 2000, src);
 
         // Initiate a key update immediately after the handshake if enabled.
         // This satisfies the quic-interop-runner "keyupdate" test case.
@@ -5718,8 +5728,8 @@ pub const Client = struct {
         const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
         try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
-        const dcid = ConnectionId.random(compat.random, 20);
-        const scid = ConnectionId.random(compat.random, 20);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -5801,8 +5811,8 @@ pub const Client = struct {
         const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
         try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
-        const dcid = ConnectionId.random(compat.random, 20);
-        const scid = ConnectionId.random(compat.random, 20);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -6253,8 +6263,8 @@ pub const Client = struct {
         try compat.bind(self.sock, &bind_any.any, bind_any.getOsSockLen());
 
         // New random connection IDs.
-        const dcid = ConnectionId.random(compat.random, 20);
-        const scid = ConnectionId.random(compat.random, 20);
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
 
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);

@@ -906,6 +906,8 @@ pub fn buildClientHelloWithPsk(
     writeU16(ext_buf[ep..], TLS_VERSION_13);
     ep += 2;
 
+    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
+
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
     ep += 2;
     writeU16(ext_buf[ep..], 4);
@@ -928,9 +930,7 @@ pub fn buildClientHelloWithPsk(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
-    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
-
-    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS_DRAFT);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
     ep += 2;
@@ -1100,16 +1100,16 @@ fn buildClientHelloInner(
     writeU16(ext_buf[ep..], TLS_VERSION_13);
     ep += 2;
 
-    // supported_groups: X25519 + secp256r1 (rustls/quinn interop expects both)
+    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
+
+    // supported_groups: X25519 only (matches key_share; rustls rejects orphan groups)
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
     ep += 2;
-    writeU16(ext_buf[ep..], 6); // 2 (list_len) + 2× u16 groups
+    writeU16(ext_buf[ep..], 4); // ext data: list_len(2) + group(2)
     ep += 2;
-    writeU16(ext_buf[ep..], 4); // list len
+    writeU16(ext_buf[ep..], 2); // list len
     ep += 2;
     writeU16(ext_buf[ep..], GROUP_X25519);
-    ep += 2;
-    writeU16(ext_buf[ep..], GROUP_SECP256R1);
     ep += 2;
 
     // key_share: X25519
@@ -1126,10 +1126,8 @@ fn buildClientHelloInner(
     @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
     ep += 32;
 
-    ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
-
-    // QUIC transport params
-    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    // QUIC transport params — draft ext type for quinn-interop server compatibility
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS_DRAFT);
     ep += 2;
     writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
     ep += 2;
