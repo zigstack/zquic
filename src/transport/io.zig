@@ -930,18 +930,21 @@ const Http09PendingOpen = struct {
 };
 
 /// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
+const http09_req_asm_buf_len = 256;
 const Http09ReqAssembly = struct {
     active: bool = false,
     stream_id: u64 = 0,
     len: usize = 0,
-    buf: [http09_server.max_request_len]u8 = undefined,
+    buf: [http09_req_asm_buf_len]u8 = undefined,
 
     fn reset(self: *Http09ReqAssembly) void {
         self.* = .{};
     }
 };
 
-const http09_req_asm_max = 512;
+// Quinn multiplexing splits GET lines across STREAM frames; one slot per
+// in-flight request until FIN. Match http09_pending_max (~2000 streams).
+const http09_req_asm_max = 2048;
 
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
@@ -3641,8 +3644,16 @@ pub const Server = struct {
         dbg("io: process1RttPacket buf_len={}\n", .{buf.len});
         var pos: usize = 0;
         while (pos < buf.len) {
-            const step = self.processOneServer1RttPacket(buf[pos..], src) orelse break;
-            if (step == 0) break;
+            const step = self.processOneServer1RttPacket(buf[pos..], src) orelse {
+                // Coalesced datagram resync (RFC 9000 §12.2): if this offset
+                // is not a decryptable packet, advance one byte and retry.
+                pos += 1;
+                continue;
+            };
+            if (step == 0) {
+                pos += 1;
+                continue;
+            }
             pos += step;
         }
     }
@@ -5037,7 +5048,11 @@ pub const Server = struct {
             dbg("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
             return;
         }
-        if (sf.data.len == 0) return;
+        // Quinn may send a zero-length STREAM+FIN after the request bytes.
+        if (sf.data.len == 0) {
+            if (!sf.fin) return;
+            if (peekHttp09ReqAssembly(conn, sf.stream_id) == null) return;
+        }
 
         // Dedup: skip if a slot for this stream already exists (active or awaiting ACK).
         // This prevents duplicate slots when both a 0-RTT request and a 1-RTT
@@ -5053,17 +5068,14 @@ pub const Server = struct {
         if (sf.offset == 0 and peekHttp09ReqAssembly(conn, sf.stream_id) == null) {
             const parse_result = http09_server.parseRequest(sf.data);
             if (parse_result) |req| {
-                if (sf.fin) {
-                    dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
-                    var path_buf: [512]u8 = undefined;
-                    const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
-                        dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
-                        return;
-                    };
-                    self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
+                dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
+                var path_buf: [512]u8 = undefined;
+                const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
+                    dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
                     return;
-                }
-                // Parsed full line but FIN not yet sent — buffer below.
+                };
+                self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
+                return;
             } else |err| {
                 if (err != error.Incomplete) {
                     dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
@@ -5074,7 +5086,7 @@ pub const Server = struct {
         }
 
         const end = sf.offset + sf.data.len;
-        if (end > http09_server.max_request_len) return;
+        if (end > http09_req_asm_buf_len) return;
 
         const req_asm = findHttp09ReqAssembly(conn, sf.stream_id) orelse {
             dbg("io: http09 req assembly slots full (stream_id={})\n", .{sf.stream_id});
@@ -5091,7 +5103,6 @@ pub const Server = struct {
             req_asm.reset();
             return;
         };
-        if (!sf.fin) return;
         req_asm.reset();
         dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
 
