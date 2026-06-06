@@ -203,20 +203,18 @@ pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, first_ack_range: u64, ect0: 
 }
 
 /// Tracks received 1-RTT packet numbers for deferred ACK frames.
-/// Unlike min/max PN tracking, this preserves gaps so we never falsely ACK
-/// packets the peer still needs to retransmit.
-const ClientAppAckTracker = struct {
+const AppAckTracker = struct {
     largest: u64 = 0,
     range_count: usize = 0,
     ranges: [128][2]u64 = undefined,
 
-    fn reset(self: *ClientAppAckTracker) void {
+    fn reset(self: *AppAckTracker) void {
         self.* = .{};
     }
 
     /// Record a received packet number. Returns true when the tracker is full
     /// and the caller should flush an ACK before accepting more PNs.
-    fn observe(self: *ClientAppAckTracker, pn: u64) bool {
+    fn observe(self: *AppAckTracker, pn: u64) bool {
         if (pn > self.largest) self.largest = pn;
         if (self.range_count == 0) {
             self.ranges[0] = .{ pn, pn };
@@ -240,7 +238,7 @@ const ClientAppAckTracker = struct {
         return true;
     }
 
-    fn buildWireFrame(self: *const ClientAppAckTracker, buf: []u8, ecn: ?ack_frame_mod.EcnCounts) !usize {
+    fn buildWireFrame(self: *const AppAckTracker, buf: []u8, ecn: ?ack_frame_mod.EcnCounts) !usize {
         if (self.range_count == 0) return 0;
         const n = @min(self.range_count, ack_frame_mod.max_ack_ranges);
         var sorted: [128]ack_frame_mod.AckRange = undefined;
@@ -928,6 +926,20 @@ const Http09PendingOpen = struct {
     path: [512]u8 = undefined,
 };
 
+/// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
+const Http09ReqAssembly = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    len: usize = 0,
+    buf: [http09_server.max_request_len]u8 = undefined,
+
+    fn reset(self: *Http09ReqAssembly) void {
+        self.* = .{};
+    }
+};
+
+const http09_req_asm_max = 128;
+
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
 /// the QUIC stream offset independently (HEADERS frame bytes are counted too).
@@ -1152,6 +1164,8 @@ pub const ConnState = struct {
     /// the correct PN range.
     zerortt_recv_pn: ?u64 = null,
     app_recv_pn: ?u64 = null,
+    /// Received 1-RTT PNs pending ACK to the peer (server role).
+    app_recv_ack: AppAckTracker = .{},
 
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
@@ -1200,7 +1214,7 @@ pub const ConnState = struct {
     qlog: qlog_writer.Writer = .{},
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [64]Http09OutSlot = [_]Http09OutSlot{.{}} ** 64,
+    http09_slots: [128]Http09OutSlot = [_]Http09OutSlot{.{}} ** 128,
 
     /// HTTP/3 responses in progress (paced DATA frame sending per connection).
     http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
@@ -1211,6 +1225,8 @@ pub const ConnState = struct {
     /// HTTP/0.9 opens waiting for a free outbound slot (quinn multiplexing).
     http09_pending: [http09_pending_max]Http09PendingOpen = undefined,
     http09_pending_count: u16 = 0,
+    /// Partial HTTP/0.9 requests reassembled until FIN.
+    http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
     /// Number of currently active HTTP/3 response slots.
     http3_active_count: u32 = 0,
 
@@ -2098,6 +2114,7 @@ pub const Server = struct {
         self.http09RetransmitPendingFins();
         self.flushPendingHttp3Responses();
         self.http3RetransmitPendingFins();
+        self.flushAllConnAppAcks();
         self.flushSendBatch();
         self.reapDrainedConnections();
     }
@@ -2311,6 +2328,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushAllConnAppAcks();
                 self.flushSendBatch();
                 continue;
             };
@@ -2326,6 +2344,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushAllConnAppAcks();
                 self.flushSendBatch();
                 self.reapDrainedConnections();
                 continue;
@@ -2376,6 +2395,7 @@ pub const Server = struct {
             self.http09RetransmitPendingFins();
             self.flushPendingHttp3Responses();
             self.http3RetransmitPendingFins();
+            self.flushAllConnAppAcks();
             // Flush all enqueued outgoing packets in one sendmmsg(2) syscall.
             self.flushSendBatch();
             self.reapDrainedConnections();
@@ -3068,6 +3088,10 @@ pub const Server = struct {
 
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
+        // Quinn multiplexing may send hundreds of 1-RTT STREAM frames before
+        // client Finished; raise the local limit now so early frames are not
+        // rejected while we still wait for the Finished handshake message.
+        _ = bumpMaxStreamsLimit(conn, true, 2000);
 
         if (self.config.keylog_path) |kpath| {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
@@ -3078,9 +3102,6 @@ pub const Server = struct {
         // quinn/rustls rejects the coalesced Handshake portion (#132).
         self.sendInitialServerHello(conn, src);
         self.sendHandshakeServerFlight(conn, src);
-        // Quinn multiplexing: grant stream credit before the client's first 1-RTT burst.
-        self.sendMaxStreamsToAtLeast(conn, true, 2000, src);
-        self.send_batch.flush(self.sock);
 
         conn.phase = .waiting_finished;
     }
@@ -3451,12 +3472,9 @@ pub const Server = struct {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
         }
 
-        // Send Handshake ACK + 1-RTT HANDSHAKE_DONE (MAX_STREAMS coalesced inside).
+        // Send Handshake ACK, then a single 1-RTT packet with MAX_STREAMS before
+        // HANDSHAKE_DONE so quinn sees stream credit before opening ~2000 streams.
         self.sendHandshakeAck(conn, src);
-        // Quinn acts on HANDSHAKE_DONE immediately; grant stream credit in a
-        // dedicated 1-RTT packet flushed first so it is not ordered after HD.
-        self.sendMaxStreamsToAtLeast(conn, true, 2000, src);
-        self.send_batch.flush(self.sock);
         self.sendHandshakeDone(conn, src);
         self.send_batch.flush(self.sock);
 
@@ -3500,6 +3518,15 @@ pub const Server = struct {
 
         var frames_buf: [2048]u8 = undefined;
         var fp: usize = 0;
+
+        // Quinn multiplexing interop: embed MAX_STREAMS(2000) before HANDSHAKE_DONE
+        // in the same 1-RTT payload so credit is applied before the client acts on HD.
+        if (computeMaxStreamsLimit(conn.max_streams_bidi_recv, 2000)) |limit| {
+            if (writeMaxStreamsFrame(frames_buf[fp..], true, limit)) |n| {
+                fp += n;
+                conn.max_streams_bidi_recv = limit;
+            }
+        }
 
         // HANDSHAKE_DONE frame
         fp += buildHandshakeDoneFrame(frames_buf[fp..]);
@@ -3664,17 +3691,22 @@ pub const Server = struct {
 
                 if (conn.phase == .waiting_finished) {
                     // Client Finished may still be in flight; 1-RTT can arrive first.
-                    if (conn.pending_1rtt_n < pending_1rtt_cap) {
-                        const slotp = &conn.pending_1rtt[conn.pending_1rtt_n];
-                        slotp.len = pt_len;
-                        @memcpy(slotp.data[0..pt_len], plaintext[0..pt_len]);
-                        conn.pending_1rtt_n += 1;
+                    // Process STREAM requests immediately — buffering only 8 datagrams
+                    // drops quinn's ~2000-stream multiplexing burst.
+                    self.processAppFrames(conn, plaintext[0..pt_len], src);
+                    if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
+                        self.flushConnAppAck(conn, src);
+                        _ = conn.app_recv_ack.observe(srv_decrypted_pn);
                     }
                     return;
                 }
 
                 // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
+                if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
+                    self.flushConnAppAck(conn, src);
+                    _ = conn.app_recv_ack.observe(srv_decrypted_pn);
+                }
                 return;
             }
         }
@@ -4339,6 +4371,37 @@ pub const Server = struct {
         }
     }
 
+    /// Send a cumulative ACK for PNs accumulated on `conn`.
+    fn flushConnAppAck(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        if (conn.app_recv_ack.range_count == 0) return;
+        const ecn: ?ack_frame_mod.EcnCounts = if (conn.ecn_ect0_recv > 0 or
+            conn.ecn_ect1_recv > 0 or
+            conn.ecn_ce_recv > 0)
+            .{
+                .ect0 = conn.ecn_ect0_recv,
+                .ect1 = conn.ecn_ect1_recv,
+                .ecn_ce = conn.ecn_ce_recv,
+            }
+        else
+            null;
+        var ack_buf: [256]u8 = undefined;
+        const ack_len = conn.app_recv_ack.buildWireFrame(&ack_buf, ecn) catch return;
+        if (ack_len == 0) return;
+        self.send1Rtt(conn, ack_buf[0..ack_len], dst);
+        conn.app_recv_ack.reset();
+    }
+
+    /// Flush deferred 1-RTT ACKs for all connections (after a recv batch).
+    fn flushAllConnAppAcks(self: *Server) void {
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (!conn.has_app_keys) continue;
+            if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
+            if (conn.app_recv_ack.range_count == 0) continue;
+            self.flushConnAppAck(conn, conn.peer);
+        }
+    }
+
     /// Flush all buffered outgoing packets via a single sendmmsg(2) call
     /// (Linux) or a tight sendto(2) loop (other OS).  Call this once per
     /// event-loop iteration after all sends for the current cycle are queued.
@@ -4405,32 +4468,30 @@ pub const Server = struct {
             last.stream_offset = old_offset;
         }
         if (fin) {
-            // Save FIN frame for retransmission in case the packet is dropped
-            // by the NS3 network simulator.  We keep the slot alive in the
-            // "awaiting_fin_ack" state; the frame will be re-sent every 200 ms
-            // until the client's ACK covers fin_pkt_pn.
-            const fin_pn = conn.app_pn - 1; // send1Rtt already incremented app_pn
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            slot.file.close();
+            // Single-chunk HTTP/0.9 (quinn multiplexing uses 32-byte files):
+            // release the slot immediately so ~2000 streams are not serialized
+            // through 64 awaiting_fin_ack slots waiting for client ACKs.
+            if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
+                dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
+                slot.* = .{};
+                self.drainHttp09Pending(conn);
+                return;
+            }
+            // Multi-chunk: keep FIN frame for retransmission until ACKed.
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
             slot.fin_frame_len = frame_len;
-            slot.fin_pkt_pn = fin_pn;
+            slot.fin_pkt_pn = conn.app_pn - 1;
             slot.fin_last_sent_ms = compat.milliTimestamp();
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
-            // Close the file — we no longer need to read from it.
-            // slot.active is set to false so flushPendingHttp09Responses
-            // stops calling us for new chunks.
-            slot.file.close();
-            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.active = false;
-            dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
+            dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, slot.fin_pkt_pn });
             self.drainHttp09Pending(conn);
         }
     }
 
-    /// Drain queued HTTP/0.9 bodies bounded by congestion control.
-    ///
-    /// The congestion controller (NewReno) is the sole rate limiter: each call to
-    /// http09SendNextChunk checks cc.canSend() and returns early if the cwnd is
     /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
     /// The congestion controller is the primary rate limiter.  The per-flush
@@ -4440,7 +4501,7 @@ pub const Server = struct {
     fn flushPendingHttp09Responses(self: *Server) void {
         // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
         // enough to drain responses before the client idle timeout.
-        var budget: usize = 64;
+        var budget: usize = 128;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -4460,6 +4521,7 @@ pub const Server = struct {
                         progressed = true;
                         budget -= 1;
                     }
+                    if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
                 }
             }
             if (!progressed) break;
@@ -4702,11 +4764,12 @@ pub const Server = struct {
 
     /// Send MAX_STREAMS in a standalone 1-RTT datagram via the send batch.
     fn sendMaxStreams1RttDirect(self: *Server, conn: *ConnState, src: compat.Address, minimum: u64) void {
-        const new_limit = bumpMaxStreamsLimit(conn, true, minimum) orelse return;
+        const new_limit = computeMaxStreamsLimit(conn.max_streams_bidi_recv, minimum) orelse return;
         var buf: [16]u8 = undefined;
         const flen = writeMaxStreamsFrame(&buf, true, new_limit) orelse return;
         self.send1Rtt(conn, buf[0..flen], src);
         self.send_batch.flush(self.sock);
+        conn.max_streams_bidi_recv = new_limit;
         dbg("io: sent MAX_STREAMS bidi limit={}\n", .{new_limit});
     }
 
@@ -4726,10 +4789,11 @@ pub const Server = struct {
             self.sendMaxStreams1RttDirect(conn, dst, minimum);
             return;
         }
-        const new_limit = bumpMaxStreamsLimit(conn, false, minimum) orelse return;
+        const new_limit = computeMaxStreamsLimit(conn.max_streams_uni_recv, minimum) orelse return;
         var buf: [16]u8 = undefined;
         const flen = writeMaxStreamsFrame(&buf, false, new_limit) orelse return;
         self.send1Rtt(conn, buf[0..flen], dst);
+        conn.max_streams_uni_recv = new_limit;
         dbg("io: sent MAX_STREAMS bidi=false limit={}\n", .{new_limit});
     }
 
@@ -4914,6 +4978,34 @@ pub const Server = struct {
         }
     }
 
+    fn peekHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
+        for (&conn.http09_req_asm) |*slot| {
+            if (slot.active and slot.stream_id == stream_id) return slot;
+        }
+        return null;
+    }
+
+    fn findHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
+        if (peekHttp09ReqAssembly(conn, stream_id)) |slot| return slot;
+        for (&conn.http09_req_asm) |*slot| {
+            if (!slot.active) {
+                slot.* = .{ .active = true, .stream_id = stream_id };
+                return slot;
+            }
+        }
+        return null;
+    }
+
+    fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) void {
+        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return;
+        }
+        if (!enqueueHttp09Pending(conn, stream_id, fs_path)) {
+            dbg("io: http/0.9 pending queue full (stream_id={})\n", .{stream_id});
+        }
+    }
+
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         _ = src;
         dbg("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
@@ -4922,10 +5014,7 @@ pub const Server = struct {
             dbg("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
             return;
         }
-        if (sf.data.len == 0) {
-            dbg("io: http09 stream_id={} empty data\n", .{sf.stream_id});
-            return;
-        }
+        if (sf.data.len == 0) return;
 
         // Dedup: skip if a slot for this stream already exists (active or awaiting ACK).
         // This prevents duplicate slots when both a 0-RTT request and a 1-RTT
@@ -4933,13 +5022,54 @@ pub const Server = struct {
         for (&conn.http09_slots) |*slot| {
             if ((slot.active or slot.awaiting_fin_ack) and slot.stream_id == sf.stream_id) return;
         }
+        for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
+            if (entry.stream_id == sf.stream_id) return;
+        }
 
-        var req_buf: [http09_server.max_request_len]u8 = undefined;
-        @memcpy(req_buf[0..sf.data.len], sf.data);
-        const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch |err| {
-            dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+        // Fast path: whole request in one STREAM frame (zquic client + most quinn streams).
+        if (sf.offset == 0 and peekHttp09ReqAssembly(conn, sf.stream_id) == null) {
+            const parse_result = http09_server.parseRequest(sf.data);
+            if (parse_result) |req| {
+                if (sf.fin) {
+                    dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
+                    var path_buf: [512]u8 = undefined;
+                    const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
+                        dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
+                        return;
+                    };
+                    self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
+                    return;
+                }
+                // Parsed full line but FIN not yet sent — buffer below.
+            } else |err| {
+                if (err != error.Incomplete) {
+                    dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+                    return;
+                }
+                // Incomplete — buffer below.
+            }
+        }
+
+        const end = sf.offset + sf.data.len;
+        if (end > http09_server.max_request_len) return;
+
+        const req_asm = findHttp09ReqAssembly(conn, sf.stream_id) orelse {
+            dbg("io: http09 req assembly slots full (stream_id={})\n", .{sf.stream_id});
             return;
         };
+        if (sf.offset == 0) req_asm.len = 0;
+        if (sf.offset > req_asm.len) return; // gap — wait for retransmit
+        @memcpy(req_asm.buf[sf.offset..end], sf.data);
+        if (end > req_asm.len) req_asm.len = end;
+
+        const req = http09_server.parseRequest(req_asm.buf[0..req_asm.len]) catch |err| {
+            if (err == error.Incomplete) return;
+            dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, req_asm.len });
+            req_asm.reset();
+            return;
+        };
+        if (!sf.fin) return;
+        req_asm.reset();
         dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
 
         var path_buf: [512]u8 = undefined;
@@ -4948,13 +5078,7 @@ pub const Server = struct {
             return;
         };
 
-        if (self.openHttp09OutSlot(conn, sf.stream_id, fs_path)) {
-            self.drainHttp09Pending(conn);
-            return;
-        }
-        if (!enqueueHttp09Pending(conn, sf.stream_id, fs_path)) {
-            dbg("io: http/0.9 pending queue full (stream_id={})\n", .{sf.stream_id});
-        }
+        self.http09OpenResolvedPath(conn, sf.stream_id, fs_path);
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
@@ -5832,7 +5956,7 @@ pub const Client = struct {
 
     /// Deferred ACK: accumulate received 1-RTT PNs and flush one ACK frame
     /// after draining all pending packets in the recv loop.
-    app_ack: ClientAppAckTracker = .{},
+    app_ack: AppAckTracker = .{},
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
