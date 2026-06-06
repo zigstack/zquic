@@ -3341,6 +3341,9 @@ pub const Server = struct {
         // codepaths that still consult it stay consistent.
         const ncid_frame_size: usize = 28; // type + seq + rpt + len + 8 cid + 16 token
         while (fp + ncid_frame_size <= frames_buf.len) {
+            // RFC 9000 §5.1.1: the peer MUST NOT store more than
+            // `active_connection_id_limit` CIDs (seq 0 counts toward the limit).
+            if (conn.localCidCount() >= conn.peer_active_cid_limit) break;
             // Find the next free pool slot.
             var has_free = false;
             for (conn.cid_pool) |slot| {
@@ -4385,6 +4388,7 @@ pub const Server = struct {
     /// 1-RTT path, and (lazily) seed the connection's stateless-reset token
     /// mirror. No-op when the pool is already full.
     fn sendNewConnectionId(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        if (conn.localCidCount() >= conn.peer_active_cid_limit) return;
         const new_cid = ConnectionId.random(compat.random, 8);
         var token: [16]u8 = undefined;
         compat.random.bytes(&token);
