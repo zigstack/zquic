@@ -2598,6 +2598,11 @@ pub const Server = struct {
             .initial_source_cid = conn.local_cid.slice(),
             .original_destination_cid = odcid,
             .stateless_reset_token = conn.stateless_reset_token,
+            // Advertise our actual receive-side UDP payload limit so the
+            // peer doesn't oversize datagrams (RFC 9000 §18.2). When the
+            // server doesn't actively migrate, the param is omitted (we
+            // still accept incoming migration if the peer initiates).
+            .max_udp_payload_size = conn.max_udp_payload,
         }) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
@@ -5938,7 +5943,11 @@ pub const Client = struct {
             // First send: build the ClientHello and save it for any future rebuild.
             const alpn = clientTlsAlpn(&self.config);
             var quic_tp_buf: [128]u8 = undefined;
-            const quic_tp = try buildEndpointTransportParams(&quic_tp_buf, self.conn.local_cid.slice());
+            const quic_tp = try buildEndpointTransportParams(
+                &quic_tp_buf,
+                self.conn.local_cid.slice(),
+                self.conn.max_udp_payload,
+            );
 
             // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(compat.milliTimestamp());
@@ -7694,9 +7703,14 @@ inline fn readU24(b: []const u8) u32 {
 fn buildEndpointTransportParams(
     buf: []u8,
     initial_source_cid: []const u8,
+    max_udp_payload_size: u64,
 ) (varint.EncodeError || varint.DecodeError)![]const u8 {
     const n = try quic_tls_mod.buildTransportParams(buf, .{
         .initial_source_cid = initial_source_cid,
+        // Advertise our actual receive-side UDP payload limit so the server
+        // doesn't oversize datagrams (RFC 9000 §18.2). Pass-through 0 means
+        // omit (peer assumes the §18.2 default of 65527).
+        .max_udp_payload_size = max_udp_payload_size,
     });
     return buf[0..n];
 }
