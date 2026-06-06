@@ -510,6 +510,9 @@ pub fn build1RttPacketFull(
     return initial_mod.protectLongHeaderPacket(out, hdr_buf[0..hp], pn, 0, payload, km, cipher);
 }
 
+/// Result of decrypting a 1-RTT packet with PN reconstruction.
+const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
+
 /// Decrypt a 1-RTT short-header packet with full packet-number
 /// reconstruction (RFC 9000 §17.1) under the connection's negotiated AEAD
 /// (RFC 9001 §5.1, §5.3).  `cipher` selects across the full §5.3 matrix:
@@ -536,7 +539,7 @@ fn unprotect1RttPacketWithPnTracking(
     km: *const KeyMaterial,
     cipher: PacketCipher,
     expected_recv_pn: ?u64,
-) !struct { pt_len: usize, pn: u64 } {
+) !Decrypt1RttResult {
     const r = try initial_mod.unprotectLongHeaderPacket(
         dst,
         buf,
@@ -611,8 +614,6 @@ fn buildRetireConnectionIdFrame(out: []u8, seq: u64) !usize {
     const enc = try varint.encode(out[1..], seq);
     return 1 + enc.len;
 }
-
-const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
 
 /// Decrypt an inbound 1-RTT packet with RFC 9001 §6 key-update handling.
 /// `recv_km` / `recv_km_prev` / `send_km` are the endpoint's receive and
