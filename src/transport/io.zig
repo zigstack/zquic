@@ -1194,6 +1194,17 @@ pub const ConnState = struct {
     /// Used by our PTO computation (RFC 9002 §6.2.1). Defaults to the spec
     /// default of 25 ms.
     peer_max_ack_delay_ms: u64 = 25,
+    /// Server-advertised preferred address (RFC 9000 §9.6) captured from
+    /// the peer's transport-parameters extension (0x0d).  Used purely as a
+    /// signal to trigger active migration on the client — we still send to
+    /// the original server address and only rebind the local socket.  The
+    /// embedded connection ID / reset token are stored for future work that
+    /// actually redirects packets to the advertised IP:port.
+    peer_preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
+    /// Peer requested no active migration (TP 0x0c, RFC 9000 §18.2).
+    /// Mirrors `PeerTransportParams.disable_active_migration`; cached on the
+    /// connection so the migration trigger can honour it without re-parsing.
+    peer_disable_active_migration: bool = false,
 
     // ── Graceful teardown ─────────────────────────────────────────────────────
     // draining is set when CONNECTION_CLOSE is sent or received; once set, all
@@ -1345,6 +1356,11 @@ pub const ConnState = struct {
         self.peer_max_streams_uni = parsed.initial_max_streams_uni;
         self.peer_max_idle_timeout_ms = parsed.max_idle_timeout_ms;
         self.peer_max_ack_delay_ms = parsed.max_ack_delay_ms;
+        self.peer_disable_active_migration = parsed.disable_active_migration;
+        if (parsed.preferred_address) |pa| {
+            self.peer_preferred_address = pa;
+            dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
+        }
     }
 
     /// Match an incoming DCID against the alternative-CID pool.
@@ -5946,8 +5962,27 @@ pub const Client = struct {
             // port as soon as the handshake completes so subsequent GETs go
             // out on the new path. The interop runner verifies via pcap that
             // the server observed >1 source ports.
-            if (self.conn.phase == .connected and self.config.migrate and !self.migrate_done) {
+            //
+            // Triggers (any one is enough, modulo peer-imposed restrictions):
+            //   - `--migrate` CLI flag (existing behaviour).
+            //   - Server advertised `preferred_address` (TP 0x0d, RFC 9000
+            //     §9.6): the server is telling us it would like the client
+            //     to migrate, so we rebind without needing the CLI flag.
+            //     We keep sending to the original server address — actually
+            //     redirecting packets to the advertised IP:port is a
+            //     deliberate follow-up (it needs a new socket bound for the
+            //     right address family + adopting the embedded CID).
+            //
+            // Honoured regardless of trigger: peer's
+            // `disable_active_migration` (TP 0x0c) — if the peer set it, we
+            // MUST NOT migrate (RFC 9000 §18.2).
+            const peer_triggered_migration = self.conn.peer_preferred_address != null;
+            const want_migrate = (self.config.migrate or peer_triggered_migration) and !self.conn.peer_disable_active_migration;
+            if (self.conn.phase == .connected and want_migrate and !self.migrate_done) {
                 self.migrate_done = true;
+                if (peer_triggered_migration and !self.config.migrate) {
+                    dbg("io: auto-migrating: peer advertised preferred_address\n", .{});
+                }
                 self.rebindMigrateSocket(server_addr);
             }
 
