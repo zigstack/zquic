@@ -277,7 +277,71 @@ pub const PeerTransportParams = struct {
     active_connection_id_limit: u64 = 2,
     /// 0x03 — peer's max receive UDP payload size. Defaults to 65527 if absent.
     max_udp_payload_size: u64 = 65527,
+    /// 0x0d — server-advertised preferred address (RFC 9000 §9.6).  Servers
+    /// only; clients sending this MUST be treated as PROTOCOL_VIOLATION
+    /// (§18.2), but this parser is permissive and surfaces whatever it
+    /// finds — call sites enforce role.  `null` when the param is absent
+    /// or the body is malformed.
+    preferred_address: ?PreferredAddressTp = null,
 };
+
+/// On-wire layout of the preferred_address transport parameter (RFC 9000
+/// §18.2).  Mirrors `migration.PreferredAddress` but kept inside the
+/// transport-param module so the parser does not depend on the higher-level
+/// migration types.
+pub const PreferredAddressTp = struct {
+    ipv4: [4]u8,
+    ipv4_port: u16,
+    ipv6: [16]u8,
+    ipv6_port: u16,
+    connection_id_len: u8,
+    connection_id: [20]u8,
+    stateless_reset_token: [16]u8,
+
+    pub fn hasIpv4(self: *const PreferredAddressTp) bool {
+        return self.ipv4_port != 0 or !std.mem.allEqual(u8, &self.ipv4, 0);
+    }
+
+    pub fn hasIpv6(self: *const PreferredAddressTp) bool {
+        return self.ipv6_port != 0 or !std.mem.allEqual(u8, &self.ipv6, 0);
+    }
+};
+
+/// Parse the encoded preferred_address transport-parameter body (RFC 9000
+/// §18.2).  Returns `null` if the body is shorter than the fixed prefix or
+/// the embedded connection-id length overflows the value buffer.
+fn parsePreferredAddress(value: []const u8) ?PreferredAddressTp {
+    // Fixed prefix: 4 (v4) + 2 (v4 port) + 16 (v6) + 2 (v6 port) + 1 (cid_len)
+    //             + 16 (reset token) = 41 bytes + connection_id.
+    if (value.len < 41) return null;
+    var pa: PreferredAddressTp = .{
+        .ipv4 = undefined,
+        .ipv4_port = 0,
+        .ipv6 = undefined,
+        .ipv6_port = 0,
+        .connection_id_len = 0,
+        .connection_id = .{0} ** 20,
+        .stateless_reset_token = undefined,
+    };
+    var p: usize = 0;
+    @memcpy(&pa.ipv4, value[p .. p + 4]);
+    p += 4;
+    pa.ipv4_port = std.mem.readInt(u16, value[p..][0..2], .big);
+    p += 2;
+    @memcpy(&pa.ipv6, value[p .. p + 16]);
+    p += 16;
+    pa.ipv6_port = std.mem.readInt(u16, value[p..][0..2], .big);
+    p += 2;
+    const cid_len = value[p];
+    p += 1;
+    if (cid_len > 20) return null;
+    if (p + cid_len + 16 > value.len) return null;
+    pa.connection_id_len = cid_len;
+    @memcpy(pa.connection_id[0..cid_len], value[p .. p + cid_len]);
+    p += cid_len;
+    @memcpy(&pa.stateless_reset_token, value[p .. p + 16]);
+    return pa;
+}
 
 /// Parse the encoded `quic_transport_parameters` TLS extension body
 /// (RFC 9000 §18). Unknown ids are skipped per §18.1. Reserved transport
@@ -311,6 +375,7 @@ pub fn parseTransportParams(bytes: []const u8) varint.DecodeError!PeerTransportP
             },
             0x0b => out.max_ack_delay_ms = readVarintField(value) catch continue,
             0x0c => out.disable_active_migration = (value_len == 0),
+            0x0d => out.preferred_address = parsePreferredAddress(value),
             0x0e => out.active_connection_id_limit = readVarintField(value) catch continue,
             else => {}, // unknown / reserved / connection-id params are not surfaced here
         }
@@ -423,6 +488,79 @@ test "transport params: disable_active_migration emitted only when opted in" {
         // 0x0c, length varint 0). The buffer must contain that exact pair.
         try testing.expect(std.mem.indexOf(u8, buf[0..n], &.{ 0x0c, 0x00 }) != null);
     }
+}
+
+test "transport params: preferred_address (0x0d) parses ipv4 + cid + reset token" {
+    const testing = std.testing;
+
+    // Hand-encode a minimal preferred_address TP body: ipv4 only, 8-byte CID.
+    // Fixed layout: 4 + 2 + 16 + 2 + 1 + 8 + 16 = 49 bytes of value.
+    var value: [49]u8 = undefined;
+    var vp: usize = 0;
+    @memcpy(value[vp .. vp + 4], &[_]u8{ 192, 0, 2, 1 });
+    vp += 4;
+    std.mem.writeInt(u16, value[vp..][0..2], 4433, .big);
+    vp += 2;
+    @memset(value[vp .. vp + 16], 0); // no ipv6
+    vp += 16;
+    std.mem.writeInt(u16, value[vp..][0..2], 0, .big);
+    vp += 2;
+    value[vp] = 8; // cid_len
+    vp += 1;
+    @memcpy(value[vp .. vp + 8], &[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 });
+    vp += 8;
+    @memset(value[vp .. vp + 16], 0xab); // reset token
+
+    // Wrap in TP framing: id 0x0d (varint), length 49 (varint), then value.
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    const id_e = try varint.encode(buf[pos..], 0x0d);
+    pos += id_e.len;
+    const len_e = try varint.encode(buf[pos..], value.len);
+    pos += len_e.len;
+    @memcpy(buf[pos .. pos + value.len], &value);
+    pos += value.len;
+
+    const parsed = try parseTransportParams(buf[0..pos]);
+    try testing.expect(parsed.preferred_address != null);
+    const pa = parsed.preferred_address.?;
+    try testing.expect(pa.hasIpv4());
+    try testing.expect(!pa.hasIpv6());
+    try testing.expectEqual(@as(u16, 4433), pa.ipv4_port);
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 1 }, &pa.ipv4);
+    try testing.expectEqual(@as(u8, 8), pa.connection_id_len);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 },
+        pa.connection_id[0..8],
+    );
+    try testing.expectEqual(@as(u8, 0xab), pa.stateless_reset_token[0]);
+}
+
+test "transport params: preferred_address absent → null" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expect(parsed.preferred_address == null);
+}
+
+test "transport params: preferred_address truncated body → null (silent skip)" {
+    const testing = std.testing;
+
+    // 30-byte value: shorter than the 41-byte fixed prefix.
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    const id_e = try varint.encode(buf[pos..], 0x0d);
+    pos += id_e.len;
+    const len_e = try varint.encode(buf[pos..], 30);
+    pos += len_e.len;
+    @memset(buf[pos .. pos + 30], 0);
+    pos += 30;
+
+    const parsed = try parseTransportParams(buf[0..pos]);
+    try testing.expect(parsed.preferred_address == null);
 }
 
 /// Tracks CRYPTO stream offsets per encryption level for reassembly.
