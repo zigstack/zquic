@@ -7185,10 +7185,12 @@ pub const Client = struct {
                 }
                 if (self.conn.peerCidCountHeld() >= self.conn.peer_active_cid_limit) {
                     dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued too many CIDs (limit={})\n", .{self.conn.peer_active_cid_limit});
+                    self.sendConnectionClose(0x09, "connection id limit");
                     return;
                 }
                 if (!self.conn.peerCidInsert(seq_r.value, new_cid, token)) {
                     dbg("io: peer CID pool full on NEW_CONNECTION_ID seq={}\n", .{seq_r.value});
+                    self.sendConnectionClose(0x09, "connection id limit");
                     return;
                 }
                 @memcpy(&self.conn.stateless_reset_token, &token);
@@ -7206,7 +7208,10 @@ pub const Client = struct {
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
                 dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
-                if (seq_r.value == 0) return;
+                if (seq_r.value == 0) {
+                    self.sendConnectionClose(0x0a, "retire connection id seq 0");
+                    return;
+                }
                 _ = self.conn.cidPoolRetireSeq(seq_r.value);
                 continue;
             }
@@ -7231,6 +7236,7 @@ pub const Client = struct {
                 const sid_type = sf_r.frame.stream_id & 3;
                 if (sid_type == 2) {
                     dbg("io: client STREAM_STATE_ERROR server wrote to client-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    self.sendConnectionClose(0x05, "write to send-only stream");
                     return;
                 }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
@@ -7252,6 +7258,59 @@ pub const Client = struct {
         if (self.deferred_ack_min_pn == null or decompressed_pn < self.deferred_ack_min_pn.?) {
             self.deferred_ack_min_pn = decompressed_pn;
         }
+    }
+
+    /// Encrypt and send a 1-RTT packet from the client.
+    fn send1Rtt(self: *Client, payload: []const u8) void {
+        if (self.conn.draining) return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        var padded_payload_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const min_len: usize = 3;
+        const effective_payload: []const u8 = if (payload.len < min_len) blk: {
+            @memcpy(padded_payload_buf[0..payload.len], payload);
+            @memset(padded_payload_buf[payload.len..min_len], 0x00);
+            break :blk padded_payload_buf[0..min_len];
+        } else payload;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            effective_payload,
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = compat.sendto(
+            self.sock,
+            send_buf[0..pkt_len],
+            0,
+            &self.conn.peer.any,
+            self.conn.peer.getOsSockLen(),
+        ) catch {};
+    }
+
+    /// Send a CONNECTION_CLOSE frame (QUIC layer, type 0x1c) and enter draining.
+    /// RFC 9000 §10.2.3: after sending CONNECTION_CLOSE the endpoint enters the
+    /// draining state and MUST NOT send any further packets except for additional
+    /// CONNECTION_CLOSE copies to handle packet loss.
+    fn sendConnectionClose(self: *Client, error_code: u64, reason: []const u8) void {
+        if (self.conn.conn_close_sent) return;
+        self.conn.conn_close_sent = true;
+        const frame = transport_frames.ConnectionClose{
+            .is_application = false,
+            .error_code = error_code,
+            .frame_type = 0,
+            .reason_phrase = reason,
+        };
+        var buf: [256]u8 = undefined;
+        const len = frame.serialize(&buf) catch return;
+        // Send before setting draining so send1Rtt does not suppress the frame.
+        self.send1Rtt(buf[0..len]);
+        dbg("io: client sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
+        self.conn.draining = true;
+        const pto = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);
+        self.conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
     }
 
     /// Send a single cumulative ACK for the highest PN accumulated since the
@@ -8593,4 +8652,56 @@ test "localCidCount: seq 0 plus pool entries" {
     const tok: [16]u8 = .{0} ** 16;
     _ = conn.cidPoolReserve(cid, tok);
     try std.testing.expectEqual(@as(u64, 2), conn.localCidCount());
+}
+
+test "rawAppStreamReceiveFrame: contiguous append and FIN offset" {
+    const allocator = std.testing.allocator;
+    var slot: RawAppStreamSlot = .{ .active = true, .stream_id = 4 };
+    defer slot.deinit(allocator);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 0, "hello");
+    try std.testing.expectEqualStrings("hello", slot.buf.items);
+    try std.testing.expectEqual(@as(u64, 5), slot.next_offset);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 5, "!");
+    try std.testing.expectEqualStrings("hello!", slot.buf.items);
+    try std.testing.expectEqual(@as(u64, 6), slot.next_offset);
+
+    // Duplicate / fully-overlapping retransmit is ignored.
+    try rawAppStreamReceiveFrame(allocator, &slot, 0, "hello!");
+    try std.testing.expectEqualStrings("hello!", slot.buf.items);
+    try std.testing.expectEqual(@as(u64, 6), slot.next_offset);
+}
+
+test "rawAppStreamReceiveFrame: out-of-order gap fill (libp2p reordering)" {
+    const allocator = std.testing.allocator;
+    var slot: RawAppStreamSlot = .{ .active = true, .stream_id = 8 };
+    defer slot.deinit(allocator);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 0, "abc");
+    try rawAppStreamReceiveFrame(allocator, &slot, 6, "ghi");
+    try std.testing.expectEqual(@as(u64, 3), slot.next_offset);
+    try std.testing.expectEqualStrings("abc", slot.buf.items);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 3, "def");
+    try std.testing.expectEqualStrings("abcdefghi", slot.buf.items);
+    try std.testing.expectEqual(@as(u64, 9), slot.next_offset);
+
+    // Partial overlap with next_offset splices only the new suffix.
+    try rawAppStreamReceiveFrame(allocator, &slot, 7, "hij");
+    try std.testing.expectEqualStrings("abcdefghij", slot.buf.items);
+    try std.testing.expectEqual(@as(u64, 10), slot.next_offset);
+}
+
+test "rawAppStreamReceiveFrame: duplicate out-of-order chunk is ignored" {
+    const allocator = std.testing.allocator;
+    var slot: RawAppStreamSlot = .{ .active = true, .stream_id = 12 };
+    defer slot.deinit(allocator);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 5, "tail");
+    try std.testing.expectEqual(@as(u64, 0), slot.next_offset);
+    try std.testing.expectEqual(@as(usize, 1), slot.out_of_order.items.len);
+
+    try rawAppStreamReceiveFrame(allocator, &slot, 5, "tail");
+    try std.testing.expectEqual(@as(usize, 1), slot.out_of_order.items.len);
 }
