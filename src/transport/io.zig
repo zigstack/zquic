@@ -34,6 +34,7 @@ const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
 const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
+const ack_frame_mod = @import("../frames/ack.zig");
 const version_neg_mod = @import("../packet/version_negotiation.zig");
 const congestion = @import("../loss/congestion.zig");
 const recovery = @import("../loss/recovery.zig");
@@ -200,6 +201,77 @@ pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, first_ack_range: u64, ect0: 
     pos += ce_enc.len;
     return pos;
 }
+
+/// Tracks received 1-RTT packet numbers for deferred ACK frames.
+/// Unlike min/max PN tracking, this preserves gaps so we never falsely ACK
+/// packets the peer still needs to retransmit.
+const ClientAppAckTracker = struct {
+    largest: u64 = 0,
+    range_count: usize = 0,
+    ranges: [128][2]u64 = undefined,
+
+    fn reset(self: *ClientAppAckTracker) void {
+        self.* = .{};
+    }
+
+    /// Record a received packet number. Returns true when the tracker is full
+    /// and the caller should flush an ACK before accepting more PNs.
+    fn observe(self: *ClientAppAckTracker, pn: u64) bool {
+        if (pn > self.largest) self.largest = pn;
+        if (self.range_count == 0) {
+            self.ranges[0] = .{ pn, pn };
+            self.range_count = 1;
+            return self.range_count >= 48;
+        }
+        const last = &self.ranges[self.range_count - 1];
+        if (pn + 1 == last[0]) {
+            last[0] = pn;
+            return self.range_count >= 48;
+        }
+        if (pn == last[1] + 1) {
+            last[1] = pn;
+            return self.range_count >= 48;
+        }
+        if (self.range_count < self.ranges.len) {
+            self.ranges[self.range_count] = .{ pn, pn };
+            self.range_count += 1;
+            return self.range_count >= 48;
+        }
+        return true;
+    }
+
+    fn buildWireFrame(self: *const ClientAppAckTracker, buf: []u8, ecn: ?ack_frame_mod.EcnCounts) !usize {
+        if (self.range_count == 0) return 0;
+        const n = @min(self.range_count, ack_frame_mod.max_ack_ranges);
+        var sorted: [128]ack_frame_mod.AckRange = undefined;
+        for (self.ranges[0..n], 0..) |r, i| {
+            sorted[i] = .{ .smallest = r[0], .largest = r[1] };
+        }
+        // Sort by largest PN descending (ACK frame wire order).
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < n) : (j += 1) {
+                if (sorted[j].largest > sorted[i].largest) {
+                    const tmp = sorted[i];
+                    sorted[i] = sorted[j];
+                    sorted[j] = tmp;
+                }
+            }
+        }
+        var frame = ack_frame_mod.AckFrame{
+            .largest_acknowledged = sorted[0].largest,
+            .ack_delay = 0,
+            .ranges = undefined,
+            .range_count = n,
+            .ecn = ecn,
+        };
+        for (0..n) |k| {
+            frame.ranges[k] = sorted[k];
+        }
+        return frame.serialize(buf);
+    }
+};
 
 /// Build a PADDING frame (one byte 0x00).
 pub fn buildPaddingFrames(out: []u8, count: usize) void {
@@ -654,6 +726,37 @@ fn buildRetireConnectionIdFrame(out: []u8, seq: u64) !usize {
     return 1 + enc.len;
 }
 
+/// Try decrypting a 1-RTT packet under `km`, sweeping PN reconstruction
+/// candidates when the high-water `largest` mark causes §17.1 aliasing on
+/// short wire encodings (reordered / retransmitted packets).
+fn tryUnprotect1RttWithPnCandidates(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    km: *const KeyMaterial,
+    cipher: PacketCipher,
+    largest: ?u64,
+) ?Decrypt1RttResult {
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, largest)) |r| {
+        return r;
+    } else |_| {}
+
+    if (largest) |hi| {
+        const floor = if (hi > 1024) hi - 1024 else 0;
+        var exp: u64 = hi;
+        while (exp > floor) : (exp -= 1) {
+            if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, exp)) |r| {
+                return r;
+            } else |_| {}
+        }
+    }
+
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, km, cipher, null)) |r| {
+        return r;
+    } else |_| {}
+    return null;
+}
+
 /// Decrypt an inbound 1-RTT packet with RFC 9001 §6 key-update handling.
 /// `recv_km` / `recv_km_prev` / `send_km` are the endpoint's receive and
 /// send key slots for this direction (server: recv=app_client_km).
@@ -670,19 +773,19 @@ fn decrypt1RttWithKeyUpdate(
     const cipher = conn.packet_cipher;
     const expected = conn.app_recv_pn;
 
-    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, recv_km, cipher, expected)) |r| {
+    if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, recv_km, cipher, expected)) |r| {
         return r;
-    } else |_| {}
+    }
 
     if (recv_km_prev.*) |prev| {
-        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &prev, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, &prev, cipher, expected)) |r| {
             return r;
-        } else |_| {}
+        }
     }
 
     if (incoming_phase != conn.peer_key_phase) {
         var nk = if (conn.use_v2) recv_km.nextGenV2() else recv_km.nextGen();
-        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &nk, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, &nk, cipher, expected)) |r| {
             recv_km_prev.* = recv_km.*;
             recv_km.* = nk;
             if (conn.key_update_pending) {
@@ -694,7 +797,7 @@ fn decrypt1RttWithKeyUpdate(
                 conn.key_phase_bit = !conn.key_phase_bit;
             }
             return r;
-        } else |_| {}
+        }
     }
 
     return error.DecryptFailed;
@@ -5727,18 +5830,9 @@ pub const Client = struct {
     /// Opaque STREAM receive buffers when `raw_application_streams` is set.
     raw_app_recv: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
-    /// Deferred ACK: instead of sending one ACK per received server packet,
-    /// we accumulate the highest received PN here and flush a single cumulative
-    /// ACK after draining all pending packets in the recv loop.  This reduces
-    /// the burst from (N ACKs + N GETs) to (1 ACK + N GETs), keeping the
-    /// combined burst under the NS3 DropTail queue limit of 25 packets.
-    deferred_ack_pn: ?u64 = null,
-    /// Minimum packet number seen since the last deferred ACK flush.
-    /// Together with deferred_ack_pn (the max), this lets flushDeferredAck
-    /// compute an accurate first_ack_range that covers all received packets,
-    /// preventing the server's k_packet_threshold loss detector from
-    /// mis-classifying contiguously-received packets as lost.
-    deferred_ack_min_pn: ?u64 = null,
+    /// Deferred ACK: accumulate received 1-RTT PNs and flush one ACK frame
+    /// after draining all pending packets in the recv loop.
+    app_ack: ClientAppAckTracker = .{},
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -6358,6 +6452,7 @@ pub const Client = struct {
         self.streams_done = 0;
         self.requested = false;
         self.zerortt_count = 0;
+        self.app_ack.reset();
 
         // Clear packet buffers (ticket_store is preserved intentionally).
         self.initial_pkt = [_]u8{0} ** MAX_DATAGRAM_SIZE;
@@ -6518,6 +6613,9 @@ pub const Client = struct {
                 if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
                     self.send0RttRequests(server_addr) catch {};
                 }
+                // downloadUrls blocks with its own recv loop; extend the outer
+                // deadline so post-batch retransmits can still complete.
+                deadline = compat.milliTimestamp() + 120_000;
                 if (self.active_urls.len > 0) {
                     try self.downloadUrls(server_addr);
                 }
@@ -7502,16 +7600,10 @@ pub const Client = struct {
             return;
         }
 
-        // Defer ACK: accumulate the highest received PN rather than sending
-        // one ACK per packet.  The actual ACK is flushed once after the recv
-        // drain loop in downloadUrls.  This keeps the combined burst
-        // (deferred ACK + next GET batch) well within the NS3 DropTail queue
-        // limit of 25 packets (1 ACK + 20 GETs = 21 ≤ 25).
-        if (decompressed_pn > (self.deferred_ack_pn orelse 0)) {
-            self.deferred_ack_pn = decompressed_pn;
-        }
-        if (self.deferred_ack_min_pn == null or decompressed_pn < self.deferred_ack_min_pn.?) {
-            self.deferred_ack_min_pn = decompressed_pn;
+        // Defer ACK until after the recv drain loop in downloadUrls.
+        if (self.app_ack.observe(decompressed_pn)) {
+            self.flushDeferredAck();
+            _ = self.app_ack.observe(decompressed_pn);
         }
     }
 
@@ -7533,29 +7625,20 @@ pub const Client = struct {
     /// this after processing inbound datagrams (typically once per event-loop
     /// iteration) so the peer receives ACKs and keeps sending application data.
     pub fn flushDeferredAck(self: *Client) void {
-        const largest_pn = self.deferred_ack_pn orelse return;
-        self.deferred_ack_pn = null;
-        // Compute first_ack_range: covers [min_pn .. largest_pn] assuming all
-        // packets in that window arrived (no gaps).  This prevents the server's
-        // k_packet_threshold loss detector from mis-classifying received packets
-        // as lost due to a sparse ACK (first_ack_range=0).
-        const min_pn = self.deferred_ack_min_pn orelse largest_pn;
-        self.deferred_ack_min_pn = null;
-        const first_ack_range = largest_pn - min_pn;
-        var ack_buf: [56]u8 = undefined;
-        const ack_len = if (self.conn.ecn_ect0_recv > 0 or
+        if (self.app_ack.range_count == 0) return;
+        const ecn: ?ack_frame_mod.EcnCounts = if (self.conn.ecn_ect0_recv > 0 or
             self.conn.ecn_ect1_recv > 0 or
             self.conn.ecn_ce_recv > 0)
-            buildAckEcnFrame(
-                &ack_buf,
-                largest_pn,
-                first_ack_range,
-                self.conn.ecn_ect0_recv,
-                self.conn.ecn_ect1_recv,
-                self.conn.ecn_ce_recv,
-            ) catch return
+            .{
+                .ect0 = self.conn.ecn_ect0_recv,
+                .ect1 = self.conn.ecn_ect1_recv,
+                .ecn_ce = self.conn.ecn_ce_recv,
+            }
         else
-            buildAckFrame(&ack_buf, largest_pn, first_ack_range) catch return;
+            null;
+        var ack_buf: [256]u8 = undefined;
+        const ack_len = self.app_ack.buildWireFrame(&ack_buf, ecn) catch return;
+        if (ack_len == 0) return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,
@@ -7575,7 +7658,10 @@ pub const Client = struct {
             &self.conn.peer.any,
             self.conn.peer.getOsSockLen(),
         ) catch {};
-        dbg("io: client flushed deferred ACK largest_pn={}\n", .{largest_pn});
+        dbg("io: client flushed deferred ACK largest_pn={} ranges={}\n", .{
+            self.app_ack.largest, self.app_ack.range_count,
+        });
+        self.app_ack.reset();
     }
 
     fn handleAppCrypto(self: *Client, data: []const u8) void {
@@ -8391,15 +8477,6 @@ pub const Client = struct {
             batch_start = batch_end;
         }
         dbg("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
-
-        // Close all stream files
-        for (&self.streams) |*s| {
-            if (s.active) {
-                s.file.close();
-                s.active = false;
-                self.http09FreeStreamReorder(s);
-            }
-        }
     }
 };
 
