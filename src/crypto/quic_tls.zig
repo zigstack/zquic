@@ -107,8 +107,10 @@ pub fn stripRecords(out: []u8, input: []const u8) usize {
     return out_pos;
 }
 
-/// QUIC transport parameters extension type (RFC 9001 §8.2)
-pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0xffa5;
+/// QUIC transport parameters extension type (RFC 9001 §8.2).
+pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0x0039;
+/// Pre-RFC draft extension type; still accepted from peers (quinn/rustls interop).
+pub const TRANSPORT_PARAMS_EXT_TYPE_DRAFT: u16 = 0xffa5;
 
 /// Options for encoding the QUIC transport parameters TLS extension (RFC 9000 §18).
 pub const TransportParamsOpts = struct {
