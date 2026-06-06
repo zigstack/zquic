@@ -83,6 +83,7 @@ test {
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
     _ = @import("transport/migration.zig");
+    _ = @import("transport/raw_app_stream.zig");
     _ = @import("transport/io.zig");
     _ = @import("transport/path_mtu.zig");
     _ = @import("http3/frame.zig");

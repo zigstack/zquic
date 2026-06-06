@@ -9,7 +9,7 @@ Tracker for closing the gap between zquic and production-grade quinn usage
 |------|-------|
 | zquic↔zquic interop (13 tests) | **12–13/13** in PR CI |
 | zquic↔quinn cross-impl | **P0 subset** in PR CI (handshake, transfer, multiplexing, both directions); full matrix nightly |
-| Raw application streams | Implemented; unit tests for reassembly; embed via `feedPacket` + `processPendingWork` |
+| Raw application streams | Implemented in `raw_app_stream.zig`; unit tests for reassembly; embed via `feedPacket` + `processPendingWork` |
 | 0-RTT | AES-128 only; ChaCha20 / AES-256 resumption not wired |
 | Cipher-aware 1-RTT | Send + receive (#157, #158) |
 | Key update / CID / anti-amp | Cooldown, retirement, 3× rule (#159) |

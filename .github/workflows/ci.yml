@@ -328,4 +328,6 @@ jobs:
               print(f"  CROSS FAILED: {len(cross_failed):2d}  {cross_failed}")
           print(f"  UNSUPPORTED : {len(unsupported):2d}  {unsupported}")
           print(f"{'='*55}\n")
+          if failed or cross_failed:
+              sys.exit(1)
           EOF
