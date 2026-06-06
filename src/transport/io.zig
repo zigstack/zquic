@@ -885,6 +885,17 @@ fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64)
 /// Max Handshake datagrams for an 8192-byte server flight (~8 at 1100 B/crypto).
 const max_server_flight_resend_datagrams: usize = 10;
 
+/// One slot in `ConnState.per_stream_send_max`: the highest per-stream send
+/// window the peer has advertised for `stream_id` via MAX_STREAM_DATA
+/// (RFC 9000 §19.10). `in_use=false` marks a free slot. RFC 9000 §19.10
+/// requires per-stream limits to be monotonically non-decreasing, so we
+/// only ever raise `max`.
+pub const PeerStreamSendMaxEntry = struct {
+    stream_id: u64 = 0,
+    max: u64 = 0,
+    in_use: bool = false,
+};
+
 /// Cached UDP payload for server flight retransmit (same PN/ciphertext).
 const StoredDatagram = struct {
     len: u16 = 0,
@@ -1127,15 +1138,23 @@ pub const ConnState = struct {
     fc_bytes_recv: u64 = 0,
 
     // ── Per-stream initial limits the peer advertised (RFC 9000 §18.2) ────────
-    // Currently captured but not yet enforced on the send path; per-stream
-    // gating is queued as a follow-up to this PR (see issue #138 §"Flow
-    // control"). Stored zero-initialised — `applyPeerTransportParams` updates
+    // The §18.2 initial values seed `peerStreamSendLimit`; mid-connection
+    // bumps from the peer's MAX_STREAM_DATA (0x11) frames are applied to
+    // `per_stream_send_max` (RFC 9000 §19.10) and override the initial when
+    // present. Stored zero-initialised — `applyPeerTransportParams` updates
     // them on handshake completion.
     peer_initial_max_stream_data_bidi_local: u64 = 0,
     peer_initial_max_stream_data_bidi_remote: u64 = 0,
     peer_initial_max_stream_data_uni: u64 = 0,
     peer_max_streams_bidi: u64 = 0,
     peer_max_streams_uni: u64 = 0,
+    /// Per-stream send-window overrides set by peer MAX_STREAM_DATA frames
+    /// (RFC 9000 §19.10). A 64-entry table is enough headroom for libp2p's
+    /// per-message-stream pattern (gossipsub + req/resp). When the table is
+    /// full we fall back to the §18.2 initial limit for any further streams,
+    /// which only causes us to be over-conservative on send — never to
+    /// violate the peer's window.
+    per_stream_send_max: [64]PeerStreamSendMaxEntry = [_]PeerStreamSendMaxEntry{.{}} ** 64,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -1329,18 +1348,33 @@ pub const ConnState = struct {
         return null;
     }
 
-    /// Peer's per-stream send window for `stream_id` (RFC 9000 §4.1, §18.2).
+    /// Peer's per-stream send window for `stream_id` (RFC 9000 §4.1, §18.2,
+    /// §19.10).
     ///
-    /// Returns the *initial* peer-advertised limit. Per-stream MAX_STREAM_DATA
-    /// updates are not yet tracked; in practice the 16 MiB initial window we
-    /// (and most peers) advertise is enough headroom for libp2p req/resp and
-    /// gossipsub traffic. Full per-stream tracking is queued as a follow-up.
+    /// Returns `max(initial §18.2 limit, peer MAX_STREAM_DATA override)`. The
+    /// override is sourced from `per_stream_send_max`, populated as the peer's
+    /// 0x11 frames arrive via `applyPeerMaxStreamData`. RFC 9000 §19.10
+    /// guarantees the override is monotonically non-decreasing, but we still
+    /// clamp to the initial as a defence: a peer that lowers the limit (in
+    /// violation of the spec) must not shrink our usable window.
     ///
     /// `we_are_server` selects the right §18.2 view: streams *we* initiated
     /// land in the peer's `bidi_remote` (or `uni`) bucket, peer-initiated
     /// streams land in `bidi_local`. Stream id encoding (RFC 9000 §2.1):
     /// bit 0 = initiator (0=client, 1=server), bit 1 = uni.
     pub fn peerStreamSendLimit(self: *const ConnState, stream_id: u64, we_are_server: bool) u64 {
+        const initial = self.peerStreamSendLimitInitial(stream_id, we_are_server);
+        for (&self.per_stream_send_max) |e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                return if (e.max > initial) e.max else initial;
+            }
+        }
+        return initial;
+    }
+
+    /// §18.2-only view used by `peerStreamSendLimit` before consulting the
+    /// MAX_STREAM_DATA override table.
+    fn peerStreamSendLimitInitial(self: *const ConnState, stream_id: u64, we_are_server: bool) u64 {
         const t = stream_id & 0x3;
         const is_uni = (t & 0x02) != 0;
         const we_initiated = (we_are_server and (t == 0x01 or t == 0x03)) or
@@ -1350,6 +1384,52 @@ pub const ConnState = struct {
             self.peer_initial_max_stream_data_bidi_remote
         else
             self.peer_initial_max_stream_data_bidi_local;
+    }
+
+    /// Apply a MAX_STREAM_DATA (0x11) frame from the peer (RFC 9000 §19.10).
+    /// Inserts or updates the entry for `stream_id` so subsequent
+    /// `peerStreamSendLimit` calls reflect the new ceiling. RFC 9000 §19.10
+    /// requires the value to be monotonically non-decreasing — a frame that
+    /// would *lower* an existing entry is silently dropped (defensive).
+    ///
+    /// Returns true when the table was modified. False means either:
+    ///   - the new value is ≤ the stored value (spec-violating peer or stale
+    ///     frame after reordering), or
+    ///   - the table is full and we did not previously track this stream.
+    /// In the table-full case the gate falls back to the §18.2 initial limit
+    /// for that stream, which is strictly conservative (we will under-send,
+    /// not over-send), and the peer will get a STREAM_DATA_BLOCKED if it
+    /// matters in practice.
+    pub fn applyPeerMaxStreamData(self: *ConnState, stream_id: u64, new_max: u64) bool {
+        for (&self.per_stream_send_max) |*e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                if (new_max > e.max) {
+                    e.max = new_max;
+                    return true;
+                }
+                return false;
+            }
+        }
+        for (&self.per_stream_send_max) |*e| {
+            if (!e.in_use) {
+                e.* = .{ .stream_id = stream_id, .max = new_max, .in_use = true };
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Drop the per-stream send-window entry for `stream_id`. Called from the
+    /// RESET_STREAM (0x04) handlers — once the peer has cancelled a stream
+    /// the stream id will never be re-used (RFC 9000 §2.1) so the slot is
+    /// pure dead weight. Safe to call on a stream that was never tracked.
+    pub fn clearPeerStreamSendMax(self: *ConnState, stream_id: u64) void {
+        for (&self.per_stream_send_max) |*e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                e.* = .{};
+                return;
+            }
+        }
     }
 };
 
@@ -1641,8 +1721,8 @@ pub const Server = struct {
         if (is_fresh) {
             // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Compares
             // the highest end-offset on this stream against the peer's
-            // advertised initial limit. We only have the initial limit until
-            // per-stream MAX_STREAM_DATA tracking lands as a follow-up.
+            // advertised limit — initial §18.2 value, raised by any
+            // MAX_STREAM_DATA (0x11) frames the peer has sent since.
             const stream_limit = conn.peerStreamSendLimit(stream_id, true);
             if (stream_limit > 0 and offset +| data.len > stream_limit) {
                 dbg("io: server per-stream gate stream_id={} end={} limit={} — sending STREAM_DATA_BLOCKED\n", .{
@@ -3419,19 +3499,17 @@ pub const Server = struct {
                 continue;
             }
             if (ft == 0x11) {
-                // MAX_STREAM_DATA (RFC 9000 §19.10) — peer raises send window on
-                // a *specific stream*.  This is a per-stream limit and MUST NOT
-                // be conflated with the connection-level limit (MAX_DATA / 0x10
-                // / conn.fc_send_max).  We currently do not enforce per-stream
-                // send credit (only connection-level), so the safest thing is
-                // to parse the frame for protocol-conformance (varint decode +
-                // skip), and NOT clobber conn.fc_send_max with the per-stream
-                // value.  TODO: track per-stream limits in a side table once
-                // raw-application streams enforce them on the send path.
+                // MAX_STREAM_DATA (RFC 9000 §19.10) — peer raises the send
+                // window on a *specific stream*.  This is a per-stream limit
+                // and MUST NOT be conflated with the connection-level limit
+                // (MAX_DATA / 0x10 / conn.fc_send_max).  Applied to
+                // `per_stream_send_max` so the gate in
+                // `sendRawStreamDataInner` honors the new ceiling.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                dbg("io: MAX_STREAM_DATA stream_id={} max={} (per-stream, not applied to conn fc_send_max)\n", .{
-                    r.frame.stream_id, r.frame.maximum_stream_data,
+                const updated = conn.applyPeerMaxStreamData(r.frame.stream_id, r.frame.maximum_stream_data);
+                dbg("io: MAX_STREAM_DATA stream_id={} max={} applied={}\n", .{
+                    r.frame.stream_id, r.frame.maximum_stream_data, updated,
                 });
                 continue;
             }
@@ -3493,6 +3571,9 @@ pub const Server = struct {
                         slot.active = false;
                     }
                 }
+                // Stream IDs are not reused (RFC 9000 §2.1); the per-stream
+                // send-window slot is dead weight once the peer has reset.
+                conn.clearPeerStreamSendMax(r.frame.stream_id);
                 continue;
             }
             if (ft == 0x05) {
@@ -3502,6 +3583,10 @@ pub const Server = struct {
                 dbg("io: STOP_SENDING stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
+                // Peer asked us to stop sending — no further STREAM frames will
+                // be emitted on this stream id, so the per-stream send-window
+                // slot is dead weight.
+                conn.clearPeerStreamSendMax(r.frame.stream_id);
                 // Respond by resetting the stream.
                 self.sendResetStream(conn, r.frame.stream_id, r.frame.application_protocol_error_code, src);
                 continue;
@@ -6610,12 +6695,13 @@ pub const Client = struct {
                 // MAX_STREAM_DATA (RFC 9000 §19.10) — per-stream limit; mirror
                 // of the server-side handler.  Must NOT update conn.fc_send_max
                 // (that is the connection-level MAX_DATA limit, frame 0x10).
-                // We currently don't enforce per-stream send credit; decode for
-                // protocol conformance and skip.
+                // Applied to `per_stream_send_max` so the client-side gate in
+                // `sendRawStreamDataInner` honors the new ceiling.
                 const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                dbg("io: client MAX_STREAM_DATA stream_id={} max={} (per-stream, not applied to conn fc_send_max)\n", .{
-                    r.frame.stream_id, r.frame.maximum_stream_data,
+                const updated = self.conn.applyPeerMaxStreamData(r.frame.stream_id, r.frame.maximum_stream_data);
+                dbg("io: client MAX_STREAM_DATA stream_id={} max={} applied={}\n", .{
+                    r.frame.stream_id, r.frame.maximum_stream_data, updated,
                 });
                 continue;
             }
@@ -6647,6 +6733,9 @@ pub const Client = struct {
                 dbg("io: client RESET_STREAM stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
+                // Stream IDs are not reused (RFC 9000 §2.1); drop the
+                // per-stream send-window slot for this id.
+                self.conn.clearPeerStreamSendMax(r.frame.stream_id);
                 continue;
             }
             if (ft == 0x05) {
@@ -6656,6 +6745,9 @@ pub const Client = struct {
                 dbg("io: client STOP_SENDING stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
+                // No further STREAM frames will go out on this stream id;
+                // drop the per-stream send-window slot.
+                self.conn.clearPeerStreamSendMax(r.frame.stream_id);
                 continue;
             }
             if (ft == 0x1c or ft == 0x1d) {
@@ -7808,4 +7900,104 @@ test "io PEM: ServerConfig with both nil falls back to path loader" {
     else
         loadCertDer(a, config.cert_path);
     try std.testing.expectError(error.FileNotFound, r);
+}
+
+// ── Per-stream send-window tests (RFC 9000 §19.10) ────────────────────────────
+//
+// The minimal-ConnState helper avoids spinning up a real handshake: the
+// methods under test only touch `per_stream_send_max` and the §18.2 initial
+// fields, so a zero-init with the three no-default fields filled in is
+// sufficient.
+
+fn makeConnForStreamTest() ConnState {
+    return ConnState{
+        .local_cid = .{},
+        .remote_cid = .{},
+        .peer = std.mem.zeroes(compat.Address),
+    };
+}
+
+test "per-stream send max: initial limit when no MAX_STREAM_DATA seen" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 16_777_216;
+    conn.peer_initial_max_stream_data_bidi_remote = 16_777_216;
+    conn.peer_initial_max_stream_data_uni = 16_777_216;
+
+    // Client-initiated bidi from the server's view = bidi_local (we are server,
+    // peer = client opened it).
+    try std.testing.expectEqual(@as(u64, 16_777_216), conn.peerStreamSendLimit(0, true));
+    // Server-initiated bidi from the server's view = bidi_remote.
+    try std.testing.expectEqual(@as(u64, 16_777_216), conn.peerStreamSendLimit(1, true));
+    // Client-initiated uni.
+    try std.testing.expectEqual(@as(u64, 16_777_216), conn.peerStreamSendLimit(2, true));
+}
+
+test "per-stream send max: MAX_STREAM_DATA raises the gate" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 1_000;
+
+    try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(0, true));
+    try std.testing.expect(conn.applyPeerMaxStreamData(0, 5_000));
+    try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
+    // Unrelated stream still uses the initial limit.
+    try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(4, true));
+}
+
+test "per-stream send max: non-monotonic frames are dropped (§19.10)" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 1_000;
+
+    try std.testing.expect(conn.applyPeerMaxStreamData(0, 5_000));
+    // A lower value (e.g. reordered/stale frame) MUST NOT lower the stored max.
+    try std.testing.expect(!conn.applyPeerMaxStreamData(0, 4_000));
+    try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
+    // Equal also returns false (no change).
+    try std.testing.expect(!conn.applyPeerMaxStreamData(0, 5_000));
+    try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
+}
+
+test "per-stream send max: value below initial is clamped on lookup" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 10_000;
+
+    // Spec-violating peer sends MAX_STREAM_DATA below the initial limit.
+    // The entry is inserted (we trust then verify on lookup) but lookup
+    // must never return below the §18.2 ceiling.
+    try std.testing.expect(conn.applyPeerMaxStreamData(0, 500));
+    try std.testing.expectEqual(@as(u64, 10_000), conn.peerStreamSendLimit(0, true));
+}
+
+test "per-stream send max: clear drops the entry, lookup falls back to initial" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 1_000;
+    _ = conn.applyPeerMaxStreamData(0, 5_000);
+    try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
+
+    conn.clearPeerStreamSendMax(0);
+    try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(0, true));
+    // Idempotent: clearing a never-tracked stream is a no-op.
+    conn.clearPeerStreamSendMax(99);
+}
+
+test "per-stream send max: table-full keeps existing tracked streams correct" {
+    var conn = makeConnForStreamTest();
+    conn.peer_initial_max_stream_data_bidi_local = 1_000;
+    conn.peer_initial_max_stream_data_bidi_remote = 1_000;
+    conn.peer_initial_max_stream_data_uni = 1_000;
+
+    // Fill the 64-entry table with one fresh entry per stream id.
+    var sid: u64 = 0;
+    while (sid < conn.per_stream_send_max.len) : (sid += 1) {
+        // Use stream ids of the same parity so we stay in one bucket; the
+        // multiplier of 4 walks the §2.1 stream-id space without colliding.
+        try std.testing.expect(conn.applyPeerMaxStreamData(sid * 4, 5_000 + sid));
+    }
+    // Updates to already-tracked streams still succeed.
+    try std.testing.expect(conn.applyPeerMaxStreamData(0, 9_999));
+    try std.testing.expectEqual(@as(u64, 9_999), conn.peerStreamSendLimit(0, true));
+    // A brand-new stream cannot be inserted; lookup falls back to the
+    // initial limit (under-send, never over-send).
+    const new_sid: u64 = 4_096;
+    try std.testing.expect(!conn.applyPeerMaxStreamData(new_sid, 9_999));
+    try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
 }
