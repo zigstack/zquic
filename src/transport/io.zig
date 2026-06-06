@@ -821,6 +821,17 @@ const Pending1RttPayload = struct {
     data: [4096]u8 = undefined,
 };
 
+/// One entry in the local CID pool an endpoint advertises to its peer
+/// via `NEW_CONNECTION_ID` frames (RFC 9000 §5.1.1).
+pub const CidPoolEntry = struct {
+    cid: ConnectionId,
+    seq: u64,
+    /// Stateless-reset token bound to this CID (RFC 9000 §10.3.1).
+    /// Each CID gets a fresh token so retiring one doesn't invalidate the
+    /// others.
+    reset_token: [16]u8,
+};
+
 /// Connection lifecycle state.
 pub const ConnPhase = enum {
     /// Waiting for ClientHello Initial packet.
@@ -897,10 +908,16 @@ pub const ConnState = struct {
     // can be matched back to the right ConnState.
     init_dcid: ?ConnectionId = null,
 
-    // Alternative local CID sent to peer via NEW_CONNECTION_ID (for migration).
-    alt_local_cid: ?ConnectionId = null,
-    // Sequence number of alt_local_cid (used to validate RETIRE_CONNECTION_ID).
-    alt_local_cid_seq: u64 = 1,
+    // Pool of alternative local CIDs we have issued to the peer via
+    // NEW_CONNECTION_ID frames (RFC 9000 §5.1.1, §19.15). The peer may use
+    // any of these CIDs as the DCID on incoming 1-RTT packets — `local_cid`
+    // (sequence 0, allocated during the handshake) plus up to N pool entries.
+    // RETIRE_CONNECTION_ID nulls a slot; the next free slot is refilled with
+    // a fresh CID so the peer always sees `active_connection_id_limit` CIDs.
+    cid_pool: [4]?CidPoolEntry = [_]?CidPoolEntry{null} ** 4,
+    // Sequence number to assign to the next NEW_CONNECTION_ID we emit.
+    // Sequence 0 is reserved for `local_cid`, so the first pool entry uses 1.
+    cid_pool_next_seq: u64 = 1,
     // Alternative remote CID received from peer via NEW_CONNECTION_ID (use on migration).
     next_remote_cid: ?ConnectionId = null,
 
@@ -1119,6 +1136,14 @@ pub const ConnState = struct {
     peer_initial_max_stream_data_uni: u64 = 0,
     peer_max_streams_bidi: u64 = 0,
     peer_max_streams_uni: u64 = 0,
+    /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
+    /// idle timeout is min(local, peer); 0 means peer omitted the param so
+    /// only the local value applies.
+    peer_max_idle_timeout_ms: u64 = 0,
+    /// Peer's `max_ack_delay` (RFC 9000 §13.2.1, §18.2) in milliseconds.
+    /// Used by our PTO computation (RFC 9002 §6.2.1). Defaults to the spec
+    /// default of 25 ms.
+    peer_max_ack_delay_ms: u64 = 25,
 
     // ── Graceful teardown ─────────────────────────────────────────────────────
     // draining is set when CONNECTION_CLOSE is sent or received; once set, all
@@ -1258,6 +1283,73 @@ pub const ConnState = struct {
         self.peer_initial_max_stream_data_uni = parsed.initial_max_stream_data_uni;
         self.peer_max_streams_bidi = parsed.initial_max_streams_bidi;
         self.peer_max_streams_uni = parsed.initial_max_streams_uni;
+        self.peer_max_idle_timeout_ms = parsed.max_idle_timeout_ms;
+        self.peer_max_ack_delay_ms = parsed.max_ack_delay_ms;
+    }
+
+    /// Match an incoming DCID against the alternative-CID pool.
+    /// Returns the slot index on hit (so callers can update last-use stats),
+    /// null on miss. `local_cid` (sequence 0) is matched separately by the
+    /// caller — this only covers post-handshake-issued alternates.
+    pub fn cidPoolFind(self: *const ConnState, candidate: ConnectionId) ?usize {
+        for (self.cid_pool, 0..) |slot, i| {
+            if (slot) |entry| {
+                if (ConnectionId.eql(entry.cid, candidate)) return i;
+            }
+        }
+        return null;
+    }
+
+    /// Retire the pool entry with the given sequence number.
+    /// Returns true if a matching entry was found and cleared.
+    pub fn cidPoolRetireSeq(self: *ConnState, seq: u64) bool {
+        for (&self.cid_pool) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.seq == seq) {
+                    slot.* = null;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Allocate the first empty slot for a fresh CID. Returns the assigned
+    /// sequence number on success. Returns null when the pool is full so the
+    /// caller can suppress the NEW_CONNECTION_ID emission.
+    pub fn cidPoolReserve(self: *ConnState, cid: ConnectionId, reset_token: [16]u8) ?u64 {
+        for (&self.cid_pool) |*slot| {
+            if (slot.* == null) {
+                const seq = self.cid_pool_next_seq;
+                self.cid_pool_next_seq += 1;
+                slot.* = .{ .cid = cid, .seq = seq, .reset_token = reset_token };
+                return seq;
+            }
+        }
+        return null;
+    }
+
+    /// Peer's per-stream send window for `stream_id` (RFC 9000 §4.1, §18.2).
+    ///
+    /// Returns the *initial* peer-advertised limit. Per-stream MAX_STREAM_DATA
+    /// updates are not yet tracked; in practice the 16 MiB initial window we
+    /// (and most peers) advertise is enough headroom for libp2p req/resp and
+    /// gossipsub traffic. Full per-stream tracking is queued as a follow-up.
+    ///
+    /// `we_are_server` selects the right §18.2 view: streams *we* initiated
+    /// land in the peer's `bidi_remote` (or `uni`) bucket, peer-initiated
+    /// streams land in `bidi_local`. Stream id encoding (RFC 9000 §2.1):
+    /// bit 0 = initiator (0=client, 1=server), bit 1 = uni.
+    pub fn peerStreamSendLimit(self: *const ConnState, stream_id: u64, we_are_server: bool) u64 {
+        const t = stream_id & 0x3;
+        const is_uni = (t & 0x02) != 0;
+        const we_initiated = (we_are_server and (t == 0x01 or t == 0x03)) or
+            (!we_are_server and (t == 0x00 or t == 0x02));
+        if (is_uni) return self.peer_initial_max_stream_data_uni;
+        return if (we_initiated)
+            self.peer_initial_max_stream_data_bidi_remote
+        else
+            self.peer_initial_max_stream_data_bidi_local;
     }
 };
 
@@ -1547,6 +1639,22 @@ pub const Server = struct {
         // already charged.
         const is_fresh = owned_buf == null;
         if (is_fresh) {
+            // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Compares
+            // the highest end-offset on this stream against the peer's
+            // advertised initial limit. We only have the initial limit until
+            // per-stream MAX_STREAM_DATA tracking lands as a follow-up.
+            const stream_limit = conn.peerStreamSendLimit(stream_id, true);
+            if (stream_limit > 0 and offset +| data.len > stream_limit) {
+                dbg("io: server per-stream gate stream_id={} end={} limit={} — sending STREAM_DATA_BLOCKED\n", .{
+                    stream_id, offset + data.len, stream_limit,
+                });
+                var blk_buf: [24]u8 = undefined;
+                blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+                const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return;
+                const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return;
+                self.send1Rtt(conn, blk_buf[0 .. 1 + sid_enc.len + lim_enc.len], conn.peer);
+                return;
+            }
             const projected: u64 = conn.fc_bytes_sent +| data.len;
             if (projected > conn.fc_send_max) {
                 dbg("io: server send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
@@ -1626,7 +1734,7 @@ pub const Server = struct {
     /// Free connection slots that have completed their draining period (RFC 9000 §10.2.2).
     fn reapDrainedConnections(self: *Server) void {
         const now = compat.milliTimestamp();
-        const idle_timeout_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
+        const local_idle_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
                 // Draining period expired.
@@ -1636,7 +1744,13 @@ pub const Server = struct {
                     slot.* = null;
                     continue;
                 }
-                // Idle timeout: no packet received for idle_timeout_ms.
+                // Effective idle timeout is min(local, peer) per RFC 9000 §10.1.
+                // peer_max_idle_timeout_ms == 0 means the peer omitted the
+                // param, so only our local value applies.
+                const idle_timeout_ms: i64 = if (conn.peer_max_idle_timeout_ms == 0)
+                    local_idle_ms
+                else
+                    @min(local_idle_ms, @as(i64, @intCast(conn.peer_max_idle_timeout_ms)));
                 if (conn.phase == .connected and conn.last_recv_ms > 0 and
                     now - conn.last_recv_ms > idle_timeout_ms)
                 {
@@ -1824,9 +1938,7 @@ pub const Server = struct {
         for (&self.conns) |*slot| {
             if (slot.*) |*c| {
                 if (ConnectionId.eql(c.local_cid, dcid)) return c;
-                if (c.alt_local_cid) |alt| {
-                    if (ConnectionId.eql(alt, dcid)) return c;
-                }
+                if (c.cidPoolFind(dcid) != null) return c;
             }
         }
         return null;
@@ -2393,10 +2505,19 @@ pub const Server = struct {
             dbg("io: missing original_destination_connection_id for server transport params\n", .{});
             return;
         };
+        // Generate the stateless-reset token bound to `local_cid` (sequence 0)
+        // before we encode transport parameters, so the SRT field is populated
+        // even if no NEW_CONNECTION_ID frame is ever sent on this connection
+        // (RFC 9000 §10.3.1, §18.2 stateless_reset_token).
+        if (!conn.stateless_reset_token_set) {
+            compat.random.bytes(&conn.stateless_reset_token);
+            conn.stateless_reset_token_set = true;
+        }
         var tp_buf: [512]u8 = undefined;
         const tp_len = quic_tls_mod.buildTransportParams(&tp_buf, .{
             .initial_source_cid = conn.local_cid.slice(),
             .original_destination_cid = odcid,
+            .stateless_reset_token = conn.stateless_reset_token,
         }) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
@@ -2837,31 +2958,45 @@ pub const Server = struct {
             }
         }
 
-        // NEW_CONNECTION_ID frame (RFC 9000 §19.15) — give the client an
-        // alternative CID to use when it migrates (--migrate mode only).
-        if (self.config.migrate) {
-            const new_cid = ConnectionId.random(compat.random, 8);
-            conn.alt_local_cid = new_cid;
-            if (fp + 28 <= frames_buf.len) {
-                frames_buf[fp] = 0x18;
-                fp += 1; // NEW_CONNECTION_ID type
-                frames_buf[fp] = 0x01;
-                fp += 1; // sequence_number = 1
-                frames_buf[fp] = 0x00;
-                fp += 1; // retire_prior_to = 0
-                frames_buf[fp] = 0x08;
-                fp += 1; // cid length = 8
-                @memcpy(frames_buf[fp .. fp + 8], new_cid.slice());
-                fp += 8;
-                // Generate a random stateless reset token (RFC 9000 §10.3) once
-                // per connection and include it with the NEW_CONNECTION_ID frame.
-                if (!conn.stateless_reset_token_set) {
-                    compat.random.bytes(&conn.stateless_reset_token);
-                    conn.stateless_reset_token_set = true;
+        // NEW_CONNECTION_ID frames (RFC 9000 §19.15) — issue alternative CIDs
+        // up to the pool limit so the peer can rotate / migrate / NAT-rebind
+        // without exhausting the §18.2 default `active_connection_id_limit`
+        // of 2. Each CID gets its own stateless-reset token (§10.3.1) so
+        // retiring one doesn't compromise the others. Stateless-reset
+        // generation is delayed until first use; if a pool entry is added
+        // here, also seed the legacy `stateless_reset_token` mirror so other
+        // codepaths that still consult it stay consistent.
+        const ncid_frame_size: usize = 28; // type + seq + rpt + len + 8 cid + 16 token
+        while (fp + ncid_frame_size <= frames_buf.len) {
+            // Find the next free pool slot.
+            var has_free = false;
+            for (conn.cid_pool) |slot| {
+                if (slot == null) {
+                    has_free = true;
+                    break;
                 }
-                @memcpy(frames_buf[fp .. fp + 16], &conn.stateless_reset_token);
-                fp += 16;
             }
+            if (!has_free) break;
+            const new_cid = ConnectionId.random(compat.random, 8);
+            var token: [16]u8 = undefined;
+            compat.random.bytes(&token);
+            const seq = conn.cidPoolReserve(new_cid, token) orelse break;
+            if (!conn.stateless_reset_token_set) {
+                conn.stateless_reset_token = token;
+                conn.stateless_reset_token_set = true;
+            }
+            frames_buf[fp] = 0x18;
+            fp += 1;
+            const seq_enc = varint.encode(frames_buf[fp..], seq) catch break;
+            fp += seq_enc.len;
+            const rpt_enc = varint.encode(frames_buf[fp..], 0) catch break; // retire_prior_to = 0
+            fp += rpt_enc.len;
+            frames_buf[fp] = 0x08;
+            fp += 1; // cid length
+            @memcpy(frames_buf[fp .. fp + 8], new_cid.slice());
+            fp += 8;
+            @memcpy(frames_buf[fp .. fp + 16], &token);
+            fp += 16;
         }
 
         // ECN (RFC 9000 §13.4): piggyback one ACK-ECN frame on this packet so
@@ -2888,7 +3023,7 @@ pub const Server = struct {
                 if (buf.len < 1 + cid_len) continue;
                 const candidate = ConnectionId.fromSlice(buf[1 .. 1 + cid_len]) catch continue;
                 const cid_match = ConnectionId.eql(conn.local_cid, candidate) or
-                    (if (conn.alt_local_cid) |alt| ConnectionId.eql(alt, candidate) else false);
+                    conn.cidPoolFind(candidate) != null;
                 if (!cid_match) continue;
 
                 // Try to decrypt with current client app keys.
@@ -3384,7 +3519,7 @@ pub const Server = struct {
                 pos += r.consumed;
                 dbg("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
                 conn.draining = true;
-                const pto2 = conn.rtt.pto_ms(25, 0);
+                const pto2 = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
                 conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto2));
                 continue;
             }
@@ -3414,10 +3549,10 @@ pub const Server = struct {
                 const seq_r = varint.decode(frames[pos..]) catch return;
                 pos += seq_r.len;
                 dbg("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
-                if (seq_r.value == conn.alt_local_cid_seq) {
-                    conn.alt_local_cid = null;
-                    // Issue a replacement CID.
-                    self.sendNewConnectionId(conn, seq_r.value + 1, src);
+                if (conn.cidPoolRetireSeq(seq_r.value)) {
+                    // Refill the freed slot so the peer keeps `active_connection_id_limit`
+                    // CIDs available without having to wait for the next round-trip.
+                    self.sendNewConnectionId(conn, src);
                 }
                 continue;
             }
@@ -3725,7 +3860,7 @@ pub const Server = struct {
             // Require at least one ACK to have been received so we have a
             // meaningful RTT estimate; before that, last_ack_ms == 0.
             if (conn.last_ack_ms == 0) continue;
-            const pto_delay: i64 = @intCast(conn.rtt.pto_ms(25, conn.pto_count));
+            const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count));
             const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
             const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
             if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
@@ -3816,7 +3951,7 @@ pub const Server = struct {
         dbg("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
         conn.draining = true;
         // RFC 9000 §10.2.2: stay in draining state for at least 3×PTO.
-        const pto = conn.rtt.pto_ms(25, 0);
+        const pto = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
         conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
     }
 
@@ -3846,11 +3981,18 @@ pub const Server = struct {
         dbg("io: sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
     }
 
-    /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
-    fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: compat.Address) void {
+    /// Reserve the next free pool slot, emit a NEW_CONNECTION_ID frame on the
+    /// 1-RTT path, and (lazily) seed the connection's stateless-reset token
+    /// mirror. No-op when the pool is already full.
+    fn sendNewConnectionId(self: *Server, conn: *ConnState, dst: compat.Address) void {
         const new_cid = ConnectionId.random(compat.random, 8);
-        conn.alt_local_cid = new_cid;
-        conn.alt_local_cid_seq = seq;
+        var token: [16]u8 = undefined;
+        compat.random.bytes(&token);
+        const seq = conn.cidPoolReserve(new_cid, token) orelse return;
+        if (!conn.stateless_reset_token_set) {
+            conn.stateless_reset_token = token;
+            conn.stateless_reset_token_set = true;
+        }
         var buf: [32]u8 = undefined;
         var pos: usize = 0;
         buf[pos] = 0x18;
@@ -3863,11 +4005,7 @@ pub const Server = struct {
         pos += 1; // CID length = 8
         @memcpy(buf[pos .. pos + 8], new_cid.slice());
         pos += 8;
-        if (!conn.stateless_reset_token_set) {
-            compat.random.bytes(&conn.stateless_reset_token);
-            conn.stateless_reset_token_set = true;
-        }
-        @memcpy(buf[pos .. pos + 16], &conn.stateless_reset_token);
+        @memcpy(buf[pos .. pos + 16], &token);
         pos += 16;
         self.send1Rtt(conn, buf[0..pos], dst);
         dbg("io: sent NEW_CONNECTION_ID seq={}\n", .{seq});
@@ -5215,6 +5353,33 @@ pub const Client = struct {
         // the original send.
         const is_fresh = owned_buf == null;
         if (is_fresh) {
+            // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Mirrors the
+            // server-side gate. Drops + emits STREAM_DATA_BLOCKED rather than
+            // overrunning the peer's per-stream window.
+            const stream_limit = self.conn.peerStreamSendLimit(stream_id, false);
+            if (stream_limit > 0 and offset +| data.len > stream_limit) {
+                dbg("io: client per-stream gate stream_id={} end={} limit={} — sending STREAM_DATA_BLOCKED\n", .{
+                    stream_id, offset + data.len, stream_limit,
+                });
+                var blk_buf: [24]u8 = undefined;
+                blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+                const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return;
+                const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return;
+                const blk_frame = blk_buf[0 .. 1 + sid_enc.len + lim_enc.len];
+                var send_blk: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const blk_pkt_len = build1RttPacketFull(
+                    &send_blk,
+                    self.conn.remote_cid,
+                    blk_frame,
+                    self.conn.app_pn,
+                    &self.conn.app_client_km,
+                    self.conn.key_phase_bit,
+                    self.conn.use_chacha20,
+                ) catch return;
+                self.conn.app_pn += 1;
+                _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                return;
+            }
             const projected: u64 = self.conn.fc_bytes_sent +| data.len;
             if (projected > self.conn.fc_send_max) {
                 dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — sending DATA_BLOCKED and dropping\n", .{
@@ -5316,7 +5481,7 @@ pub const Client = struct {
         // Need at least one prior ACK so the RTT estimate is meaningful.
         if (self.conn.last_ack_ms == 0) return;
         const now_ms = compat.milliTimestamp();
-        const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(25, self.conn.pto_count));
+        const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count));
         const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
         const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
         if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {

@@ -120,6 +120,13 @@ pub const TransportParamsOpts = struct {
     original_destination_cid: ?[]const u8 = null,
     /// `retry_source_connection_id` (0x10): SCID from the server's Retry packet, if any.
     retry_source_cid: ?[]const u8 = null,
+    /// `stateless_reset_token` (0x02): server-only; 16 bytes used by the peer
+    /// to validate stateless resets we emit (RFC 9000 §10.3).
+    stateless_reset_token: ?[16]u8 = null,
+    /// `active_connection_id_limit` (0x0e): how many concurrent CIDs we are
+    /// willing to store for the peer. RFC 9000 §18.2 default is 2; we
+    /// advertise a larger pool so the peer can rotate freely.
+    active_connection_id_limit: u64 = 4,
 };
 
 fn writeParamVarint(
@@ -171,9 +178,22 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     // Stay at <=1000 so quic-interop-runner's multiplexing test still passes.
     pos = try writeParamVarint(out, pos, 0x08, 1000); // initial_max_streams_bidi
     pos = try writeParamVarint(out, pos, 0x09, 1000); // initial_max_streams_uni
+    // ack_delay_exponent (0x0a): we encode ACK Delay with the §18.2 default
+    // exponent of 3, so advertise 3 explicitly. Without this the peer
+    // assumes 3 anyway, but quinn double-checks the value when present.
+    pos = try writeParamVarint(out, pos, 0x0a, 3);
+    // max_ack_delay (0x0b): upper bound on how long we'll batch ACKs before
+    // sending. 25 ms matches the §18.2 default and our actual ACK timer.
+    pos = try writeParamVarint(out, pos, 0x0b, 25);
+    // active_connection_id_limit (0x0e): we will accept this many distinct
+    // CIDs from the peer; lets the peer rotate / migrate without exhausting.
+    pos = try writeParamVarint(out, pos, 0x0e, opts.active_connection_id_limit);
 
     if (opts.original_destination_cid) |odcid| {
         pos = try writeParamBytes(out, pos, 0x00, odcid);
+    }
+    if (opts.stateless_reset_token) |srt| {
+        pos = try writeParamBytes(out, pos, 0x02, &srt);
     }
     pos = try writeParamBytes(out, pos, 0x0f, opts.initial_source_cid);
     if (opts.retry_source_cid) |rscid| {
@@ -294,11 +314,11 @@ test "transport params: round-trip varint fields" {
     try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_uni);
     try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_bidi);
     try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_uni);
-    // Defaults for params we don't currently emit.
     try testing.expectEqual(@as(u8, 3), parsed.ack_delay_exponent);
     try testing.expectEqual(@as(u64, 25), parsed.max_ack_delay_ms);
+    try testing.expectEqual(@as(u64, 4), parsed.active_connection_id_limit);
+    // We don't emit `disable_active_migration`; check the default here.
     try testing.expectEqual(false, parsed.disable_active_migration);
-    try testing.expectEqual(@as(u64, 2), parsed.active_connection_id_limit);
 }
 
 test "transport params: unknown ids are skipped" {
