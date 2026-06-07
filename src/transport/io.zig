@@ -946,6 +946,34 @@ const Http09ReqAssembly = struct {
 // in-flight request until FIN. Match http09_pending_max (~2000 streams).
 const http09_req_asm_max = 2048;
 
+fn http09ReqAsmIndex(stream_id: u64) usize {
+    return @as(usize, @intCast((stream_id >> 2) % http09_req_asm_max));
+}
+
+fn http09SlotIndex(conn: *const ConnState, slot: *const Http09OutSlot) u16 {
+    const off = (@intFromPtr(slot) - @intFromPtr(&conn.http09_slots[0]));
+    return @intCast(off / @sizeOf(Http09OutSlot));
+}
+
+fn http09TrackActiveSlot(conn: *ConnState, slot_idx: u16) void {
+    for (conn.http09_active_indices[0..conn.http09_active_list_n]) |idx| {
+        if (idx == slot_idx) return;
+    }
+    conn.http09_active_indices[conn.http09_active_list_n] = slot_idx;
+    conn.http09_active_list_n += 1;
+}
+
+fn http09UntrackActiveSlot(conn: *ConnState, slot_idx: u16) void {
+    var i: u16 = 0;
+    while (i < conn.http09_active_list_n) : (i += 1) {
+        if (conn.http09_active_indices[i] == slot_idx) {
+            conn.http09_active_indices[i] = conn.http09_active_indices[conn.http09_active_list_n - 1];
+            conn.http09_active_list_n -= 1;
+            return;
+        }
+    }
+}
+
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
 /// the QUIC stream offset independently (HEADERS frame bytes are counted too).
@@ -1055,8 +1083,13 @@ const FinEntry = struct {
 };
 
 /// Record the final size of a stream that reached FIN/RESET.  Evicts the
-/// oldest entry (index 0) if full.  Idempotent for an existing stream_id.
-fn recordFinalSize(tracker: *[fin_tracker_cap]FinEntry, stream_id: u64, final_size: u64) void {
+/// oldest entry (ring) if full.  Idempotent for an existing stream_id.
+fn recordFinalSize(
+    tracker: *[fin_tracker_cap]FinEntry,
+    ring: *u16,
+    stream_id: u64,
+    final_size: u64,
+) void {
     for (tracker) |*e| {
         if (e.used and e.stream_id == stream_id) {
             e.final_size = final_size;
@@ -1069,10 +1102,9 @@ fn recordFinalSize(tracker: *[fin_tracker_cap]FinEntry, stream_id: u64, final_si
             return;
         }
     }
-    // Full — shift and replace the last slot.
-    var i: usize = 0;
-    while (i < tracker.len - 1) : (i += 1) tracker[i] = tracker[i + 1];
-    tracker[tracker.len - 1] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+    const idx = ring.*;
+    tracker[idx] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+    ring.* = (idx + 1) % fin_tracker_cap;
 }
 
 /// Returns true if `final_size` matches any previously-recorded final size
@@ -1229,6 +1261,11 @@ pub const ConnState = struct {
     /// Number of currently active HTTP/0.9 response slots (maintained by the server).
     /// Avoids O(2000) scan in the event-loop poll-timeout calculation.
     http09_active_count: u32 = 0,
+    /// Indices of active slots — flush iterates this list instead of all 512 slots.
+    http09_active_indices: [http09_slot_max]u16 = undefined,
+    http09_active_list_n: u16 = 0,
+    /// Cursor for finding the next free outbound slot.
+    http09_slot_cursor: u16 = 0,
     /// HTTP/0.9 opens waiting for a free outbound slot (quinn multiplexing).
     http09_pending: [http09_pending_max]Http09PendingOpen = undefined,
     http09_pending_count: u16 = 0,
@@ -1328,6 +1365,7 @@ pub const ConnState = struct {
     // most-recently-finished streams need to be checked against late RESETs,
     // and stale entries naturally age out as newer FIN/RESETs arrive.
     fin_tracker: [fin_tracker_cap]FinEntry = [_]FinEntry{.{}} ** fin_tracker_cap,
+    fin_tracker_ring: u16 = 0,
 
     // ── Active connection ID limit (RFC 9000 §5.1.1) ──────────────────────────
     // Count of unretired CIDs the peer has issued via NEW_CONNECTION_ID.
@@ -2323,26 +2361,26 @@ pub const Server = struct {
                     if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
                         conn.http3_active_count > 0)
                     {
-                        poll_timeout_ms = 50;
+                        poll_timeout_ms = 10;
                         break;
                     }
                     // Also check awaiting_fin_ack slots (FIN retransmit needed).
                     for (&conn.http09_slots) |*slot| {
                         if (slot.awaiting_fin_ack) {
-                            poll_timeout_ms = 50;
+                            poll_timeout_ms = 10;
                             break;
                         }
                     }
-                    if (poll_timeout_ms != 50) {
+                    if (poll_timeout_ms != 10) {
                         for (&conn.http3_slots) |*slot| {
                             if (slot.awaiting_fin_ack) {
-                                poll_timeout_ms = 50;
+                                poll_timeout_ms = 10;
                                 break;
                             }
                         }
                     }
                 }
-                if (poll_timeout_ms == 50) break;
+                if (poll_timeout_ms == 10) break;
             }
 
             const ready = std.posix.poll(fds[0..nfds], poll_timeout_ms) catch |err| {
@@ -3835,6 +3873,7 @@ pub const Server = struct {
                         slot.active = true;
                         slot.awaiting_fin_ack = false;
                         conn.http09_active_count += 1;
+                        http09TrackActiveSlot(conn, http09SlotIndex(conn, slot));
                         dbg("io: path change: reopened FIN slot stream_id={} rewind to {}\n", .{ slot.stream_id, rewind_to });
                     } else |_| {}
                 }
@@ -4003,6 +4042,7 @@ pub const Server = struct {
                                     slot.active = true;
                                     slot.awaiting_fin_ack = false;
                                     conn.http09_active_count += 1;
+                                    http09TrackActiveSlot(conn, http09SlotIndex(conn, slot));
                                     dbg("io: retransmit h09 stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
                                 } else |_| {}
                             }
@@ -4137,7 +4177,7 @@ pub const Server = struct {
                     self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
                     return;
                 }
-                recordFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size);
+                recordFinalSize(&conn.fin_tracker, &conn.fin_tracker_ring, r.frame.stream_id, r.frame.final_size);
                 // Cancel any pending response for this stream.
                 for (&conn.http09_slots) |*slot| {
                     if (slot.active and slot.stream_id == r.frame.stream_id) {
@@ -4458,17 +4498,20 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
+        const slot_idx = http09SlotIndex(conn, slot);
         var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
         const to_read = @min(conn.app_stream_chunk, file_buf.len);
         const n = slot.file.read(file_buf[0..to_read]) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         };
         if (n == 0) {
             dbg("io: http09 stream_id={} EOF (offset={}, file_end={})\n", .{ slot.stream_id, slot.stream_offset, slot.file_end });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         }
@@ -4492,6 +4535,7 @@ pub const Server = struct {
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
             dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         };
@@ -4522,6 +4566,7 @@ pub const Server = struct {
             // through awaiting_fin_ack slots waiting for client ACKs.
             if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
                 dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
+                http09UntrackActiveSlot(conn, slot_idx);
                 slot.* = .{};
                 self.drainHttp09Pending(conn);
                 return;
@@ -4533,6 +4578,7 @@ pub const Server = struct {
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
             slot.active = false;
+            http09UntrackActiveSlot(conn, slot_idx);
             dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, slot.fin_pkt_pn });
             self.drainHttp09Pending(conn);
         }
@@ -4547,25 +4593,37 @@ pub const Server = struct {
     fn flushPendingHttp09Responses(self: *Server) void {
         // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
         // enough to drain responses before the client idle timeout.
-        var budget: usize = 512;
+        var budget: usize = 2048;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
-                    // Only send 1-RTT data once app keys are available.
-                    // 0-RTT requests can be buffered in http09_slots before the
-                    // handshake completes; wait for has_app_keys before flushing.
                     if (!conn.has_app_keys) continue;
-                    for (&conn.http09_slots) |*slot| {
-                        if (!slot.active) continue;
-                        if (budget == 0) return;
-                        // Pre-check CC: if the window is exhausted, skip all
-                        // remaining slots for this connection — there is nothing
-                        // to send and we must not burn the budget on null sends.
-                        if (!conn.cc.canSend(congestion.mss)) break;
-                        self.http09SendNextChunk(conn, slot);
-                        progressed = true;
-                        budget -= 1;
+                    if (conn.http09_active_list_n > 0) {
+                        var i: u16 = 0;
+                        while (i < conn.http09_active_list_n and budget > 0) {
+                            if (!conn.cc.canSend(congestion.mss)) break;
+                            const slot_idx = conn.http09_active_indices[i];
+                            const slot = &conn.http09_slots[slot_idx];
+                            if (!slot.active) {
+                                http09UntrackActiveSlot(conn, slot_idx);
+                                continue;
+                            }
+                            self.http09SendNextChunk(conn, slot);
+                            progressed = true;
+                            budget -= 1;
+                            if (!slot.active) continue;
+                            i += 1;
+                        }
+                    } else {
+                        for (&conn.http09_slots) |*slot| {
+                            if (!slot.active) continue;
+                            if (budget == 0) return;
+                            if (!conn.cc.canSend(congestion.mss)) break;
+                            self.http09SendNextChunk(conn, slot);
+                            progressed = true;
+                            budget -= 1;
+                        }
                     }
                     if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
                 }
@@ -4910,7 +4968,7 @@ pub const Server = struct {
                 self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
                 return;
             }
-            recordFinalSize(&conn.fin_tracker, sf.stream_id, final_size);
+            recordFinalSize(&conn.fin_tracker, &conn.fin_tracker_ring, sf.stream_id, final_size);
         }
         if (self.config.raw_application_streams) {
             self.handleRawApplicationStreamServer(conn, sf, src);
@@ -4976,7 +5034,11 @@ pub const Server = struct {
             return false;
         };
 
-        for (&conn.http09_slots) |*slot| {
+        var tries: u16 = 0;
+        while (tries < http09_slot_max) : (tries += 1) {
+            const idx = conn.http09_slot_cursor;
+            conn.http09_slot_cursor = (conn.http09_slot_cursor + 1) % http09_slot_max;
+            const slot = &conn.http09_slots[idx];
             if (slot.active or slot.awaiting_fin_ack) continue;
             slot.* = .{
                 .active = true,
@@ -4989,6 +5051,7 @@ pub const Server = struct {
             @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
             slot.file_path_len = path_len;
             conn.http09_active_count += 1;
+            http09TrackActiveSlot(conn, idx);
             dbg("io: http09 stream_id={} opened (size={})\n", .{ stream_id, file_end });
             return true;
         }
@@ -5028,18 +5091,26 @@ pub const Server = struct {
     }
 
     fn peekHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
-        for (&conn.http09_req_asm) |*slot| {
-            if (slot.active and slot.stream_id == stream_id) return slot;
+        const slot = &conn.http09_req_asm[http09ReqAsmIndex(stream_id)];
+        if (slot.active and slot.stream_id == stream_id) return slot;
+        for (&conn.http09_req_asm) |*s| {
+            if (s.active and s.stream_id == stream_id) return s;
         }
         return null;
     }
 
     fn findHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
-        if (peekHttp09ReqAssembly(conn, stream_id)) |slot| return slot;
-        for (&conn.http09_req_asm) |*slot| {
-            if (!slot.active) {
-                slot.* = .{ .active = true, .stream_id = stream_id };
-                return slot;
+        const slot = &conn.http09_req_asm[http09ReqAsmIndex(stream_id)];
+        if (slot.active) {
+            if (slot.stream_id == stream_id) return slot;
+        } else {
+            slot.* = .{ .active = true, .stream_id = stream_id };
+            return slot;
+        }
+        for (&conn.http09_req_asm) |*s| {
+            if (!s.active) {
+                s.* = .{ .active = true, .stream_id = stream_id };
+                return s;
             }
         }
         return null;
