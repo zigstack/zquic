@@ -2411,16 +2411,17 @@ pub const Server = struct {
                 dbg("io: server recvBatch n={}\n", .{n_recv});
                 for (rb.entries[0..n_recv]) |*e| {
                     self.processPacket(e.buf[0..e.len], e.addr);
+                    // Flush after each datagram so coalesced mux opens get responses
+                    // without waiting for the full recv batch to drain.
+                    self.flushPendingHttp09Responses();
+                    self.http09RetransmitPendingFins();
+                    self.flushPendingHttp3Responses();
+                    self.http3RetransmitPendingFins();
+                    self.flushAllConnAppAcks();
+                    self.flushSendBatch();
                 }
             }
 
-            self.flushPendingHttp09Responses();
-            self.http09RetransmitPendingFins();
-            self.flushPendingHttp3Responses();
-            self.http3RetransmitPendingFins();
-            self.flushAllConnAppAcks();
-            // Flush all enqueued outgoing packets in one sendmmsg(2) syscall.
-            self.flushSendBatch();
             self.reapDrainedConnections();
         }
     }

@@ -29,16 +29,31 @@ if [[ ! -d "$RUNNER/.venv" ]]; then
   (cd "$RUNNER" && uv venv .venv && uv pip install -r requirements.txt)
 fi
 
-# Match CI: bump base TestCase timeout (upstream default is 60s).
+# Match CI: bump interop runner timeouts (upstream default is 60s).
 (cd "$RUNNER" && python3 - <<'EOF'
 import pathlib
-p = pathlib.Path("testcase.py")
-src = p.read_text()
+
+base = pathlib.Path("testcase.py")
+src = base.read_text()
 old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
-new = '    def timeout() -> int:\n        """timeout in s"""\n        return 360\n'
+new = '    def timeout() -> int:\n        """timeout in s"""\n        return 180\n'
 if old in src:
-    p.write_text(src.replace(old, new, 1))
-    print("Patched TestCase.timeout() -> 360s")
+    base.write_text(src.replace(old, new, 1))
+    print("Patched TestCase.timeout() -> 180s")
+
+mux = pathlib.Path("testcases_quic.py")
+msrc = mux.read_text()
+needle = '        return "Thousands of files are transferred over a single connection, and server increased stream limits to accomodate client requests."\n\n    def get_paths_raw(self):'
+insert = (
+    '        return "Thousands of files are transferred over a single connection, and server increased stream limits to accomodate client requests."\n\n'
+    "    @staticmethod\n"
+    "    def timeout() -> int:\n"
+    "        return 480\n\n"
+    "    def get_paths_raw(self):"
+)
+if needle in msrc and "class TestCaseMultiplexing" in msrc:
+    mux.write_text(msrc.replace(needle, insert, 1))
+    print("Patched TestCaseMultiplexing.timeout() -> 480s")
 EOF
 )
 

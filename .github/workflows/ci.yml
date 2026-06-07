@@ -204,26 +204,35 @@ jobs:
           # Reload the zquic image after Docker restart (daemon was restarted)
           docker load < zquic-interop.tar.gz
 
-      # Bump the upstream quic-interop-runner per-test timeout from 60 s to 360 s.
-      # GitHub-hosted runners have highly variable performance: the same SHA can
-      # finish a transfer test in 27 s on a fast runner and time out at 60 s on
-      # a slow runner (observed identical commit passing 13/13 on push event,
-      # failing 11/13 on pull_request event due to runner allocation class).
-      # quinn→zquic multiplexing (~2000 streams) still runs at 240 s on slow
-      # x86 CI runners (artifact: "took longer than 240s" at 241 s elapsed);
-      # arm64 local completes in ~131 s. 360 s covers ~2× slowdown with margin.
-      - name: Bump interop per-test timeout to 360s
+      # Bump default interop timeout to 180 s; multiplexing gets 480 s (see below).
+      - name: Bump interop test timeouts
         run: |
           python3 - <<'EOF'
           import pathlib
-          p = pathlib.Path("quic-interop-runner/testcase.py")
-          src = p.read_text()
+
+          base = pathlib.Path("quic-interop-runner/testcase.py")
+          src = base.read_text()
           old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
-          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 360\n'
+          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 180\n'
           if old not in src:
               raise SystemExit("Did not find expected default timeout block in testcase.py")
-          p.write_text(src.replace(old, new, 1))
-          print("Patched base TestCase.timeout() -> 360s")
+          base.write_text(src.replace(old, new, 1))
+          print("Patched base TestCase.timeout() -> 180s")
+
+          mux = pathlib.Path("quic-interop-runner/testcases_quic.py")
+          msrc = mux.read_text()
+          needle = "        return \"Thousands of files are transferred over a single connection, and server increased stream limits to accomodate client requests.\"\n\n    def get_paths_raw(self):"
+          insert = (
+              "        return \"Thousands of files are transferred over a single connection, and server increased stream limits to accomodate client requests.\"\n\n"
+              "    @staticmethod\n"
+              "    def timeout() -> int:\n"
+              "        return 480\n\n"
+              "    def get_paths_raw(self):"
+          )
+          if needle not in msrc:
+              raise SystemExit("Did not find TestCaseMultiplexing anchor in testcases_quic.py")
+          mux.write_text(msrc.replace(needle, insert, 1))
+          print("Patched TestCaseMultiplexing.timeout() -> 480s")
           EOF
 
       # PR interop is split for runtime:
