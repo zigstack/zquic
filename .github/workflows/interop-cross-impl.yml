@@ -134,18 +134,18 @@ jobs:
           sudo systemctl restart docker
           docker load < zquic-interop.tar.gz
 
-      - name: Bump interop per-test timeout to 240s
+      - name: Bump interop per-test timeout to 360s
         run: |
           python3 - <<'EOF'
           import pathlib
           p = pathlib.Path("quic-interop-runner/testcase.py")
           src = p.read_text()
           old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
-          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 240\n'
+          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 360\n'
           if old not in src:
               raise SystemExit("Did not find expected default timeout block in testcase.py")
           p.write_text(src.replace(old, new, 1))
-          print("Patched base TestCase.timeout() -> 240s")
+          print("Patched base TestCase.timeout() -> 360s")
           EOF
 
       - name: Run full cross-impl interop matrix

@@ -29,6 +29,19 @@ if [[ ! -d "$RUNNER/.venv" ]]; then
   (cd "$RUNNER" && uv venv .venv && uv pip install -r requirements.txt)
 fi
 
+# Match CI: bump base TestCase timeout (upstream default is 60s).
+(cd "$RUNNER" && python3 - <<'EOF'
+import pathlib
+p = pathlib.Path("testcase.py")
+src = p.read_text()
+old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
+new = '    def timeout() -> int:\n        """timeout in s"""\n        return 360\n'
+if old in src:
+    p.write_text(src.replace(old, new, 1))
+    print("Patched TestCase.timeout() -> 360s")
+EOF
+)
+
 PY="$RUNNER/.venv/bin/python"
 mkdir -p "$LOG_ROOT"
 

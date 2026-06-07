@@ -204,25 +204,26 @@ jobs:
           # Reload the zquic image after Docker restart (daemon was restarted)
           docker load < zquic-interop.tar.gz
 
-      # Bump the upstream quic-interop-runner per-test timeout from 60 s to 240 s.
+      # Bump the upstream quic-interop-runner per-test timeout from 60 s to 360 s.
       # GitHub-hosted runners have highly variable performance: the same SHA can
       # finish a transfer test in 27 s on a fast runner and time out at 60 s on
       # a slow runner (observed identical commit passing 13/13 on push event,
       # failing 11/13 on pull_request event due to runner allocation class).
-      # quinn→zquic multiplexing (~2000 streams) can take ~180 s on slow x86 CI
-      # runners even when functionally correct; 240 s keeps headroom.
-      - name: Bump interop per-test timeout to 240s
+      # quinn→zquic multiplexing (~2000 streams) still runs at 240 s on slow
+      # x86 CI runners (artifact: "took longer than 240s" at 241 s elapsed);
+      # arm64 local completes in ~131 s. 360 s covers ~2× slowdown with margin.
+      - name: Bump interop per-test timeout to 360s
         run: |
           python3 - <<'EOF'
           import pathlib
           p = pathlib.Path("quic-interop-runner/testcase.py")
           src = p.read_text()
           old = '    def timeout() -> int:\n        """timeout in s"""\n        return 60\n'
-          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 240\n'
+          new = '    def timeout() -> int:\n        """timeout in s"""\n        return 360\n'
           if old not in src:
               raise SystemExit("Did not find expected default timeout block in testcase.py")
           p.write_text(src.replace(old, new, 1))
-          print("Patched base TestCase.timeout() -> 240s")
+          print("Patched base TestCase.timeout() -> 360s")
           EOF
 
       # PR interop is split for runtime:
