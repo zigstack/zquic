@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.12] - 2026-06-08
+
+### Fixed
+
+- **Ignore `RETIRE_CONNECTION_ID` sequence 0 from quic-go.** RFC 9000 §5.1.2
+  forbids retiring the initial CID, but quic-go (go-libp2p) sometimes sends it
+  after Identify on a new stream. Previously zquic closed with
+  `PROTOCOL_VIOLATION`, breaking go-libp2p client → zquic server ping interop.
+  The frame is now dropped on both server and client receive paths.
+
+---
+
+## [v1.6.11] - 2026-06-08
+
+### Fixed
+
+- **TLS `CertificateRequest` `signature_algorithms` wire format.** The inner
+  `SignatureSchemeList` length prefix was missing in `buildCertificateRequest`,
+  causing compliant TLS parsers (go-libp2p, rust-libp2p) to reject the request
+  and block cross-impl mutual-TLS dials.
+
+---
+
 ## [v1.6.10] - 2026-06-08
 
 ### Fixed

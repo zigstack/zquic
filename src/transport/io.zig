@@ -4324,8 +4324,10 @@ pub const Server = struct {
                 pos += seq_r.len;
                 dbg("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 if (seq_r.value == 0) {
-                    self.sendConnectionClose(conn, 0x0a, "retire connection id seq 0", src);
-                    return;
+                    // quic-go (go-libp2p) may emit RETIRE seq 0 despite RFC 9000 §5.1.2;
+                    // closing breaks cross-impl identify/ping with zig-libp2p servers.
+                    dbg("io: ignoring RETIRE_CONNECTION_ID seq 0 (quic-go interop)\n", .{});
+                    continue;
                 }
                 if (!conn.cidPoolRetireSeq(seq_r.value)) {
                     dbg("io: RETIRE_CONNECTION_ID unknown seq={}\n", .{seq_r.value});
@@ -8022,8 +8024,8 @@ pub const Client = struct {
                 pos += seq_r.len;
                 dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 if (seq_r.value == 0) {
-                    self.sendConnectionClose(0x0a, "retire connection id seq 0");
-                    return;
+                    dbg("io: client ignoring RETIRE_CONNECTION_ID seq 0 (quic-go interop)\n", .{});
+                    continue;
                 }
                 _ = self.conn.cidPoolRetireSeq(seq_r.value);
                 continue;
