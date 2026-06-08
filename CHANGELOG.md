@@ -11,7 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [v1.6.12] - 2026-06-08
+## [v1.6.15] - 2026-06-08
+
+### Fixed
+
+- **Client Handshake CRYPTO reassembly.** Quinn/rust-libp2p (ethlambda) split
+  the server flight across multiple Handshake CRYPTO frames at non-zero offsets.
+  The client previously called `processServerFlight` on each chunk in isolation,
+  so EncryptedExtensions/Certificate/Finished never assembled and outbound
+  zquic → quinn dials stalled. Chunks are now accumulated in offset order
+  (with the existing reorder buffer) before parsing the full flight.
+
+---
+
+## [v1.6.14] - 2026-06-08
+
+### Fixed
+
+- **Server Initial ClientHello retransmit replay.** When a client retransmits
+  its Initial ClientHello after the server has already progressed, the server
+  now replays the stored server flight instead of failing the handshake.
+
+---
 
 ### Fixed
 

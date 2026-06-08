@@ -1333,7 +1333,12 @@ pub const ConnState = struct {
     // so the client can verify it matches the DCID from its first Initial.
     retry_odcid: [20]u8 = [_]u8{0} ** 20,
     retry_odcid_len: usize = 0,
+    /// Next expected offset in the peer's Handshake CRYPTO stream (client role).
     hs_crypto_offset: u64 = 0,
+    /// Contiguous Handshake-level CRYPTO bytes from the server (client role).
+    /// Quinn/rustls often split EncryptedExtensions + Certificate + Finished
+    /// across multiple CRYPTO frames; processServerFlight needs the full flight.
+    hs_flight_acc: [tls_hs.max_peer_leaf_cert_bytes + 512]u8 = undefined,
 
     // Set once client has seen the server's first Initial packet and has
     // updated remote_cid to the server's SCID (RFC 9000 §7.2).
@@ -7600,7 +7605,7 @@ pub const Client = struct {
         if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
             self.conn.hs_recv_pn = dec.pn;
 
-        // Accumulate Handshake CRYPTO frames
+        // Accumulate Handshake CRYPTO frames (offset-ordered, like the server path).
         var fpos: usize = 0;
         while (fpos < pt_len) {
             if (plaintext[fpos] == 0x00) {
@@ -7623,29 +7628,49 @@ pub const Client = struct {
             const dlen: usize = @intCast(dlen_r.value);
             if (fpos + dlen > pt_len) break;
             const cdata = plaintext[fpos .. fpos + dlen];
-
-            // Process server flight messages
-            var flight_buf: [tls_hs.max_peer_leaf_cert_bytes + 512]u8 = undefined;
-            const mutual: ?tls_hs.ClientMutualTlsCredentials = if (self.client_cert_der.len > 0) .{
-                .cert_der = self.client_cert_der,
-                .private_key = &self.client_private_key,
-            } else null;
-            const tail_len = self.tls.processServerFlight(cdata, flight_buf[0..], mutual) catch |err| {
-                if (err != error.NoServerFinished) {
-                    dbg("io: processServerFlight error: {}\n", .{err});
+            if (off_r.value == self.conn.hs_crypto_offset) {
+                self.appendClientHandshakeCrypto(cdata);
+                var hs_drain: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
+                while (true) {
+                    const dn = self.conn.hs_crypto_reorder.take(self.conn.hs_crypto_offset, &hs_drain);
+                    if (dn == 0) break;
+                    self.appendClientHandshakeCrypto(hs_drain[0..dn]);
                 }
-                fpos += dlen;
-                continue;
-            };
-            // Apply server's transport parameters from EncryptedExtensions
-            // before any 1-RTT data is exchanged (RFC 9000 §7.4.1).
-            self.conn.applyPeerTransportParams(self.tls.peer_qtp[0..self.tls.peer_qtp_len]);
-            // App secrets are now derived; update QUIC 1-RTT keys.
-            self.conn.deriveAppKeys(&self.tls.secrets);
-
-            self.sendClientHandshakeTail(flight_buf[0..tail_len]);
-            break;
+            } else {
+                self.conn.hs_crypto_reorder.insert(off_r.value, cdata);
+            }
+            fpos += dlen;
         }
+    }
+
+    fn appendClientHandshakeCrypto(self: *Client, data: []const u8) void {
+        const off: usize = @intCast(self.conn.hs_crypto_offset);
+        if (off + data.len > self.conn.hs_flight_acc.len) {
+            dbg("io: client Handshake CRYPTO acc overflow (off={} len={})\n", .{ off, data.len });
+            return;
+        }
+        @memcpy(self.conn.hs_flight_acc[off..][0..data.len], data);
+        self.conn.hs_crypto_offset += data.len;
+        self.tryProcessAccumulatedServerFlight();
+    }
+
+    fn tryProcessAccumulatedServerFlight(self: *Client) void {
+        if (self.conn.hs_crypto_offset == 0) return;
+        var flight_buf: [tls_hs.max_peer_leaf_cert_bytes + 512]u8 = undefined;
+        const mutual: ?tls_hs.ClientMutualTlsCredentials = if (self.client_cert_der.len > 0) .{
+            .cert_der = self.client_cert_der,
+            .private_key = &self.client_private_key,
+        } else null;
+        const acc = self.conn.hs_flight_acc[0..@intCast(self.conn.hs_crypto_offset)];
+        const tail_len = self.tls.processServerFlight(acc, flight_buf[0..], mutual) catch |err| {
+            if (err != error.NoServerFinished) {
+                dbg("io: processServerFlight error: {}\n", .{err});
+            }
+            return;
+        };
+        self.conn.applyPeerTransportParams(self.tls.peer_qtp[0..self.tls.peer_qtp_len]);
+        self.conn.deriveAppKeys(&self.tls.secrets);
+        self.sendClientHandshakeTail(flight_buf[0..tail_len]);
     }
 
     fn flushClientHandshakeTailPacketsTo(self: *Client, dst: compat.Address) void {
