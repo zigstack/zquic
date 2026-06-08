@@ -127,6 +127,10 @@ pub const SentPacket = struct {
     stream_data: ?[]u8 = null,
     /// FIN flag accompanying `stream_data` (so retransmit preserves the bit).
     stream_fin: bool = false,
+    /// True when declared lost by the time threshold (RFC 9002 §6.1.2), not
+    /// packet-threshold alone.  Used to retry HTTP/0.9 mux without spiralling
+    /// on quinn's ACK-compression false packet-threshold losses.
+    time_threshold_loss: bool = false,
 };
 
 /// Loss detection state for one packet number space.
@@ -302,7 +306,9 @@ pub const LossDetector = struct {
                     } else latest_lost_eliciting_send_time = p.send_time_ms;
                 }
                 if (lost_count < lost_buf.len) {
-                    lost_buf[lost_count] = p;
+                    var lost_pkt = p;
+                    lost_pkt.time_threshold_loss = time_threshold_lost and !packet_threshold_lost;
+                    lost_buf[lost_count] = lost_pkt;
                     self.sent[i].stream_data = null;
                     lost_count += 1;
                 } else {

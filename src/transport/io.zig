@@ -923,10 +923,19 @@ const Http09OutSlot = struct {
 const http09_slot_max = 512;
 const http09_pending_max = 2048;
 
+const Http09RespondedEntry = struct {
+    stream_id: u64 = 0,
+    path_len: u16 = 0,
+    path: [512]u8 = undefined,
+    /// True after one packet-threshold loss retry (avoids duplicate storms).
+    loss_retry: bool = false,
+};
+
 const Http09PendingOpen = struct {
     stream_id: u64 = 0,
     path_len: u16 = 0,
     path: [512]u8 = undefined,
+    loss_retry: bool = false,
 };
 
 /// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
@@ -974,24 +983,39 @@ fn http09UntrackActiveSlot(conn: *ConnState, slot_idx: u16) void {
     }
 }
 
+fn http09ClearOutSlot(conn: *ConnState, stream_id: u64) void {
+    for (&conn.http09_slots, 0..) |*slot, idx| {
+        if (slot.stream_id != stream_id) continue;
+        if (!slot.active and !slot.awaiting_fin_ack) continue;
+        if (slot.active) slot.file.close();
+        if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+        http09UntrackActiveSlot(conn, @intCast(idx));
+        slot.* = .{};
+    }
+}
+
 fn http09AlreadyResponded(conn: *const ConnState, stream_id: u64) bool {
-    for (conn.http09_responded[0..conn.http09_responded_count]) |id| {
-        if (id == stream_id) return true;
+    for (conn.http09_responded[0..conn.http09_responded_count]) |entry| {
+        if (entry.stream_id == stream_id) return true;
     }
     for (&conn.http09_slots) |*slot| {
         if (slot.stream_id != stream_id) continue;
         if (slot.awaiting_fin_ack) return true;
-        // Active slot with no bytes sent yet may be FC/CC-blocked — allow retry.
-        if (slot.active and slot.stream_offset > 0) return true;
     }
     return false;
 }
 
-fn http09MarkResponded(conn: *ConnState, stream_id: u64) void {
+fn http09MarkResponded(conn: *ConnState, stream_id: u64, fs_path: []const u8, loss_retry: bool) void {
     if (http09AlreadyResponded(conn, stream_id)) return;
     if (conn.http09_responded_count >= http09_pending_max) return;
-    conn.http09_responded[conn.http09_responded_count] = stream_id;
+    const entry = &conn.http09_responded[conn.http09_responded_count];
+    entry.stream_id = stream_id;
+    const path_len = @min(fs_path.len, entry.path.len);
+    @memcpy(entry.path[0..path_len], fs_path[0..path_len]);
+    entry.path_len = @intCast(path_len);
+    entry.loss_retry = loss_retry;
     conn.http09_responded_count += 1;
+    http09ClearOutSlot(conn, stream_id);
 }
 
 /// One pending HTTP/3 file response (served incrementally from the event loop).
@@ -1289,8 +1313,10 @@ pub const ConnState = struct {
     /// HTTP/0.9 opens waiting for a free outbound slot (quinn multiplexing).
     http09_pending: [http09_pending_max]Http09PendingOpen = undefined,
     http09_pending_count: u16 = 0,
+    /// Round-robin cursor for fair CC-limited pending drains.
+    http09_pending_cursor: u16 = 0,
     /// Streams that already received an HTTP/0.9 response (immediate path has no slot).
-    http09_responded: [http09_pending_max]u64 = undefined,
+    http09_responded: [http09_pending_max]Http09RespondedEntry = undefined,
     http09_responded_count: u16 = 0,
     /// Partial HTTP/0.9 requests reassembled until FIN.
     http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
@@ -2196,7 +2222,7 @@ pub const Server = struct {
         data: []const u8,
         fin: bool,
     ) void {
-        self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
+        self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null, true);
     }
 
     /// Internal: optionally adopt `owned_buf` (already heap-allocated by an
@@ -2204,6 +2230,11 @@ pub const Server = struct {
     /// duping `data`.  Used by the loss-recovery branch in `onAck` so we move
     /// the bytes from the lost SentPacket into the new SentPacket without
     /// allocating a fresh copy.
+    ///
+    /// `ld_stream_retransmit`: when false, do not attach stream metadata to the
+    /// loss detector.  HTTP/0.9 file responses are re-opened from disk on the
+    /// slot path; skipping LD copies avoids quinn-client false-loss storms on
+    /// the mux interop test (delayed ACK compression vs packet-threshold loss).
     fn sendRawStreamDataInner(
         self: *Server,
         conn: *ConnState,
@@ -2212,6 +2243,7 @@ pub const Server = struct {
         data: []const u8,
         fin: bool,
         owned_buf: ?[]u8,
+        ld_stream_retransmit: bool,
     ) void {
         if (conn.phase != .connected or !conn.has_app_keys) {
             if (owned_buf) |b| self.allocator.free(b);
@@ -2288,6 +2320,13 @@ pub const Server = struct {
         const last = &conn.ld.sent[conn.ld.sent_count - 1];
         if (last.pn != sent_pn) {
             if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
+        if (!ld_stream_retransmit and owned_buf == null) {
+            last.has_stream_data = true;
+            last.stream_id = stream_id;
+            last.stream_offset = offset;
+            last.stream_fin = fin;
             return;
         }
         const buf = owned_buf orelse blk: {
@@ -2372,9 +2411,15 @@ pub const Server = struct {
             var poll_timeout_ms: i32 = 2000;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
-                    if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
-                        conn.http3_active_count > 0)
-                    {
+                    if (conn.http09_pending_count > 0) {
+                        poll_timeout_ms = 1;
+                        break;
+                    }
+                    if (conn.http09_active_count > 0) {
+                        poll_timeout_ms = 10;
+                        break;
+                    }
+                    if (conn.http3_active_count > 0) {
                         poll_timeout_ms = 10;
                         break;
                     }
@@ -2463,8 +2508,6 @@ pub const Server = struct {
                 dbg("io: server recvBatch n={}\n", .{n_recv});
                 for (rb.entries[0..n_recv]) |*e| {
                     self.processPacket(e.buf[0..e.len], e.addr);
-                    // Flush after each datagram so coalesced mux opens get responses
-                    // without waiting for the full recv batch to drain.
                     self.flushPendingHttp09Responses();
                     self.http09RetransmitPendingFins();
                     self.flushPendingHttp3Responses();
@@ -2472,6 +2515,7 @@ pub const Server = struct {
                     self.flushAllConnAppAcks();
                     self.flushSendBatch();
                 }
+                self.flushPendingHttp09Responses();
             }
 
             self.reapDrainedConnections();
@@ -3953,7 +3997,7 @@ pub const Server = struct {
                         slot.awaiting_fin_ack = false;
                     }
                 }
-                self.drainHttp09Pending(conn);
+                self.drainHttp09Pending(conn, 16);
                 // Loss detection + RTT estimation (RFC 9002).
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
@@ -4108,10 +4152,9 @@ pub const Server = struct {
                         // it via `sendRawStreamDataInner` so the bytes get a
                         // fresh PN and the new SentPacket adopts the buffer.
                         if (lp.stream_data) |buf| {
-                            self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
-                            // ownership of `buf` is transferred into the new
-                            // SentPacket (or freed inside *Inner on draining /
-                            // serialize failure); we must NOT touch it again.
+                            self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf, true);
+                        } else if (lp.time_threshold_loss and lp.has_stream_data and lp.stream_fin and lp.stream_offset == 0 and lp.stream_data == null) {
+                            self.http09RequeueOnMuxLoss(conn, lp.stream_id, true);
                         }
                     }
                 }
@@ -4393,7 +4436,7 @@ pub const Server = struct {
             // Unknown frame type — cannot safely skip without knowing the length.
             break;
         }
-        if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
+        if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn, 16);
     }
 
     /// Send a RESET_STREAM frame to cancel a stream (RFC 9000 §19.4).
@@ -4512,6 +4555,10 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
+        if (http09AlreadyResponded(conn, slot.stream_id)) {
+            http09ClearOutSlot(conn, slot.stream_id);
+            return;
+        }
         const slot_idx = http09SlotIndex(conn, slot);
         var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
         const to_read = @min(conn.app_stream_chunk, file_buf.len);
@@ -4555,7 +4602,7 @@ pub const Server = struct {
         };
         dbg("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
         const fc_before = conn.fc_bytes_sent;
-        self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null);
+        self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null, true);
         if (conn.fc_bytes_sent <= fc_before) {
             // FC blocked (DATA_BLOCKED) or send failed — rewind and retry later.
             slot.stream_offset -= @intCast(n);
@@ -4572,9 +4619,10 @@ pub const Server = struct {
             // through awaiting_fin_ack slots waiting for client ACKs.
             if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
                 dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
+                http09MarkResponded(conn, slot.stream_id, slot.file_path[0..slot.file_path_len], false);
                 http09UntrackActiveSlot(conn, slot_idx);
                 slot.* = .{};
-                self.drainHttp09Pending(conn);
+                self.drainHttp09Pending(conn, 16);
                 return;
             }
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
@@ -4586,7 +4634,7 @@ pub const Server = struct {
             slot.active = false;
             http09UntrackActiveSlot(conn, slot_idx);
             dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, slot.fin_pkt_pn });
-            self.drainHttp09Pending(conn);
+            self.drainHttp09Pending(conn, 8);
         }
     }
 
@@ -4599,12 +4647,22 @@ pub const Server = struct {
     fn flushPendingHttp09Responses(self: *Server) void {
         // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
         // enough to drain responses before the client idle timeout.
-        var budget: usize = 2048;
+        var budget: usize = 4096;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
                     if (!conn.has_app_keys) continue;
+                    if (conn.http09_pending_count > 0) {
+                        const pending_before = conn.http09_pending_count;
+                        const pending_budget = @min(budget, 128);
+                        self.drainHttp09Pending(conn, pending_budget);
+                        if (conn.http09_pending_count < pending_before) {
+                            progressed = true;
+                            budget -|= pending_before - conn.http09_pending_count;
+                        }
+                    }
+                    if (budget == 0) break;
                     if (conn.http09_active_list_n > 0) {
                         var i: u16 = 0;
                         while (i < conn.http09_active_list_n and budget > 0) {
@@ -4613,6 +4671,10 @@ pub const Server = struct {
                             const slot = &conn.http09_slots[slot_idx];
                             if (!slot.active) {
                                 http09UntrackActiveSlot(conn, slot_idx);
+                                continue;
+                            }
+                            if (http09AlreadyResponded(conn, slot.stream_id)) {
+                                http09ClearOutSlot(conn, slot.stream_id);
                                 continue;
                             }
                             self.http09SendNextChunk(conn, slot);
@@ -4626,12 +4688,15 @@ pub const Server = struct {
                             if (!slot.active) continue;
                             if (budget == 0) return;
                             if (!conn.cc.canSend(congestion.mss)) break;
+                            if (http09AlreadyResponded(conn, slot.stream_id)) {
+                                http09ClearOutSlot(conn, slot.stream_id);
+                                continue;
+                            }
                             self.http09SendNextChunk(conn, slot);
                             progressed = true;
                             budget -= 1;
                         }
                     }
-                    if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
                 }
             }
             if (!progressed) break;
@@ -5068,8 +5133,17 @@ pub const Server = struct {
     /// Quinn `serve_hq` model: read the whole response and send STREAM+FIN
     /// immediately on the request stream — no outbound slot or flush queue.
     /// Used for multiplexing (32-byte files) and any response ≤ one chunk.
-    fn http09SendFileImmediate(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+    fn http09SendFileImmediate(
+        self: *Server,
+        conn: *ConnState,
+        stream_id: u64,
+        fs_path: []const u8,
+        loss_retry: bool,
+    ) bool {
         if (conn.phase != .connected or !conn.has_app_keys) return false;
+        if (http09AlreadyResponded(conn, stream_id)) return true;
+        if (!conn.cc.canSend(congestion.mss)) return false;
+        if (conn.http09_pending_count > 0 and conn.cc.getBytesInFlight() >= 16 * congestion.mss) return false;
 
         const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
             dbg("io: http09 immediate file not found: {s}\n", .{fs_path});
@@ -5087,16 +5161,16 @@ pub const Server = struct {
         if (n == 0 or @as(u64, @intCast(n)) < file_end) return false;
 
         const fc_before = conn.fc_bytes_sent;
-        self.sendRawStreamDataInner(conn, stream_id, 0, file_buf[0..n], true, null);
+        self.sendRawStreamDataInner(conn, stream_id, 0, file_buf[0..n], true, null, false);
         if (conn.fc_bytes_sent <= fc_before) return false;
 
-        http09MarkResponded(conn, stream_id);
+        http09MarkResponded(conn, stream_id, fs_path, loss_retry);
         dbg("io: http09 stream_id={} immediate send n={} (quinn-style)\n", .{ stream_id, n });
-        self.drainHttp09Pending(conn);
+        self.drainHttp09Pending(conn, 32);
         return true;
     }
 
-    fn enqueueHttp09Pending(conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+    fn enqueueHttp09Pending(conn: *ConnState, stream_id: u64, fs_path: []const u8, loss_retry: bool) bool {
         for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
             if (entry.stream_id == stream_id) return true;
         }
@@ -5106,32 +5180,82 @@ pub const Server = struct {
         const path_len = @min(fs_path.len, entry.path.len);
         @memcpy(entry.path[0..path_len], fs_path[0..path_len]);
         entry.path_len = @intCast(path_len);
+        entry.loss_retry = loss_retry;
         conn.http09_pending_count += 1;
         dbg("io: http09 stream_id={} queued (pending={})\n", .{ stream_id, conn.http09_pending_count });
         return true;
     }
 
-    fn drainHttp09Pending(self: *Server, conn: *ConnState) void {
+    fn http09FileEnd(fs_path: []const u8) ?u64 {
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch return null;
+        defer file.close();
+        return file.getEndPos() catch null;
+    }
+
+    fn http09NeedsOutSlot(conn: *const ConnState, file_end: u64) bool {
+        return file_end > conn.app_stream_chunk;
+    }
+
+    fn http09RequeueOnMuxLoss(self: *Server, conn: *ConnState, stream_id: u64, time_threshold: bool) void {
         var i: u16 = 0;
-        while (i < conn.http09_pending_count) {
+        while (i < conn.http09_responded_count) {
+            const entry = &conn.http09_responded[i];
+            if (entry.stream_id != stream_id) {
+                i += 1;
+                continue;
+            }
+            if (!time_threshold and entry.loss_retry) return;
+            const path = entry.path[0..entry.path_len];
+            const pending_retry = if (time_threshold) entry.loss_retry else true;
+            conn.http09_responded_count -= 1;
+            if (i < conn.http09_responded_count) {
+                conn.http09_responded[i] = conn.http09_responded[conn.http09_responded_count];
+            }
+            _ = enqueueHttp09Pending(conn, stream_id, path, pending_retry);
+            self.drainHttp09Pending(conn, 16);
+            return;
+        }
+    }
+
+    fn drainHttp09Pending(self: *Server, conn: *ConnState, max_sends: usize) void {
+        if (conn.http09_pending_count == 0 or max_sends == 0) return;
+        var sent: usize = 0;
+        var tried: u16 = 0;
+        var i: u16 = conn.http09_pending_cursor % conn.http09_pending_count;
+        while (sent < max_sends and tried < conn.http09_pending_count) {
+            if (!conn.cc.canSend(congestion.mss)) break;
             const entry = conn.http09_pending[i];
             const path = entry.path[0..entry.path_len];
-            if (self.http09SendFileImmediate(conn, entry.stream_id, path)) {
+            if (self.http09SendFileImmediate(conn, entry.stream_id, path, entry.loss_retry)) {
                 conn.http09_pending_count -= 1;
                 if (i < conn.http09_pending_count) {
                     conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
                 }
+                sent += 1;
+                if (conn.http09_pending_count == 0) break;
                 continue;
             }
-            if (self.openHttp09OutSlot(conn, entry.stream_id, path)) |slot_idx| {
-                self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
-                conn.http09_pending_count -= 1;
-                if (i < conn.http09_pending_count) {
-                    conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
+            if (http09FileEnd(path)) |file_end| {
+                if (http09NeedsOutSlot(conn, file_end)) {
+                    if (self.openHttp09OutSlot(conn, entry.stream_id, path)) |slot_idx| {
+                        self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
+                        conn.http09_pending_count -= 1;
+                        if (i < conn.http09_pending_count) {
+                            conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
+                        }
+                        sent += 1;
+                        if (conn.http09_pending_count == 0) break;
+                        continue;
+                    }
                 }
-                continue;
             }
-            i += 1;
+            tried += 1;
+            i = (i + 1) % conn.http09_pending_count;
+        }
+        if (conn.http09_pending_count > 0) {
+            conn.http09_pending_cursor = i % conn.http09_pending_count;
+        } else {
+            conn.http09_pending_cursor = 0;
         }
     }
 
@@ -5162,29 +5286,24 @@ pub const Server = struct {
     }
 
     fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
-        // Quinn `serve_hq`: each stream opens the file and copies it to the send
-        // stream in the same task — no slot pool or flush-queue delay.
-        if (self.http09SendFileImmediate(conn, stream_id, fs_path)) return true;
+        if (self.http09SendFileImmediate(conn, stream_id, fs_path, false)) return true;
+        const file_end = http09FileEnd(fs_path) orelse return false;
+        if (!http09NeedsOutSlot(conn, file_end)) {
+            // Multiplexing uses 32-byte files: queue for CC-fair drain instead of
+            // the 512-slot pool (quinn opens ~2000 streams at once).
+            if (enqueueHttp09Pending(conn, stream_id, fs_path, false)) {
+                self.drainHttp09Pending(conn, 32);
+                return true;
+            }
+            dbg("io: http/0.9 pending full (stream_id={} pending={})\n", .{ stream_id, conn.http09_pending_count });
+            return false;
+        }
         if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
             self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
-            self.drainHttp09Pending(conn);
+            self.drainHttp09Pending(conn, 16);
             return true;
         }
-        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
-            self.drainHttp09Pending(conn);
-            return true;
-        }
-        // Slots and pending may have freed since the first attempt (CC flush).
-        self.drainHttp09Pending(conn);
-        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
-            self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
-            self.drainHttp09Pending(conn);
-            return true;
-        }
-        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
-            self.drainHttp09Pending(conn);
-            return true;
-        }
+        if (enqueueHttp09Pending(conn, stream_id, fs_path, false)) return true;
         dbg("io: http/0.9 open queued failed (stream_id={} pending={})\n", .{ stream_id, conn.http09_pending_count });
         return false;
     }
@@ -5214,7 +5333,7 @@ pub const Server = struct {
         if (http09AlreadyResponded(conn, sf.stream_id)) return;
         for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
             if (entry.stream_id == sf.stream_id) {
-                self.drainHttp09Pending(conn);
+                self.drainHttp09Pending(conn, 16);
                 if (http09AlreadyResponded(conn, sf.stream_id)) return;
                 break;
             }
