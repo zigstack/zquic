@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.8] - 2026-06-08
+
+### Fixed
+
+- **`Client.init` stack overflow.** The enlarged `ConnState` (http/0.9 server
+  arrays from v1.6.7) made `Client.init` stack-allocate two copies transiently
+  (`var conn` plus the returned `Client`), overflowing default test-thread stacks
+  in downstream consumers such as zig-libp2p.  Connection state is now
+  configured in-place via `Client.configureNewConn`.
+
+---
+
 ## [v1.6.7] - 2026-06-08
 
 ### Fixed
