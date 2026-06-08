@@ -2616,12 +2616,7 @@ pub const Server = struct {
     fn findConnByPeer(self: *Server, peer: compat.Address) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.*) |*c| {
-                // Compare family, port, and IP address bytes
-                if (c.peer.any.family == peer.any.family and
-                    std.mem.eql(u8, c.peer.any.data[0..6], peer.any.data[0..6]))
-                {
-                    return c;
-                }
+                if (compat.Address.eql(c.peer, peer)) return c;
             }
         }
         return null;
@@ -2713,14 +2708,14 @@ pub const Server = struct {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
             if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial: replay exact UDP payloads. Rebuilding with
-                // new PNs re-injects TLS records and quinn reports UnsolicitedEncryptedExtension.
+                // Retransmitted Initial before the client learns our CID: reuse the
+                // existing connection instead of opening a second one (which would
+                // rebuild the TLS flight and trigger quinn UnsolicitedEncryptedExtension).
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
                     self.replayStoredServerFlight(existing, src);
+                    return;
                 }
-                // Quinn does not rebuild the TLS flight here; loss recovery re-sends the
-                // same CRYPTO bytes (connection/spaces.rs). We cache the first UDP payloads.
-                return;
+                break :blk existing;
             }
 
             // Truly new connection
@@ -3045,9 +3040,20 @@ pub const Server = struct {
         // Advance the expected offset now that we have the contiguous segment.
         conn.init_crypto_offset += data.len;
 
-        // Only process ClientHello in initial phase
+        // Retransmitted ClientHello after we already sent the server flight: replay
+        // the cached UDP payloads byte-for-byte. Re-running processClientHello /
+        // buildServerFlight re-injects TLS records and quinn reports
+        // UnsolicitedEncryptedExtension (see processInitialPacket findConnByPeer).
+        if (data.len >= 4 and data[0] == tls_hs.MSG_CLIENT_HELLO and
+            (conn.phase != .initial or (conn.tls_inited and conn.sh_len > 0)))
+        {
+            if (conn.init_resend_valid or conn.hs_resend_count > 0) {
+                self.replayStoredServerFlight(conn, src);
+            }
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
         if (conn.phase != .initial) {
-            // Drain any now-contiguous buffered segments even if we skip processing.
             self.drainInitCryptoReorder(conn, src);
             return;
         }
