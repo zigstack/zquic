@@ -681,11 +681,16 @@ pub fn buildCertificateRequest(out: []u8) !usize {
     var ep: usize = 0;
     writeU16(ext_buf[ep..], EXT_SIGNATURE_ALGORITHMS);
     ep += 2;
-    const algo_bytes: [4]u8 = .{ 0x04, 0x03, 0x05, 0x03 };
-    writeU16(ext_buf[ep..], algo_bytes.len);
+    // extension_data = SignatureSchemeList: u16 list_len + schemes (same layout as
+    // appendClientHelloSignatureAlgorithms — omitting list_len breaks go/crypto/tls).
+    writeU16(ext_buf[ep..], 6); // ext data: list_len(2) + 2× u16 schemes
     ep += 2;
-    @memcpy(ext_buf[ep..][0..algo_bytes.len], &algo_bytes);
-    ep += algo_bytes.len;
+    writeU16(ext_buf[ep..], 4); // signature list length in bytes
+    ep += 2;
+    writeU16(ext_buf[ep..], SIG_ECDSA_SECP256R1_SHA256);
+    ep += 2;
+    writeU16(ext_buf[ep..], SIG_ECDSA_SECP384R1_SHA384);
+    ep += 2;
 
     const body_len = 1 + 2 + ep;
     if (out.len < 4 + body_len) return error.BufferTooSmall;
@@ -1992,6 +1997,23 @@ test "leafCertificateDerFromCertificateHandshakeMessage round trip" {
     const n = try buildCertificate(&buf, &der_in);
     const leaf = try leafCertificateDerFromCertificateHandshakeMessage(buf[0..n]);
     try testing.expectEqualSlices(u8, &der_in, leaf);
+}
+
+test "buildCertificateRequest signature_algorithms extension wire format" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const n = try buildCertificateRequest(&buf);
+    try testing.expect(n > 4);
+    try testing.expectEqual(MSG_CERTIFICATE_REQUEST, buf[0]);
+    // body: ctx_len=0, extensions_len=10, ext type=13, ext_data_len=6, list_len=4, 0x0403, 0x0503
+    const body = buf[4..n];
+    try testing.expectEqual(@as(u8, 0), body[0]); // empty request context
+    try testing.expectEqual(@as(u16, 10), readU16(body[1..])); // extensions block
+    try testing.expectEqual(@as(u16, EXT_SIGNATURE_ALGORITHMS), readU16(body[3..]));
+    try testing.expectEqual(@as(u16, 6), readU16(body[5..])); // extension data
+    try testing.expectEqual(@as(u16, 4), readU16(body[7..])); // SignatureSchemeList length
+    try testing.expectEqual(SIG_ECDSA_SECP256R1_SHA256, readU16(body[9..]));
+    try testing.expectEqual(SIG_ECDSA_SECP384R1_SHA384, readU16(body[11..]));
 }
 
 test "handshake: client-server secrets are mirrored" {
