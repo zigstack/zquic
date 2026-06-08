@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.7] - 2026-06-08
+
+### Fixed
+
+- **quinn→zquic HTTP/0.9 multiplexing interop.** Pace and congestion-control-gate
+  every http/0.9 data send (immediate path, pending drain, active slots, FIN and
+  loss retransmits) so quinn's ~2000-stream burst is not answered as one blast
+  that overruns the NS3 bottleneck queue. Defer cwnd-blocked loss retransmits
+  into a bounded `http09_rtx` queue. Only count 1-RTT packets toward
+  `bytes_in_flight` when the loss detector tracks them (prevents a permanent
+  PTO PING loop when the LD ring fills). Stop re-entering `drainHttp09Pending`
+  from send helpers — that swap-remove corruption silently dropped queued
+  requests (~17 streams with no server response).
+
+- **Cross-impl quinn interop (handshake, transfer, download).** ALPN echo for
+  arbitrary client preferences, QUIC transport-parameter extension type echo,
+  coalesced Initial/Handshake receive resync, client stream reordering, and
+  proactive MAX_STREAMS for quinn's stream credit model.
+
+- **Packet number guard.** `decompressPacketNumber` no longer over/underflows
+  on extreme PN gaps (#161).
+
+### Added
+
+- **Issue #138 P1 transport parity.** DPLPMTUD probes (`PlPmtuState`), preferred
+  address TP encode, automatic key update after 1M 1-RTT packets, cipher-aware
+  0-RTT for non-AES-128, ECN on Initial/Handshake, and `MigrationManager`
+  wiring (anti-amplification, path challenge/response).
+
+- **`raw_app_stream.zig`.** Extracted raw application stream send/receive path
+  from `io.zig` for clearer ownership of retransmit buffers.
+
+### Changed
+
+- **HTTP/0.9 server scheduling.** Quinn-style immediate single-chunk responses,
+  bounded pending/retransmit queues, and paced flush under congestion control.
+
+---
+
 ## [v1.6.6] - 2026-06-03
 
 ### Added
