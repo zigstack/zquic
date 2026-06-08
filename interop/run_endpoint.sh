@@ -80,8 +80,8 @@ fi
 # Unknown or unsupported test cases exit 127 so the runner marks them "unsupported".
 case "${TESTCASE}" in
     handshake|multiplexing|multiconnect)
-        # quinn-interop negotiates h3 for HTTPS handshake/transfer tests.
-        EXTRA_FLAGS=(--http3)
+        # quinn-interop negotiates hq-interop; http09 matches the passing transfer case.
+        EXTRA_FLAGS=(--http09)
         ;;
     transfer)
         EXTRA_FLAGS=(--http09)

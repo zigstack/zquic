@@ -34,14 +34,19 @@ const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
 const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
+const ack_frame_mod = @import("../frames/ack.zig");
 const version_neg_mod = @import("../packet/version_negotiation.zig");
 const congestion = @import("../loss/congestion.zig");
 const recovery = @import("../loss/recovery.zig");
 const build_options = @import("build_options");
 const batch_io = @import("batch_io.zig");
 const path_mtu_mod = @import("path_mtu.zig");
+const migration_mod = @import("migration.zig");
 const raw_app_stream = @import("raw_app_stream.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
+
+/// Locally-initiate a key update after this many 1-RTT packets (RFC 9001 §6).
+const auto_key_update_packet_threshold: u64 = 1_000_000;
 
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
 /// in production builds all calls are removed by the optimizer with zero overhead.
@@ -196,6 +201,75 @@ pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, first_ack_range: u64, ect0: 
     pos += ce_enc.len;
     return pos;
 }
+
+/// Tracks received 1-RTT packet numbers for deferred ACK frames.
+const AppAckTracker = struct {
+    largest: u64 = 0,
+    range_count: usize = 0,
+    ranges: [128][2]u64 = undefined,
+
+    fn reset(self: *AppAckTracker) void {
+        self.* = .{};
+    }
+
+    /// Record a received packet number. Returns true when the tracker is full
+    /// and the caller should flush an ACK before accepting more PNs.
+    fn observe(self: *AppAckTracker, pn: u64) bool {
+        if (pn > self.largest) self.largest = pn;
+        if (self.range_count == 0) {
+            self.ranges[0] = .{ pn, pn };
+            self.range_count = 1;
+            return self.range_count >= 48;
+        }
+        const last = &self.ranges[self.range_count - 1];
+        if (pn + 1 == last[0]) {
+            last[0] = pn;
+            return self.range_count >= 48;
+        }
+        if (pn == last[1] + 1) {
+            last[1] = pn;
+            return self.range_count >= 48;
+        }
+        if (self.range_count < self.ranges.len) {
+            self.ranges[self.range_count] = .{ pn, pn };
+            self.range_count += 1;
+            return self.range_count >= 48;
+        }
+        return true;
+    }
+
+    fn buildWireFrame(self: *const AppAckTracker, buf: []u8, ecn: ?ack_frame_mod.EcnCounts) !usize {
+        if (self.range_count == 0) return 0;
+        const n = @min(self.range_count, ack_frame_mod.max_ack_ranges);
+        var sorted: [128]ack_frame_mod.AckRange = undefined;
+        for (self.ranges[0..n], 0..) |r, i| {
+            sorted[i] = .{ .smallest = r[0], .largest = r[1] };
+        }
+        // Sort by largest PN descending (ACK frame wire order).
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < n) : (j += 1) {
+                if (sorted[j].largest > sorted[i].largest) {
+                    const tmp = sorted[i];
+                    sorted[i] = sorted[j];
+                    sorted[j] = tmp;
+                }
+            }
+        }
+        var frame = ack_frame_mod.AckFrame{
+            .largest_acknowledged = sorted[0].largest,
+            .ack_delay = 0,
+            .ranges = undefined,
+            .range_count = n,
+            .ecn = ecn,
+        };
+        for (0..n) |k| {
+            frame.ranges[k] = sorted[k];
+        }
+        return frame.serialize(buf);
+    }
+};
 
 /// Build a PADDING frame (one byte 0x00).
 pub fn buildPaddingFrames(out: []u8, count: usize) void {
@@ -522,8 +596,31 @@ fn pad1RttPayload(payload: []const u8, pad_buf: []u8) []const u8 {
     return pad_buf[0..min_len];
 }
 
+fn keyMaterialFromEarlyKeys(cets: [32]u8, early: session_mod.EarlyDataKeys) KeyMaterial {
+    var km = KeyMaterial{ .secret = cets };
+    @memcpy(km.key[0..16], early.key[0..16]);
+    @memcpy(km.key32[0..32], early.key[0..32]);
+    km.iv = early.iv;
+    @memcpy(km.hp[0..16], early.hp[0..16]);
+    @memcpy(km.hp32[0..32], early.hp[0..32]);
+    km.initCachedContexts();
+    return km;
+}
+
+fn migrationPreferredFromTp(pa: quic_tls_mod.PreferredAddressTp) migration_mod.PreferredAddress {
+    return .{
+        .ipv4 = pa.ipv4,
+        .ipv4_port = pa.ipv4_port,
+        .ipv6 = pa.ipv6,
+        .ipv6_port = pa.ipv6_port,
+        .connection_id = pa.connection_id,
+        .connection_id_len = pa.connection_id_len,
+        .stateless_reset_token = pa.stateless_reset_token,
+    };
+}
+
 /// Result of decrypting a 1-RTT packet with PN reconstruction.
-const Decrypt1RttResult = struct { pt_len: usize, pn: u64 };
+const Decrypt1RttResult = struct { pt_len: usize, pn: u64, wire_len: usize };
 
 /// Decrypt a 1-RTT short-header packet with full packet-number
 /// reconstruction (RFC 9000 §17.1) under the connection's negotiated AEAD
@@ -548,6 +645,7 @@ fn unprotect1RttPacketWithPnTracking(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
+    payload_end: usize,
     km: *const KeyMaterial,
     cipher: PacketCipher,
     expected_recv_pn: ?u64,
@@ -556,12 +654,12 @@ fn unprotect1RttPacketWithPnTracking(
         dst,
         buf,
         pn_start,
-        buf.len,
+        payload_end,
         km,
         expected_recv_pn,
         cipher,
     );
-    return .{ .pt_len = r.pt_len, .pn = r.pn };
+    return .{ .pt_len = r.pt_len, .pn = r.pn, .wire_len = payload_end };
 }
 
 /// Decrypt a 1-RTT packet without expected-PN tracking.  Thin wrapper used
@@ -627,6 +725,38 @@ fn buildRetireConnectionIdFrame(out: []u8, seq: u64) !usize {
     return 1 + enc.len;
 }
 
+/// Try decrypting a 1-RTT packet under `km`, sweeping PN reconstruction
+/// candidates when the high-water `largest` mark causes §17.1 aliasing on
+/// short wire encodings (reordered / retransmitted packets).
+fn tryUnprotect1RttWithPnCandidates(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    payload_end: usize,
+    km: *const KeyMaterial,
+    cipher: PacketCipher,
+    largest: ?u64,
+) ?Decrypt1RttResult {
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, largest)) |r| {
+        return r;
+    } else |_| {}
+
+    if (largest) |hi| {
+        const floor = if (hi > 1024) hi - 1024 else 0;
+        var exp: u64 = hi;
+        while (exp > floor) : (exp -= 1) {
+            if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, exp)) |r| {
+                return r;
+            } else |_| {}
+        }
+    }
+
+    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, payload_end, km, cipher, null)) |r| {
+        return r;
+    } else |_| {}
+    return null;
+}
+
 /// Decrypt an inbound 1-RTT packet with RFC 9001 §6 key-update handling.
 /// `recv_km` / `recv_km_prev` / `send_km` are the endpoint's receive and
 /// send key slots for this direction (server: recv=app_client_km).
@@ -635,6 +765,7 @@ fn decrypt1RttWithKeyUpdate(
     dst: []u8,
     buf: []const u8,
     pn_start: usize,
+    payload_end: usize,
     incoming_phase: bool,
     recv_km: *KeyMaterial,
     recv_km_prev: *?KeyMaterial,
@@ -643,19 +774,19 @@ fn decrypt1RttWithKeyUpdate(
     const cipher = conn.packet_cipher;
     const expected = conn.app_recv_pn;
 
-    if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, recv_km, cipher, expected)) |r| {
+    if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, recv_km, cipher, expected)) |r| {
         return r;
-    } else |_| {}
+    }
 
     if (recv_km_prev.*) |prev| {
-        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &prev, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, &prev, cipher, expected)) |r| {
             return r;
-        } else |_| {}
+        }
     }
 
     if (incoming_phase != conn.peer_key_phase) {
         var nk = if (conn.use_v2) recv_km.nextGenV2() else recv_km.nextGen();
-        if (unprotect1RttPacketWithPnTracking(dst, buf, pn_start, &nk, cipher, expected)) |r| {
+        if (tryUnprotect1RttWithPnCandidates(dst, buf, pn_start, payload_end, &nk, cipher, expected)) |r| {
             recv_km_prev.* = recv_km.*;
             recv_km.* = nk;
             if (conn.key_update_pending) {
@@ -667,7 +798,7 @@ fn decrypt1RttWithKeyUpdate(
                 conn.key_phase_bit = !conn.key_phase_bit;
             }
             return r;
-        } else |_| {}
+        }
     }
 
     return error.DecryptFailed;
@@ -787,6 +918,91 @@ const Http09OutSlot = struct {
     }
 };
 
+/// Quinn's multiplexing test opens ~2000 streams at once; serve enough
+/// concurrent responses that the pending queue does not fill under CC.
+const http09_slot_max = 512;
+const http09_pending_max = 2048;
+
+const Http09PendingOpen = struct {
+    stream_id: u64 = 0,
+    path_len: u16 = 0,
+    path: [512]u8 = undefined,
+};
+
+/// A lost immediate-mux STREAM frame waiting to be retransmitted under
+/// congestion control.  `data` is heap-owned (the same buffer the loss
+/// detector surfaced); ownership transfers back into a fresh SentPacket when
+/// the entry is drained, or is freed if the queue is torn down.
+const Http09Rtx = struct {
+    stream_id: u64 = 0,
+    offset: u64 = 0,
+    fin: bool = false,
+    data: []u8 = &.{},
+};
+
+/// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
+const http09_req_asm_buf_len = 256;
+const Http09ReqAssembly = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    len: usize = 0,
+    buf: [http09_req_asm_buf_len]u8 = undefined,
+
+    fn reset(self: *Http09ReqAssembly) void {
+        self.* = .{};
+    }
+};
+
+// Quinn multiplexing splits GET lines across STREAM frames; one slot per
+// in-flight request until FIN. Match http09_pending_max (~2000 streams).
+const http09_req_asm_max = 2048;
+
+fn http09ReqAsmIndex(stream_id: u64) usize {
+    return @as(usize, @intCast((stream_id >> 2) % http09_req_asm_max));
+}
+
+fn http09SlotIndex(conn: *const ConnState, slot: *const Http09OutSlot) u16 {
+    const off = (@intFromPtr(slot) - @intFromPtr(&conn.http09_slots[0]));
+    return @intCast(off / @sizeOf(Http09OutSlot));
+}
+
+fn http09TrackActiveSlot(conn: *ConnState, slot_idx: u16) void {
+    for (conn.http09_active_indices[0..conn.http09_active_list_n]) |idx| {
+        if (idx == slot_idx) return;
+    }
+    conn.http09_active_indices[conn.http09_active_list_n] = slot_idx;
+    conn.http09_active_list_n += 1;
+}
+
+fn http09UntrackActiveSlot(conn: *ConnState, slot_idx: u16) void {
+    var i: u16 = 0;
+    while (i < conn.http09_active_list_n) : (i += 1) {
+        if (conn.http09_active_indices[i] == slot_idx) {
+            conn.http09_active_indices[i] = conn.http09_active_indices[conn.http09_active_list_n - 1];
+            conn.http09_active_list_n -= 1;
+            return;
+        }
+    }
+}
+
+fn http09AlreadyResponded(conn: *const ConnState, stream_id: u64) bool {
+    for (conn.http09_responded[0..conn.http09_responded_count]) |id| {
+        if (id == stream_id) return true;
+    }
+    for (&conn.http09_slots) |*slot| {
+        if (slot.stream_id != stream_id) continue;
+        if (slot.awaiting_fin_ack) return true;
+    }
+    return false;
+}
+
+fn http09MarkResponded(conn: *ConnState, stream_id: u64) void {
+    if (http09AlreadyResponded(conn, stream_id)) return;
+    if (conn.http09_responded_count >= http09_pending_max) return;
+    conn.http09_responded[conn.http09_responded_count] = stream_id;
+    conn.http09_responded_count += 1;
+}
+
 /// One pending HTTP/3 file response (served incrementally from the event loop).
 /// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
 /// the QUIC stream offset independently (HEADERS frame bytes are counted too).
@@ -888,6 +1104,7 @@ pub const ConnPhase = enum {
 };
 
 /// Final-size tracking entry (RFC 9000 §4.5).  `used=false` slots are empty.
+const fin_tracker_cap = 2048;
 const FinEntry = struct {
     stream_id: u64 = 0,
     final_size: u64 = 0,
@@ -895,8 +1112,13 @@ const FinEntry = struct {
 };
 
 /// Record the final size of a stream that reached FIN/RESET.  Evicts the
-/// oldest entry (index 0) if full.  Idempotent for an existing stream_id.
-fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void {
+/// oldest entry (ring) if full.  Idempotent for an existing stream_id.
+fn recordFinalSize(
+    tracker: *[fin_tracker_cap]FinEntry,
+    ring: *u16,
+    stream_id: u64,
+    final_size: u64,
+) void {
     for (tracker) |*e| {
         if (e.used and e.stream_id == stream_id) {
             e.final_size = final_size;
@@ -909,16 +1131,15 @@ fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void
             return;
         }
     }
-    // Full — shift and replace the last slot.
-    var i: usize = 0;
-    while (i < tracker.len - 1) : (i += 1) tracker[i] = tracker[i + 1];
-    tracker[tracker.len - 1] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+    const idx = ring.*;
+    tracker[idx] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+    ring.* = (idx + 1) % fin_tracker_cap;
 }
 
 /// Returns true if `final_size` matches any previously-recorded final size
 /// for this stream_id, or if no entry exists (new stream).  Returns false
 /// only on a known mismatch — caller should close with FINAL_SIZE_ERROR.
-fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64) bool {
+fn checkFinalSize(tracker: *const [fin_tracker_cap]FinEntry, stream_id: u64, final_size: u64) bool {
     for (tracker) |e| {
         if (e.used and e.stream_id == stream_id) return e.final_size == final_size;
     }
@@ -982,6 +1203,8 @@ pub const ConnState = struct {
     max_udp_payload: u16 = default_conn_path_mtu.max_udp_payload,
     /// Largest HTTP/0.9 or HTTP/3 file read per STREAM frame (from `max_udp_payload`).
     app_stream_chunk: usize = default_conn_path_mtu.app_stream_chunk,
+    /// RFC 8899 PLPMTUD state for this path.
+    plpmtu: path_mtu_mod.PlPmtuState = path_mtu_mod.PlPmtuState.init(default_conn_path_mtu.max_udp_payload),
 
     // Initial packet keys (derived from DCID)
     init_keys: ?InitialSecrets = null,
@@ -1009,6 +1232,8 @@ pub const ConnState = struct {
     /// the correct PN range.
     zerortt_recv_pn: ?u64 = null,
     app_recv_pn: ?u64 = null,
+    /// Received 1-RTT PNs pending ACK to the peer (server role).
+    app_recv_ack: AppAckTracker = .{},
 
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
@@ -1057,7 +1282,7 @@ pub const ConnState = struct {
     qlog: qlog_writer.Writer = .{},
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [64]Http09OutSlot = [_]Http09OutSlot{.{}} ** 64,
+    http09_slots: [http09_slot_max]Http09OutSlot = [_]Http09OutSlot{.{}} ** http09_slot_max,
 
     /// HTTP/3 responses in progress (paced DATA frame sending per connection).
     http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
@@ -1065,6 +1290,26 @@ pub const ConnState = struct {
     /// Number of currently active HTTP/0.9 response slots (maintained by the server).
     /// Avoids O(2000) scan in the event-loop poll-timeout calculation.
     http09_active_count: u32 = 0,
+    /// Indices of active slots — flush iterates this list instead of all 512 slots.
+    http09_active_indices: [http09_slot_max]u16 = undefined,
+    http09_active_list_n: u16 = 0,
+    /// Cursor for finding the next free outbound slot.
+    http09_slot_cursor: u16 = 0,
+    /// HTTP/0.9 opens waiting for a free outbound slot (quinn multiplexing).
+    http09_pending: [http09_pending_max]Http09PendingOpen = undefined,
+    http09_pending_count: u16 = 0,
+    /// Streams that already received an HTTP/0.9 response (immediate path has no slot).
+    http09_responded: [http09_pending_max]u64 = undefined,
+    http09_responded_count: u16 = 0,
+    /// Lost immediate-mux STREAM frames awaiting a congestion-controlled
+    /// retransmission (drained by flushPendingHttp09Responses).  Without this
+    /// the onAck loss handler resends every lost frame immediately, bypassing
+    /// cwnd, which under quinn's ~2000-stream burst snowballs into a retransmit
+    /// storm that overflows the NS3 queue and the loss-detector ring.
+    http09_rtx: [http09_pending_max]Http09Rtx = [_]Http09Rtx{.{}} ** http09_pending_max,
+    http09_rtx_count: u16 = 0,
+    /// Partial HTTP/0.9 requests reassembled until FIN.
+    http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
     /// Number of currently active HTTP/3 response slots.
     http3_active_count: u32 = 0,
 
@@ -1125,9 +1370,8 @@ pub const ConnState = struct {
     // Used to detect peer confirmation via ACK + Key Phase observation.
     key_update_init_pn: ?u64 = null,
 
-    // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
-    // Non-null while waiting for a PATH_RESPONSE from the new address.
-    path_challenge_data: ?[8]u8 = null,
+    /// Path validation, anti-amplification, and preferred-address policy.
+    migration: migration_mod.MigrationManager = .{},
 
     // ── Stream limit enforcement (RFC 9000 §4.6) ──────────────────────────────
     // The server advertises initial_max_streams_bidi=1000 and
@@ -1159,7 +1403,8 @@ pub const ConnState = struct {
     // triggers FINAL_SIZE_ERROR (0x06).  A small ring is sufficient: only the
     // most-recently-finished streams need to be checked against late RESETs,
     // and stale entries naturally age out as newer FIN/RESETs arrive.
-    fin_tracker: [16]FinEntry = [_]FinEntry{.{}} ** 16,
+    fin_tracker: [fin_tracker_cap]FinEntry = [_]FinEntry{.{}} ** fin_tracker_cap,
+    fin_tracker_ring: u16 = 0,
 
     // ── Active connection ID limit (RFC 9000 §5.1.1) ──────────────────────────
     // Count of unretired CIDs the peer has issued via NEW_CONNECTION_ID.
@@ -1183,10 +1428,8 @@ pub const ConnState = struct {
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
     // completed), the server MUST NOT send more than 3× the bytes received.
-    // These counters track raw UDP payload bytes exchanged during the handshake.
-    // Once address_validated is set, the limit no longer applies.
-    anti_amp_bytes_recv: u64 = 0,
-    anti_amp_bytes_sent: u64 = 0,
+    // Byte accounting lives in `migration.anti_amp`. Once address_validated is
+    // set, the limit no longer applies.
     address_validated: bool = false,
     // Set when a pre-validation send was blocked by the 3× rule; cleared
     // (and the pending flight retried) once more client bytes arrive.
@@ -1225,7 +1468,7 @@ pub const ConnState = struct {
     /// full we fall back to the §18.2 initial limit for any further streams,
     /// which only causes us to be over-conservative on send — never to
     /// violate the peer's window.
-    per_stream_send_max: [64]PeerStreamSendMaxEntry = [_]PeerStreamSendMaxEntry{.{}} ** 64,
+    per_stream_send_max: [2048]PeerStreamSendMaxEntry = [_]PeerStreamSendMaxEntry{.{}} ** 2048,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -1274,6 +1517,8 @@ pub const ConnState = struct {
     // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
     early_km: KeyMaterial = undefined,
     has_early_keys: bool = false,
+    /// AEAD for inbound 0-RTT (may differ from handshake/1-RTT cipher).
+    early_packet_cipher: PacketCipher = .aes128_gcm,
 
     // AEAD for Handshake / 0-RTT / 1-RTT (Initial always AES-128-GCM).
     packet_cipher: PacketCipher = .aes128_gcm,
@@ -1287,12 +1532,16 @@ pub const ConnState = struct {
     // Controls initial-secret derivation, long-header type bits, and Retry tag.
     use_v2: bool = false,
 
-    // ECN counters for received 1-RTT packets (RFC 9000 §13.4).
+    // ECN counters for received packets (RFC 9000 §13.4).
     // We mark all outgoing packets ECT(0); these counts track what was received
     // so that ACK-ECN frames (type 0x03) report accurate ECN feedback to the peer.
+    init_ecn_ect0_recv: u64 = 0,
+    hs_ecn_ect0_recv: u64 = 0,
     ecn_ect0_recv: u64 = 0,
     ecn_ect1_recv: u64 = 0,
     ecn_ce_recv: u64 = 0,
+    /// 1-RTT packets sent since the last locally-initiated key update.
+    packets_since_key_update: u64 = 0,
 
     // Peer-reported ECN counters from ACK frames carrying ECN feedback
     // (RFC 9002 §B.4 / RFC 9000 §13.4).  When `peer_ecn_ce` increases for a
@@ -1311,6 +1560,9 @@ pub const ConnState = struct {
     rtt: recovery.RttEstimator = .{},
     // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
     ld: recovery.LossDetector = .{},
+    // Token-bucket pacer state (see ConnState.pacerAllow).
+    pacing_tokens: f64 = 0,
+    pacing_last_ms: i64 = 0,
 
     // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
     // Set on the client when config.v2 = true so we can decrypt a v2 Initial
@@ -1382,6 +1634,17 @@ pub const ConnState = struct {
     /// (`max_ack_delay`, `ack_delay_exponent`), and CID-pool sizing are
     /// applied in follow-ups so each gap from issue #138 lands as its own
     /// reviewable diff.
+    /// Sync `max_udp_payload` / `app_stream_chunk` from `plpmtu`.
+    pub fn syncPathMtuFields(self: *ConnState) void {
+        self.max_udp_payload = self.plpmtu.effectiveMtu();
+        self.app_stream_chunk = self.plpmtu.appStreamChunk();
+    }
+
+    /// Record one sent 1-RTT packet for automatic key-update thresholding.
+    pub fn note1RttSent(self: *ConnState) void {
+        self.packets_since_key_update += 1;
+    }
+
     pub fn applyPeerTransportParams(self: *ConnState, qtp: []const u8) void {
         if (qtp.len == 0) return;
         const parsed = quic_tls_mod.parseTransportParams(qtp) catch |err| {
@@ -1403,8 +1666,13 @@ pub const ConnState = struct {
         if (parsed.active_connection_id_limit > 0) {
             self.peer_active_cid_limit = parsed.active_connection_id_limit;
         }
+        if (parsed.max_udp_payload_size > 0) {
+            self.plpmtu.applyPeerMax(parsed.max_udp_payload_size);
+            self.syncPathMtuFields();
+        }
         if (parsed.preferred_address) |pa| {
             self.peer_preferred_address = pa;
+            self.migration.setPreferredAddress(migrationPreferredFromTp(pa));
             dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
         }
     }
@@ -1451,6 +1719,34 @@ pub const ConnState = struct {
         return null;
     }
 
+    /// Token-bucket pacer (RFC 9002 §7.7).  Spreads data sends across the RTT
+    /// so a cwnd-sized response does not leave as one instantaneous burst.  The
+    /// NS3 interop path has a 25-packet DropTail bottleneck queue, so an unpaced
+    /// ~900-packet reply to quinn's multiplexing burst drops ~35% and collapses
+    /// the connection.  Tokens are denominated in bytes; one packet costs one
+    /// MSS so the effective rate is cwnd_packets / srtt.
+    fn pacerAllow(self: *ConnState, now_ms: i64) bool {
+        const srtt = @max(self.rtt.srtt_ms, 1.0);
+        const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
+        const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
+        if (self.pacing_last_ms == 0) {
+            self.pacing_last_ms = now_ms;
+            self.pacing_tokens = @floatFromInt(congestion.mss);
+        }
+        const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
+        self.pacing_last_ms = now_ms;
+        self.pacing_tokens += rate * elapsed;
+        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
+        if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
+        return self.pacing_tokens >= @as(f64, @floatFromInt(congestion.mss));
+    }
+
+    /// Consume one packet's worth of pacing credit after an actual send.
+    fn pacerConsume(self: *ConnState) void {
+        self.pacing_tokens -= @floatFromInt(congestion.mss);
+        if (self.pacing_tokens < 0) self.pacing_tokens = 0;
+    }
+
     /// RFC 9001 §6.5: minimum spacing between locally-initiated key updates.
     fn keyUpdateCooldownMs(self: *const ConnState) u64 {
         const srt = @as(u64, @intFromFloat(@max(self.rtt.srtt_ms, 0.0)));
@@ -1469,8 +1765,7 @@ pub const ConnState = struct {
     /// unvalidated address without exceeding the 3× amplification limit?
     pub fn canSendAntiAmp(self: *const ConnState, pkt_len: usize) bool {
         if (self.address_validated) return true;
-        if (self.anti_amp_bytes_recv == 0) return false;
-        return self.anti_amp_bytes_sent + @as(u64, @intCast(pkt_len)) <= self.anti_amp_bytes_recv * 3;
+        return self.migration.anti_amp.canSend(pkt_len);
     }
 
     /// Count of unretired local CIDs we have advertised (seq 0 + pool).
@@ -1682,6 +1977,7 @@ fn clientSend1RttImmediate(
         conn.packet_cipher,
     ) catch return;
     conn.app_pn += 1;
+    conn.note1RttSent();
     _ = compat.sendto(sock, send_buf[0..pkt_len], 0, &conn.peer.any, conn.peer.getOsSockLen()) catch {};
 }
 
@@ -1731,6 +2027,8 @@ pub const ServerConfig = struct {
     request_client_certificate: bool = false,
     /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
     max_udp_payload: ?u16 = null,
+    /// Optional preferred address to advertise in transport parameters (TP 0x0d).
+    preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
 };
 
 /// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
@@ -1925,10 +2223,13 @@ pub const Server = struct {
     /// Run loss recovery, flush pending HTTP responses, and reap idle connections — same work as an idle `run()` iteration without reading the socket.
     pub fn processPendingWork(self: *Server) void {
         self.checkPto();
+        self.maybeSendPlpmtuProbes();
+        self.maybeAutoKeyUpdates();
         self.flushPendingHttp09Responses();
         self.http09RetransmitPendingFins();
         self.flushPendingHttp3Responses();
         self.http3RetransmitPendingFins();
+        self.flushAllConnAppAcks();
         self.flushSendBatch();
         self.reapDrainedConnections();
     }
@@ -2023,7 +2324,16 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
+        // Fresh STREAM bytes went on the wire — charge flow control even when
+        // the loss detector is full and we cannot attach a retransmit buffer.
+        if (is_fresh) conn.fc_bytes_sent +|= data.len;
         if (conn.ld.sent_count == 0) {
+            if (owned_buf) |b| self.allocator.free(b);
+            return;
+        }
+        const sent_pn = conn.app_pn - 1;
+        const last = &conn.ld.sent[conn.ld.sent_count - 1];
+        if (last.pn != sent_pn) {
             if (owned_buf) |b| self.allocator.free(b);
             return;
         }
@@ -2034,7 +2344,6 @@ pub const Server = struct {
             const dup = self.allocator.dupe(u8, data) catch return;
             break :blk dup;
         };
-        const last = &conn.ld.sent[conn.ld.sent_count - 1];
         // Defence-in-depth: free any pre-existing data so we don't leak if
         // some unrelated path already attached one.
         if (last.stream_data) |old| self.allocator.free(old);
@@ -2043,9 +2352,6 @@ pub const Server = struct {
         last.stream_offset = offset;
         last.stream_data = buf;
         last.stream_fin = fin;
-        // Charge fresh-send bytes against the connection-level limit.
-        // Retransmits reuse already-charged bytes (RFC 9000 §4.1).
-        if (is_fresh) conn.fc_bytes_sent +|= data.len;
     }
 
     pub fn deinit(self: *Server) void {
@@ -2113,27 +2419,29 @@ pub const Server = struct {
             var poll_timeout_ms: i32 = 2000;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
-                    if (conn.http09_active_count > 0 or conn.http3_active_count > 0) {
-                        poll_timeout_ms = 50;
+                    if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
+                        conn.http09_rtx_count > 0 or conn.http3_active_count > 0)
+                    {
+                        poll_timeout_ms = 10;
                         break;
                     }
                     // Also check awaiting_fin_ack slots (FIN retransmit needed).
                     for (&conn.http09_slots) |*slot| {
                         if (slot.awaiting_fin_ack) {
-                            poll_timeout_ms = 50;
+                            poll_timeout_ms = 10;
                             break;
                         }
                     }
-                    if (poll_timeout_ms != 50) {
+                    if (poll_timeout_ms != 10) {
                         for (&conn.http3_slots) |*slot| {
                             if (slot.awaiting_fin_ack) {
-                                poll_timeout_ms = 50;
+                                poll_timeout_ms = 10;
                                 break;
                             }
                         }
                     }
                 }
-                if (poll_timeout_ms == 50) break;
+                if (poll_timeout_ms == 10) break;
             }
 
             const ready = std.posix.poll(fds[0..nfds], poll_timeout_ms) catch |err| {
@@ -2142,6 +2450,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushAllConnAppAcks();
                 self.flushSendBatch();
                 continue;
             };
@@ -2157,6 +2466,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushAllConnAppAcks();
                 self.flushSendBatch();
                 self.reapDrainedConnections();
                 continue;
@@ -2200,15 +2510,17 @@ pub const Server = struct {
                 dbg("io: server recvBatch n={}\n", .{n_recv});
                 for (rb.entries[0..n_recv]) |*e| {
                     self.processPacket(e.buf[0..e.len], e.addr);
+                    // Flush after each datagram so coalesced mux opens get responses
+                    // without waiting for the full recv batch to drain.
+                    self.flushPendingHttp09Responses();
+                    self.http09RetransmitPendingFins();
+                    self.flushPendingHttp3Responses();
+                    self.http3RetransmitPendingFins();
+                    self.flushAllConnAppAcks();
+                    self.flushSendBatch();
                 }
             }
 
-            self.flushPendingHttp09Responses();
-            self.http09RetransmitPendingFins();
-            self.flushPendingHttp3Responses();
-            self.http3RetransmitPendingFins();
-            // Flush all enqueued outgoing packets in one sendmmsg(2) syscall.
-            self.flushSendBatch();
             self.reapDrainedConnections();
         }
     }
@@ -2252,11 +2564,31 @@ pub const Server = struct {
                 return;
             }
             dbg("io: server pkt_type={any}\n", .{lh.header.packet_type});
+            // RFC 9000 §12.2: determine this packet's end for coalesced datagrams.
+            const pkt_end: usize = blk: {
+                var pos = lh.consumed;
+                if (lh.header.packet_type == .initial) {
+                    const tok_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
+                    const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
+                    pos += tok_r.len + tok_len;
+                }
+                if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
+                    if (pos >= buf.len) break :blk buf.len;
+                    const len_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
+                    const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
+                    pos += len_r.len + payload_len;
+                    break :blk @min(pos, buf.len);
+                }
+                break :blk buf.len;
+            };
             switch (lh.header.packet_type) {
-                .initial => self.processInitialPacket(buf, src),
-                .handshake => self.processHandshakePacket(buf, src),
-                .zero_rtt => self.process0RttPacket(buf, src),
+                .initial => self.processInitialPacket(buf[0..pkt_end], src),
+                .handshake => self.processHandshakePacket(buf[0..pkt_end], src),
+                .zero_rtt => self.process0RttPacket(buf[0..pkt_end], src),
                 .retry => {}, // server never receives Retry
+            }
+            if (pkt_end < buf.len) {
+                self.processPacket(buf[pkt_end..], src);
             }
         } else {
             // Short (1-RTT) header
@@ -2322,6 +2654,7 @@ pub const Server = struct {
                 const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
                 conn.max_udp_payload = pm.max_udp_payload;
                 conn.app_stream_chunk = pm.app_stream_chunk;
+                conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
                 if (self.config.cubic) {
                     conn.cc = congestion.CongestionController.init(.cubic);
                 }
@@ -2399,7 +2732,7 @@ pub const Server = struct {
         }
 
         // Anti-amplification (RFC 9000 §8.1): track received bytes.
-        conn.anti_amp_bytes_recv += buf.len;
+        conn.migration.anti_amp.onRecv(buf.len);
         // If Retry was accepted, the address is already validated.
         if (verified_odcid != null) conn.address_validated = true;
         self.tryFlushDeferredServerSend(conn, src);
@@ -2425,6 +2758,7 @@ pub const Server = struct {
             return;
         };
         const pt_len = dec.pt_len;
+        conn.init_ecn_ect0_recv += 1;
 
         // Compatible version negotiation (RFC 9368): if the server is configured
         // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
@@ -2511,7 +2845,7 @@ pub const Server = struct {
             payload_end,
             &conn.early_km,
             conn.zerortt_recv_pn,
-            conn.packet_cipher,
+            conn.early_packet_cipher,
         ) catch |err| {
             dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
@@ -2544,13 +2878,18 @@ pub const Server = struct {
                 // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 if (sid_type == 0 or sid_type == 2) {
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
-                    if (sid_type == 0 and stream_count > conn.max_streams_bidi_recv) {
-                        dbg("io: 0-RTT STREAM_LIMIT_ERROR bidi stream_id={}\n", .{sf_r.frame.stream_id});
-                        break; // drop packet (cannot send CONNECTION_CLOSE in 0-RTT context)
-                    }
-                    if (sid_type == 2 and stream_count > conn.max_streams_uni_recv) {
-                        dbg("io: 0-RTT STREAM_LIMIT_ERROR uni stream_id={}\n", .{sf_r.frame.stream_id});
-                        break;
+                    if (sid_type == 0) {
+                        self.ensurePeerStreamBudget(conn, true, stream_count, src);
+                        if (stream_count > conn.max_streams_bidi_recv) {
+                            dbg("io: 0-RTT STREAM_LIMIT_ERROR bidi stream_id={}\n", .{sf_r.frame.stream_id});
+                            break;
+                        }
+                    } else {
+                        self.ensurePeerStreamBudget(conn, false, stream_count, src);
+                        if (stream_count > conn.max_streams_uni_recv) {
+                            dbg("io: 0-RTT STREAM_LIMIT_ERROR uni stream_id={}\n", .{sf_r.frame.stream_id});
+                            break;
+                        }
                     }
                 }
                 self.handleStreamData(conn, &sf_r.frame, src);
@@ -2758,16 +3097,9 @@ pub const Server = struct {
                 var psk: [32]u8 = .{0} ** 32;
                 @memcpy(&psk, conn.tls.ch.psk_identity[0..32]);
                 const cets = session_mod.deriveEarlyTrafficSecret(psk, conn.tls.ch_hash);
-                const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                conn.early_km = KeyMaterial{
-                    .secret = cets,
-                    .key = early_keys.key,
-                    .key32 = .{0} ** 32,
-                    .iv = early_keys.iv,
-                    .hp = early_keys.hp,
-                    .hp32 = .{0} ** 32,
-                };
-                conn.early_km.initCachedContexts();
+                const early_keys = session_mod.deriveEarlyKeysFromSecret(cets, conn.tls.ch.cipher_suite);
+                conn.early_km = keyMaterialFromEarlyKeys(cets, early_keys);
+                conn.early_packet_cipher = packetCipherFromTls(conn.tls.ch.cipher_suite);
                 conn.has_early_keys = true;
                 dbg("io: server derived 0-RTT early keys\n", .{});
             }
@@ -2856,6 +3188,7 @@ pub const Server = struct {
             // server doesn't actively migrate, the param is omitted (we
             // still accept incoming migration if the peer initiates).
             .max_udp_payload_size = conn.max_udp_payload,
+            .preferred_address = self.config.preferred_address,
         }) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
@@ -2878,6 +3211,10 @@ pub const Server = struct {
 
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
+        // Quinn multiplexing may send hundreds of 1-RTT STREAM frames before
+        // client Finished; raise the local limit now so early frames are not
+        // rejected while we still wait for the Finished handshake message.
+        _ = bumpMaxStreamsLimit(conn, true, 2000);
 
         if (self.config.keylog_path) |kpath| {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
@@ -2931,7 +3268,7 @@ pub const Server = struct {
             }
             const init_pn_sent = conn.init_pn;
             conn.init_pn += 1;
-            conn.anti_amp_bytes_sent += pkt_len;
+            conn.migration.anti_amp.onSent(pkt_len);
             coalesced_len = pkt_len;
             conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
         }
@@ -2972,7 +3309,7 @@ pub const Server = struct {
                 }
                 conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
                 conn.hs_pn += 1;
-                conn.anti_amp_bytes_sent += pkt_len;
+                conn.migration.anti_amp.onSent(pkt_len);
                 coalesced_len += pkt_len;
                 offset += chunk_len;
             }
@@ -3058,7 +3395,7 @@ pub const Server = struct {
 
         const init_pn_sent = conn.init_pn;
         conn.init_pn += 1;
-        conn.anti_amp_bytes_sent += pkt_len;
+        conn.migration.anti_amp.onSent(pkt_len);
         conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
         conn.init_resend.store(send_buf[0..pkt_len]);
@@ -3116,7 +3453,7 @@ pub const Server = struct {
             }
 
             conn.hs_pn += 1;
-            conn.anti_amp_bytes_sent += pkt_len;
+            conn.migration.anti_amp.onSent(pkt_len);
             conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
@@ -3150,7 +3487,7 @@ pub const Server = struct {
         if (!conn.has_hs_keys) return;
 
         // Anti-amplification: track Handshake bytes received (RFC 9000 §8.1).
-        conn.anti_amp_bytes_recv += buf.len;
+        conn.migration.anti_amp.onRecv(buf.len);
         self.tryFlushDeferredServerSend(conn, src);
 
         // If already connected, the client may be retransmitting its Finished because
@@ -3185,6 +3522,7 @@ pub const Server = struct {
             conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
+        conn.hs_ecn_ect0_recv += 1;
         if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
             conn.hs_recv_pn = dec.pn;
 
@@ -3244,6 +3582,7 @@ pub const Server = struct {
         conn.phase = .connected;
         // Handshake complete → peer address is validated (RFC 9000 §8.1).
         conn.address_validated = true;
+        conn.migration.trustActivePath();
 
         const pending_n = conn.pending_1rtt_n;
         conn.pending_1rtt_n = 0;
@@ -3256,9 +3595,11 @@ pub const Server = struct {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
         }
 
-        // Send Handshake ACK + 1-RTT HANDSHAKE_DONE
+        // Send Handshake ACK, then a single 1-RTT packet with MAX_STREAMS before
+        // HANDSHAKE_DONE so quinn sees stream credit before opening ~2000 streams.
         self.sendHandshakeAck(conn, src);
         self.sendHandshakeDone(conn, src);
+        self.send_batch.flush(self.sock);
 
         // Initiate a key update immediately after the handshake if enabled.
         // This satisfies the quic-interop-runner "keyupdate" test case.
@@ -3273,7 +3614,10 @@ pub const Server = struct {
 
         var send_buf: [256]u8 = undefined;
         var frames_buf: [64]u8 = undefined;
-        const ack_len = buildAckFrame(&frames_buf, pn, 0) catch return;
+        const ack_len = if (conn.hs_ecn_ect0_recv > 0)
+            buildAckEcnFrame(&frames_buf, pn, 0, conn.hs_ecn_ect0_recv, 0, 0) catch return
+        else
+            buildAckFrame(&frames_buf, pn, 0) catch return;
 
         const hs_pn_sent = conn.hs_pn;
         const pkt_len = buildHandshakePacket(
@@ -3297,6 +3641,15 @@ pub const Server = struct {
 
         var frames_buf: [2048]u8 = undefined;
         var fp: usize = 0;
+
+        // Quinn multiplexing interop: embed MAX_STREAMS(2000) before HANDSHAKE_DONE
+        // in the same 1-RTT payload so credit is applied before the client acts on HD.
+        if (computeMaxStreamsLimit(conn.max_streams_bidi_recv, 2000)) |limit| {
+            if (writeMaxStreamsFrame(frames_buf[fp..], true, limit)) |n| {
+                fp += n;
+                conn.max_streams_bidi_recv = limit;
+            }
+        }
 
         // HANDSHAKE_DONE frame
         fp += buildHandshakeDoneFrame(frames_buf[fp..]);
@@ -3390,7 +3743,24 @@ pub const Server = struct {
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         dbg("io: process1RttPacket buf_len={}\n", .{buf.len});
-        // Find connection by scanning CID prefix
+        var pos: usize = 0;
+        while (pos < buf.len) {
+            const step = self.processOneServer1RttPacket(buf[pos..], src) orelse {
+                // Coalesced datagram resync (RFC 9000 §12.2): if this offset
+                // is not a decryptable packet, advance one byte and retry.
+                pos += 1;
+                continue;
+            };
+            if (step == 0) {
+                pos += 1;
+                continue;
+            }
+            pos += step;
+        }
+    }
+
+    /// Decrypt and handle one 1-RTT packet (RFC 9000 §12.2 coalescing).
+    fn processOneServer1RttPacket(self: *Server, buf: []const u8, src: compat.Address) ?usize {
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
                 if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
@@ -3402,80 +3772,81 @@ pub const Server = struct {
                     conn.cidPoolFind(candidate) != null;
                 if (!cid_match) continue;
 
-                // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
                 const pn_start = 1 + cid_len;
 
-                // Detect peer-initiated key update via the UNPROTECTED key phase bit.
-                // Must remove HP first before reading bit 2 (RFC 9001 §5.4.1).
                 const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.packet_cipher) orelse continue;
                 const incoming_phase = (unprotected_first & 0x04) != 0;
 
-                // Try current recv keys first. Only use next key generation when the
-                // current keys fail and the Key Phase bit indicates an update — avoids
-                // mis-sampled HP flipping keys before the first post-handshake packet.
-                // Use PN-tracking decryption so packet number decompression is correct
-                // even when the client's PN space grows beyond 1-byte truncation range.
-                var srv_decrypted_pn: u64 = 0;
-                const pt_len: usize = decrypt: {
-                    const r = decrypt1RttWithKeyUpdate(
-                        conn,
-                        &plaintext,
-                        buf,
-                        pn_start,
-                        incoming_phase,
-                        &conn.app_client_km,
-                        &conn.app_client_km_prev,
-                        &conn.app_server_km,
-                    ) catch {
-                        // RFC 9000 §10.3: Stateless Reset detection.
-                        if (buf.len >= 21 and conn.stateless_reset_token_set) {
-                            const tail = buf[buf.len - 16 ..];
-                            var tail_arr: [16]u8 = undefined;
-                            @memcpy(&tail_arr, tail);
-                            if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
-                                dbg("io: Stateless Reset detected — entering draining\n", .{});
-                                conn.draining = true;
-                                return;
-                            }
+                const min_end = pn_start + 1 + 16;
+                if (buf.len < min_end) continue;
+
+                var decrypted_opt: ?Decrypt1RttResult = decrypt1RttWithKeyUpdate(
+                    conn,
+                    &plaintext,
+                    buf,
+                    pn_start,
+                    buf.len,
+                    incoming_phase,
+                    &conn.app_client_km,
+                    &conn.app_client_km_prev,
+                    &conn.app_server_km,
+                ) catch null;
+
+                if (decrypted_opt == null and buf.len > min_end) {
+                    var end = min_end;
+                    while (end < buf.len) : (end += 1) {
+                        decrypted_opt = decrypt1RttWithKeyUpdate(
+                            conn,
+                            &plaintext,
+                            buf,
+                            pn_start,
+                            end,
+                            incoming_phase,
+                            &conn.app_client_km,
+                            &conn.app_client_km_prev,
+                            &conn.app_server_km,
+                        ) catch null;
+                        if (decrypted_opt != null) break;
+                    }
+                }
+
+                const decrypted = decrypted_opt orelse {
+                    if (buf.len >= 21 and conn.stateless_reset_token_set) {
+                        const tail = buf[buf.len - 16 ..];
+                        var tail_arr: [16]u8 = undefined;
+                        @memcpy(&tail_arr, tail);
+                        if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
+                            dbg("io: Stateless Reset detected — entering draining\n", .{});
+                            conn.draining = true;
+                            return buf.len;
                         }
-                        dbg(
-                            "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
-                            .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
-                        );
-                        continue;
-                    };
-                    srv_decrypted_pn = r.pn;
-                    break :decrypt r.pt_len;
+                    }
+                    dbg(
+                        "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
+                        .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
+                    );
+                    continue;
                 };
-                // Update server's received PN so future decompression stays accurate.
+
+                const srv_decrypted_pn = decrypted.pn;
+                const pt_len = decrypted.pt_len;
                 if (srv_decrypted_pn > (conn.app_recv_pn orelse 0)) {
                     conn.app_recv_pn = srv_decrypted_pn;
                 }
 
-                // ECN: count this 1-RTT packet as ECT(0) — we mark all outgoing
-                // packets ECT(0) via IP_TOS, so the peer does the same.
                 conn.ecn_ect0_recv += 1;
-
                 conn.peer_key_phase = incoming_phase;
 
-                if (conn.phase == .waiting_finished) {
-                    // Client Finished may still be in flight; 1-RTT can arrive first.
-                    if (conn.pending_1rtt_n < pending_1rtt_cap) {
-                        const slotp = &conn.pending_1rtt[conn.pending_1rtt_n];
-                        slotp.len = pt_len;
-                        @memcpy(slotp.data[0..pt_len], plaintext[0..pt_len]);
-                        conn.pending_1rtt_n += 1;
-                    }
-                    return;
-                }
-
-                // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
-                return;
+                if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
+                    self.flushConnAppAck(conn, src);
+                    _ = conn.app_recv_ack.observe(srv_decrypted_pn);
+                }
+                return decrypted.wire_len;
             }
         }
-        dbg("io: process1RttPacket: no matching connection found\n", .{});
+        return null;
     }
 
     /// Trigger a local key update: rotate send keys and emit a packet with
@@ -3509,17 +3880,16 @@ pub const Server = struct {
         //   1. Eagerly update conn.peer so HTTP responses go to the new path immediately.
         //   2. Send PATH_CHALLENGE so the interop runner can verify we validated the path.
         //
-        // We intentionally do NOT guard on path_challenge_data == null.  If a previous
+        // We intentionally do NOT guard on pending_challenge == null.  If a previous
         // challenge is still in flight (PATH_RESPONSE not yet received) when the next
         // rebind fires, we overwrite it with a fresh challenge for the new address.
-        // This keeps data flowing: guarding on path_challenge_data == null would leave
+        // This keeps data flowing: guarding on pending_challenge == null would leave
         // conn.peer pointing at the OLD (now-dead) port for the duration of the second
         // rebind, causing a download stall and eventual 60 s timeout.
         if (!addressEqual(conn.peer, src)) {
             var challenge: [8]u8 = undefined;
             compat.random.bytes(&challenge);
-            // Overwrite any pending challenge — a fresh one is needed for the new path.
-            conn.path_challenge_data = challenge;
+            conn.migration.notePathChallenge(challenge);
             // Eagerly update peer so all subsequent sends reach the new address.
             conn.peer = src;
             self.sendPathChallenge(conn, challenge, src);
@@ -3564,6 +3934,7 @@ pub const Server = struct {
                         slot.active = true;
                         slot.awaiting_fin_ack = false;
                         conn.http09_active_count += 1;
+                        http09TrackActiveSlot(conn, http09SlotIndex(conn, slot));
                         dbg("io: path change: reopened FIN slot stream_id={} rewind to {}\n", .{ slot.stream_id, rewind_to });
                     } else |_| {}
                 }
@@ -3584,7 +3955,7 @@ pub const Server = struct {
         while (pos < frames.len) {
             const ft_r = varint.decode(frames[pos..]) catch {
                 dbg("io: frame type decode error at pos={}\n", .{pos});
-                return;
+                break;
             };
             const ft = ft_r.value;
             pos += ft_r.len;
@@ -3629,6 +4000,7 @@ pub const Server = struct {
                         slot.awaiting_fin_ack = false;
                     }
                 }
+                self.drainHttp09Pending(conn);
                 // Loss detection + RTT estimation (RFC 9002).
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
@@ -3653,6 +4025,12 @@ pub const Server = struct {
                 // detector, keeping bytes_in_flight accurate.
                 if (ld_result.bytes_acked > 0) {
                     conn.cc.onAck(ld_result.bytes_acked);
+                }
+                if (conn.plpmtu.probe_pn) |probe_pn| {
+                    if (largest_ack >= probe_pn) {
+                        conn.plpmtu.onProbeAcked(probe_pn);
+                        conn.syncPathMtuFields();
+                    }
                 }
                 // Remove lost-packet bytes from bytes_in_flight (RFC 9002 §7.5:
                 // lost packets are no longer "in flight").
@@ -3686,6 +4064,12 @@ pub const Server = struct {
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
                     const lp = lost_buf[li];
+                    if (conn.plpmtu.probing) {
+                        if (conn.plpmtu.probe_pn == lp.pn) {
+                            conn.plpmtu.onProbeLost();
+                            conn.syncPathMtuFields();
+                        }
+                    }
                     conn.cc.onLoss(lp.pn);
                     // Retransmit: if the lost packet carried stream data, rewind
                     // the corresponding slot so the data is re-sent.
@@ -3719,6 +4103,7 @@ pub const Server = struct {
                                     slot.active = true;
                                     slot.awaiting_fin_ack = false;
                                     conn.http09_active_count += 1;
+                                    http09TrackActiveSlot(conn, http09SlotIndex(conn, slot));
                                     dbg("io: retransmit h09 stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
                                 } else |_| {}
                             }
@@ -3770,10 +4155,22 @@ pub const Server = struct {
                         // it via `sendRawStreamDataInner` so the bytes get a
                         // fresh PN and the new SentPacket adopts the buffer.
                         if (lp.stream_data) |buf| {
-                            self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
-                            // ownership of `buf` is transferred into the new
-                            // SentPacket (or freed inside *Inner on draining /
-                            // serialize failure); we must NOT touch it again.
+                            // Retransmissions are subject to the congestion
+                            // window (RFC 9002 §6.2.4 / §7).  When cwnd has room
+                            // resend immediately; otherwise queue the frame so
+                            // flushPendingHttp09Responses replays it as ACKs open
+                            // the window.  This paces recovery and prevents the
+                            // unbounded retransmit storm that overflowed the NS3
+                            // queue and the loss-detector ring.
+                            if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
+                                self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
+                                conn.pacerConsume();
+                                // ownership of `buf` is transferred into the new
+                                // SentPacket (or freed inside *Inner on draining /
+                                // serialize failure); we must NOT touch it again.
+                            } else if (!http09QueueRtx(conn, lp.stream_id, lp.stream_offset, lp.stream_fin, buf)) {
+                                self.allocator.free(buf);
+                            }
                         }
                     }
                 }
@@ -3853,7 +4250,7 @@ pub const Server = struct {
                     self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
                     return;
                 }
-                recordFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size);
+                recordFinalSize(&conn.fin_tracker, &conn.fin_tracker_ring, r.frame.stream_id, r.frame.final_size);
                 // Cancel any pending response for this stream.
                 for (&conn.http09_slots) |*slot| {
                     if (slot.active and slot.stream_id == r.frame.stream_id) {
@@ -3915,13 +4312,9 @@ pub const Server = struct {
                 // PATH_RESPONSE — validate against pending challenge.
                 const pr = transport_frames.PathResponse.parse(frames[pos..]) catch return;
                 pos += pr.consumed;
-                if (conn.path_challenge_data) |expected| {
-                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
-                        // Path validated — migrate to the new address.
-                        conn.peer = src;
-                        conn.path_challenge_data = null;
-                        dbg("io: connection migrated to new address\n", .{});
-                    }
+                if (conn.migration.handlePathResponse(pr.frame.data)) {
+                    conn.peer = src;
+                    dbg("io: connection migrated to new address\n", .{});
                 }
                 continue;
             }
@@ -3982,7 +4375,7 @@ pub const Server = struct {
                 // STREAM frame
                 const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch |err| {
                     dbg("io: STREAM frame parse error ft=0x{x:0>2}: {}\n", .{ ft, err });
-                    return;
+                    break;
                 };
                 pos += sf_r.consumed;
                 dbg("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
@@ -4004,7 +4397,8 @@ pub const Server = struct {
                 if (sid_type == 0 or sid_type == 2) { // client-initiated
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0) {
-                        // Bidirectional: enforce hard limit (RFC 9000 §4.6).
+                        // Bidirectional: grant more credit before closing (quinn multiplexing).
+                        self.ensurePeerStreamBudget(conn, true, stream_count, src);
                         if (stream_count > conn.max_streams_bidi_recv) {
                             dbg("io: STREAM_LIMIT_ERROR bidi stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_bidi_recv });
                             self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
@@ -4019,7 +4413,8 @@ pub const Server = struct {
                         if (conn.peer_bidi_stream_count * 2 >= conn.max_streams_bidi_recv)
                             self.sendMaxStreams(conn, true, src);
                     } else {
-                        // Unidirectional: enforce hard limit.
+                        // Unidirectional: grant more credit before closing.
+                        self.ensurePeerStreamBudget(conn, false, stream_count, src);
                         if (stream_count > conn.max_streams_uni_recv) {
                             dbg("io: STREAM_LIMIT_ERROR uni stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_uni_recv });
                             self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
@@ -4032,7 +4427,7 @@ pub const Server = struct {
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
-                // Flow control (RFC 9000 §4.1): track cumulative bytes received.
+                // Flow control (RFC 9000 §4.1): track highest end offset seen.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
                 if (conn.fc_bytes_recv > conn.fc_recv_max) {
@@ -4045,9 +4440,19 @@ pub const Server = struct {
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
+            if (ft == 0x07) {
+                // NEW_TOKEN (RFC 9000 §19.7) — ignore on server.
+                const len_r = varint.decode(frames[pos..]) catch break;
+                pos += len_r.len;
+                const tlen = varint.lenToUsize(len_r.value) catch break;
+                if (pos + tlen > frames.len) break;
+                pos += tlen;
+                continue;
+            }
             // Unknown frame type — cannot safely skip without knowing the length.
-            return;
+            break;
         }
+        if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
     }
 
     /// Send a RESET_STREAM frame to cancel a stream (RFC 9000 §19.4).
@@ -4094,6 +4499,7 @@ pub const Server = struct {
             return;
         };
         conn.app_pn += 1;
+        conn.note1RttSent();
         conn.qlog.packetSent(.one_rtt, conn.app_pn - 1, pkt_len);
         if (has_fin) {
             dbg("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
@@ -4105,23 +4511,57 @@ pub const Server = struct {
             // Batch full — flush immediately before enqueuing more.
             self.send_batch.flush(self.sock);
         }
-        // Congestion control: update bytes in flight.
-        conn.cc.onPacketSent(@intCast(pkt_len));
-        // Loss detection: record this packet.  Discard return value — this
-        // tracker can fill (max_tracked) under sustained loss; in that case
-        // the packet is dropped from the LD.  The raw-app retransmit path
-        // (`Server.sendRawStreamData` etc.) is responsible for freeing
-        // `stream_data` if it ever attaches a buffer to a SentPacket that
-        // does not get recorded.
-        _ = conn.ld.onPacketSent(.{
+        // Loss detection: record this packet.  The tracker can fill
+        // (max_tracked) under a large burst; if it does the packet is *not*
+        // recorded.  The raw-app retransmit path (`Server.sendRawStreamData`
+        // etc.) is responsible for freeing `stream_data` if it ever attaches a
+        // buffer to a SentPacket that does not get recorded.
+        const tracked = conn.ld.onPacketSent(.{
             .pn = conn.app_pn - 1,
             .send_time_ms = @intCast(compat.milliTimestamp()),
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
         });
+        // Congestion control: only count the packet toward bytes_in_flight when
+        // the loss detector is tracking it.  An untracked packet can never be
+        // removed on ACK or loss, so counting it would leak in-flight bytes
+        // permanently and pin canSend() to false — the connection would make no
+        // further data progress and degrade into a PTO-only PING loop.
+        if (tracked) conn.cc.onPacketSent(@intCast(pkt_len));
         if (has_fin) {
             dbg("io: server FIN PACKET enqueued {} bytes\n", .{pkt_len});
+        }
+    }
+
+    /// Send a cumulative ACK for PNs accumulated on `conn`.
+    fn flushConnAppAck(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        if (conn.app_recv_ack.range_count == 0) return;
+        const ecn: ?ack_frame_mod.EcnCounts = if (conn.ecn_ect0_recv > 0 or
+            conn.ecn_ect1_recv > 0 or
+            conn.ecn_ce_recv > 0)
+            .{
+                .ect0 = conn.ecn_ect0_recv,
+                .ect1 = conn.ecn_ect1_recv,
+                .ecn_ce = conn.ecn_ce_recv,
+            }
+        else
+            null;
+        var ack_buf: [256]u8 = undefined;
+        const ack_len = conn.app_recv_ack.buildWireFrame(&ack_buf, ecn) catch return;
+        if (ack_len == 0) return;
+        self.send1Rtt(conn, ack_buf[0..ack_len], dst);
+        conn.app_recv_ack.reset();
+    }
+
+    /// Flush deferred 1-RTT ACKs for all connections (after a recv batch).
+    fn flushAllConnAppAcks(self: *Server) void {
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (!conn.has_app_keys) continue;
+            if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
+            if (conn.app_recv_ack.range_count == 0) continue;
+            self.flushConnAppAck(conn, conn.peer);
         }
     }
 
@@ -4134,17 +4574,20 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
+        const slot_idx = http09SlotIndex(conn, slot);
         var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
         const to_read = @min(conn.app_stream_chunk, file_buf.len);
         const n = slot.file.read(file_buf[0..to_read]) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         };
         if (n == 0) {
             dbg("io: http09 stream_id={} EOF (offset={}, file_end={})\n", .{ slot.stream_id, slot.stream_offset, slot.file_end });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         }
@@ -4168,54 +4611,47 @@ pub const Server = struct {
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
             dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            http09UntrackActiveSlot(conn, slot_idx);
             slot.close();
             return;
         };
         dbg("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
-        // Congestion control: only send if cwnd allows.
-        if (!conn.cc.canSend(congestion.mss)) {
-            // Rewind offset — we didn't actually send this chunk.
+        const fc_before = conn.fc_bytes_sent;
+        self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null);
+        if (conn.fc_bytes_sent <= fc_before) {
+            // FC blocked (DATA_BLOCKED) or send failed — rewind and retry later.
             slot.stream_offset -= @intCast(n);
             slot.file.seekTo(slot.stream_offset) catch |err| {
                 dbg("io: http09 seekTo rewind failed stream_id={}: {}\n", .{ slot.stream_id, err });
             };
             return;
         }
-        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
-        // Patch stream metadata into the last recorded SentPacket so that the
-        // loss detector can surface it for retransmission if this packet is lost.
-        if (conn.ld.sent_count > 0) {
-            const last = &conn.ld.sent[conn.ld.sent_count - 1];
-            last.has_stream_data = true;
-            last.stream_id = slot.stream_id;
-            last.stream_offset = old_offset;
-        }
         if (fin) {
-            // Save FIN frame for retransmission in case the packet is dropped
-            // by the NS3 network simulator.  We keep the slot alive in the
-            // "awaiting_fin_ack" state; the frame will be re-sent every 200 ms
-            // until the client's ACK covers fin_pkt_pn.
-            const fin_pn = conn.app_pn - 1; // send1Rtt already incremented app_pn
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+            slot.file.close();
+            // Single-chunk HTTP/0.9 (quinn multiplexing uses 32-byte files):
+            // release the slot immediately so ~2000 streams are not serialized
+            // through awaiting_fin_ack slots waiting for client ACKs.
+            if (old_offset == 0 and slot.file_end <= @as(u64, @intCast(n))) {
+                dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
+                http09UntrackActiveSlot(conn, slot_idx);
+                slot.* = .{};
+                // NB: no drainHttp09Pending here — this runs inside the drain
+                // loop and re-entering would corrupt its swap-remove iteration.
+                return;
+            }
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
             slot.fin_frame_len = frame_len;
-            slot.fin_pkt_pn = fin_pn;
+            slot.fin_pkt_pn = conn.app_pn - 1;
             slot.fin_last_sent_ms = compat.milliTimestamp();
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
-            // Close the file — we no longer need to read from it.
-            // slot.active is set to false so flushPendingHttp09Responses
-            // stops calling us for new chunks.
-            slot.file.close();
-            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.active = false;
-            dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
+            http09UntrackActiveSlot(conn, slot_idx);
+            dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, slot.fin_pkt_pn });
         }
     }
 
-    /// Drain queued HTTP/0.9 bodies bounded by congestion control.
-    ///
-    /// The congestion controller (NewReno) is the sole rate limiter: each call to
-    /// http09SendNextChunk checks cc.canSend() and returns early if the cwnd is
     /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
     /// The congestion controller is the primary rate limiter.  The per-flush
@@ -4223,29 +4659,94 @@ pub const Server = struct {
     /// NS3 simulator's 25-packet DropTail queue.  On real networks and
     /// loopback the CC window is the effective bottleneck, not this budget.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 20;
+        // Quinn multiplexing opens ~2000 streams; keep the per-tick flush high
+        // enough to drain responses before the client idle timeout.
+        var budget: usize = 2048;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
-                    // Only send 1-RTT data once app keys are available.
-                    // 0-RTT requests can be buffered in http09_slots before the
-                    // handshake completes; wait for has_app_keys before flushing.
                     if (!conn.has_app_keys) continue;
-                    for (&conn.http09_slots) |*slot| {
-                        if (!slot.active) continue;
-                        if (budget == 0) return;
-                        // Pre-check CC: if the window is exhausted, skip all
-                        // remaining slots for this connection — there is nothing
-                        // to send and we must not burn the budget on null sends.
-                        if (!conn.cc.canSend(congestion.mss)) break;
-                        self.http09SendNextChunk(conn, slot);
+                    // Drain congestion-deferred retransmissions first so lost
+                    // data takes priority over fresh responses (RFC 9002 §7).
+                    while (conn.http09_rtx_count > 0 and budget > 0 and
+                        conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp()))
+                    {
+                        conn.http09_rtx_count -= 1;
+                        const e = conn.http09_rtx[conn.http09_rtx_count];
+                        conn.http09_rtx[conn.http09_rtx_count] = .{};
+                        self.sendRawStreamDataInner(conn, e.stream_id, e.offset, e.data, e.fin, e.data);
+                        conn.pacerConsume();
                         progressed = true;
                         budget -= 1;
                     }
+                    if (conn.http09_active_list_n > 0) {
+                        var i: u16 = 0;
+                        while (i < conn.http09_active_list_n and budget > 0) {
+                            if (!conn.cc.canSend(congestion.mss)) break;
+                            if (!conn.pacerAllow(compat.milliTimestamp())) break;
+                            const slot_idx = conn.http09_active_indices[i];
+                            const slot = &conn.http09_slots[slot_idx];
+                            if (!slot.active) {
+                                http09UntrackActiveSlot(conn, slot_idx);
+                                continue;
+                            }
+                            self.http09SendNextChunk(conn, slot);
+                            conn.pacerConsume();
+                            progressed = true;
+                            budget -= 1;
+                            if (!slot.active) continue;
+                            i += 1;
+                        }
+                    } else {
+                        for (&conn.http09_slots) |*slot| {
+                            if (!slot.active) continue;
+                            if (budget == 0) return;
+                            if (!conn.cc.canSend(congestion.mss)) break;
+                            if (!conn.pacerAllow(compat.milliTimestamp())) break;
+                            self.http09SendNextChunk(conn, slot);
+                            conn.pacerConsume();
+                            progressed = true;
+                            budget -= 1;
+                        }
+                    }
+                    if (conn.http09_pending_count > 0) self.drainHttp09Pending(conn);
                 }
             }
             if (!progressed) break;
+        }
+    }
+
+    /// RFC 8899: probe a larger UDP payload when PLPMTUD state allows it.
+    fn maybeSendPlpmtuProbes(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
+        var probe_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const overhead: usize = 48;
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (conn.phase != .connected or conn.draining) continue;
+            const probe_size = conn.plpmtu.maybeProbeSize(now_ms) orelse continue;
+            if (probe_size <= overhead) continue;
+            const target_payload = @as(usize, probe_size) - overhead;
+            if (target_payload > probe_buf.len) continue;
+            probe_buf[0] = 0x01;
+            if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
+            const pn = conn.app_pn;
+            conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+            self.send1Rtt(conn, probe_buf[0..target_payload], conn.peer);
+        }
+    }
+
+    /// Initiate a key update when the packet threshold is reached (RFC 9001 §6).
+    fn maybeAutoKeyUpdates(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (conn.phase != .connected or conn.draining) continue;
+            if (conn.packets_since_key_update < auto_key_update_packet_threshold) continue;
+            if (!conn.canInitiateKeyUpdate(now_ms)) continue;
+            self.initiateServerKeyUpdate(conn, conn.peer);
+            conn.packets_since_key_update = 0;
         }
     }
 
@@ -4314,6 +4815,12 @@ pub const Server = struct {
                     if (budget == 0) return;
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
+                    // Respect the congestion window and pacer: FIN retransmits
+                    // are data and must not bypass cwnd, otherwise thousands of
+                    // awaiting mux slots produce a ~160 pkt/s storm that
+                    // overflows the NS3 queue (RFC 9002 §7/§7.7).
+                    if (!conn.cc.canSend(congestion.mss)) break;
+                    if (!conn.pacerAllow(now)) break;
 
                     if (slot.fin_retransmit_count >= MAX_FIN_RETRANSMITS) {
                         dbg("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
@@ -4326,6 +4833,7 @@ pub const Server = struct {
                     budget -= 1;
                     dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
+                    conn.pacerConsume();
                 }
             }
         }
@@ -4427,26 +4935,69 @@ pub const Server = struct {
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
     fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
-        // Grow by 1000 streams per MAX_STREAMS — large enough that bursts of
-        // gossipsub publishes or req/resps on a fan-out mesh don't repeatedly
-        // race with the next credit grant, and matches the initial value to
-        // keep behaviour predictable.
-        const new_limit: u64 = if (bidi)
-            conn.max_streams_bidi_recv + 1000
-        else
-            conn.max_streams_uni_recv + 1000;
+        const current: u64 = if (bidi) conn.max_streams_bidi_recv else conn.max_streams_uni_recv;
+        self.sendMaxStreamsToAtLeast(conn, bidi, current + 1000, dst);
+    }
 
+    /// Compute raised stream limit without mutating `conn`.
+    fn computeMaxStreamsLimit(current: u64, minimum: u64) ?u64 {
+        if (minimum <= current) return null;
+        return ((minimum + 999) / 1000) * 1000;
+    }
+
+    /// Raise the peer's stream limit to at least `minimum` (RFC 9000 §19.11).
+    /// Returns the new limit when raised, null if already sufficient.
+    fn bumpMaxStreamsLimit(conn: *ConnState, bidi: bool, minimum: u64) ?u64 {
+        const current: u64 = if (bidi) conn.max_streams_bidi_recv else conn.max_streams_uni_recv;
+        const new_limit = computeMaxStreamsLimit(current, minimum) orelse return null;
         if (bidi) {
             conn.max_streams_bidi_recv = new_limit;
         } else {
             conn.max_streams_uni_recv = new_limit;
         }
+        return new_limit;
+    }
 
+    /// Send MAX_STREAMS in a standalone 1-RTT datagram via the send batch.
+    fn sendMaxStreams1RttDirect(self: *Server, conn: *ConnState, src: compat.Address, minimum: u64) void {
+        const new_limit = computeMaxStreamsLimit(conn.max_streams_bidi_recv, minimum) orelse return;
         var buf: [16]u8 = undefined;
-        buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13); // MAX_STREAMS bidi/uni
-        const enc = varint.encode(buf[1..], new_limit) catch return;
-        self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
-        dbg("io: sent MAX_STREAMS bidi={} limit={}\n", .{ bidi, new_limit });
+        const flen = writeMaxStreamsFrame(&buf, true, new_limit) orelse return;
+        self.send1Rtt(conn, buf[0..flen], src);
+        self.send_batch.flush(self.sock);
+        conn.max_streams_bidi_recv = new_limit;
+        dbg("io: sent MAX_STREAMS bidi limit={}\n", .{new_limit});
+    }
+
+    /// Serialize a MAX_STREAMS frame (RFC 9000 §19.11) into `out`.
+    fn writeMaxStreamsFrame(out: []u8, bidi: bool, limit: u64) ?usize {
+        if (out.len == 0) return null;
+        out[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13);
+        const enc = varint.encode(out[1..], limit) catch return null;
+        return 1 + enc.len;
+    }
+
+    /// Raise the peer's stream limit to at least `minimum` (RFC 9000 §19.11).
+    /// Quinn's multiplexing interop test opens ~2000 streams in one burst; the
+    /// runner expects MAX_STREAMS credit grants, not CONNECTION_CLOSE(0x4).
+    fn sendMaxStreamsToAtLeast(self: *Server, conn: *ConnState, bidi: bool, minimum: u64, dst: compat.Address) void {
+        if (bidi) {
+            self.sendMaxStreams1RttDirect(conn, dst, minimum);
+            return;
+        }
+        const new_limit = computeMaxStreamsLimit(conn.max_streams_uni_recv, minimum) orelse return;
+        var buf: [16]u8 = undefined;
+        const flen = writeMaxStreamsFrame(&buf, false, new_limit) orelse return;
+        self.send1Rtt(conn, buf[0..flen], dst);
+        conn.max_streams_uni_recv = new_limit;
+        dbg("io: sent MAX_STREAMS bidi=false limit={}\n", .{new_limit});
+    }
+
+    /// Extend peer stream budget when a burst opens beyond the current limit.
+    fn ensurePeerStreamBudget(self: *Server, conn: *ConnState, bidi: bool, stream_count: u64, dst: compat.Address) void {
+        const limit: u64 = if (bidi) conn.max_streams_bidi_recv else conn.max_streams_uni_recv;
+        if (stream_count <= limit) return;
+        self.sendMaxStreamsToAtLeast(conn, bidi, stream_count, dst);
     }
 
     /// Initiate a server-side key update (RFC 9001 §6).
@@ -4509,7 +5060,7 @@ pub const Server = struct {
                 self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
                 return;
             }
-            recordFinalSize(&conn.fin_tracker, sf.stream_id, final_size);
+            recordFinalSize(&conn.fin_tracker, &conn.fin_tracker_ring, sf.stream_id, final_size);
         }
         if (self.config.raw_application_streams) {
             self.handleRawApplicationStreamServer(conn, sf, src);
@@ -4565,6 +5116,201 @@ pub const Server = struct {
         if (sf.fin) slot.fin_received = true;
     }
 
+    fn openHttp09OutSlot(_: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) ?u16 {
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
+            dbg("io: file not found: {s}\n", .{fs_path});
+            return null;
+        };
+        const file_end = file.getEndPos() catch {
+            file.close();
+            return null;
+        };
+
+        var tries: u16 = 0;
+        while (tries < http09_slot_max) : (tries += 1) {
+            const idx = conn.http09_slot_cursor;
+            conn.http09_slot_cursor = (conn.http09_slot_cursor + 1) % http09_slot_max;
+            const slot = &conn.http09_slots[idx];
+            if (slot.active or slot.awaiting_fin_ack) continue;
+            slot.* = .{
+                .active = true,
+                .stream_id = stream_id,
+                .file = file,
+                .stream_offset = 0,
+                .file_end = file_end,
+            };
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
+            conn.http09_active_count += 1;
+            http09TrackActiveSlot(conn, idx);
+            dbg("io: http09 stream_id={} opened (size={})\n", .{ stream_id, file_end });
+            return idx;
+        }
+        file.close();
+        return null;
+    }
+
+    /// Quinn `serve_hq` model: read the whole response and send STREAM+FIN
+    /// immediately on the request stream — no outbound slot or flush queue.
+    /// Used for multiplexing (32-byte files) and any response ≤ one chunk.
+    fn http09SendFileImmediate(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        if (conn.phase != .connected or !conn.has_app_keys) return false;
+
+        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
+            dbg("io: http09 immediate file not found: {s}\n", .{fs_path});
+            return false;
+        };
+        defer file.close();
+
+        const file_end = file.getEndPos() catch return false;
+        const max_inline = conn.app_stream_chunk;
+        if (file_end > max_inline) return false;
+
+        // Congestion control + pacing (RFC 9002 §7 / §7.7): the immediate path
+        // must respect both the congestion window and the pacer like every other
+        // data send.  Returning false here lets the caller queue the response in
+        // http09_pending, which flushPendingHttp09Responses drains as ACKs open
+        // the window.  Without this gate quinn's ~1000-stream burst is answered
+        // in one unthrottled blast that overflows the NS3 25-packet queue (mass
+        // loss) *and* the 2048-entry loss-detector ring, permanently leaking
+        // bytes_in_flight and wedging the connection into a PING-only PTO loop.
+        if (!conn.cc.canSend(congestion.mss)) return false;
+        if (!conn.pacerAllow(compat.milliTimestamp())) return false;
+
+        var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
+        const to_read = @min(max_inline, file_buf.len);
+        const n = file.read(file_buf[0..to_read]) catch return false;
+        if (n == 0 or @as(u64, @intCast(n)) < file_end) return false;
+
+        const fc_before = conn.fc_bytes_sent;
+        self.sendRawStreamDataInner(conn, stream_id, 0, file_buf[0..n], true, null);
+        if (conn.fc_bytes_sent <= fc_before) return false;
+        conn.pacerConsume();
+
+        http09MarkResponded(conn, stream_id);
+        dbg("io: http09 stream_id={} immediate send n={} (quinn-style)\n", .{ stream_id, n });
+        // NB: do not call drainHttp09Pending here.  http09SendFileImmediate is
+        // itself invoked from inside drainHttp09Pending's loop; re-entering it
+        // would swap-remove entries out from under that loop and silently drop
+        // queued requests.  The paced flush drains the queue.
+        return true;
+    }
+
+    /// Queue a lost immediate-mux STREAM frame for congestion-controlled
+    /// retransmission.  Takes ownership of `data`; returns false (caller frees)
+    /// only if the queue is full.
+    fn http09QueueRtx(conn: *ConnState, stream_id: u64, offset: u64, fin: bool, data: []u8) bool {
+        if (conn.http09_rtx_count >= http09_pending_max) return false;
+        conn.http09_rtx[conn.http09_rtx_count] = .{
+            .stream_id = stream_id,
+            .offset = offset,
+            .fin = fin,
+            .data = data,
+        };
+        conn.http09_rtx_count += 1;
+        return true;
+    }
+
+    fn enqueueHttp09Pending(conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
+            if (entry.stream_id == stream_id) return true;
+        }
+        if (conn.http09_pending_count >= http09_pending_max) return false;
+        const entry = &conn.http09_pending[conn.http09_pending_count];
+        entry.stream_id = stream_id;
+        const path_len = @min(fs_path.len, entry.path.len);
+        @memcpy(entry.path[0..path_len], fs_path[0..path_len]);
+        entry.path_len = @intCast(path_len);
+        conn.http09_pending_count += 1;
+        dbg("io: http09 stream_id={} queued (pending={})\n", .{ stream_id, conn.http09_pending_count });
+        return true;
+    }
+
+    fn drainHttp09Pending(self: *Server, conn: *ConnState) void {
+        var i: u16 = 0;
+        while (i < conn.http09_pending_count) {
+            // Pace the drain: stop as soon as the congestion window or the
+            // pacer is exhausted so queued responses leave smoothly instead of
+            // as a burst that overruns the bottleneck queue (RFC 9002 §7/§7.7).
+            if (!conn.cc.canSend(congestion.mss)) break;
+            if (!conn.pacerAllow(compat.milliTimestamp())) break;
+            const entry = conn.http09_pending[i];
+            const path = entry.path[0..entry.path_len];
+            if (self.http09SendFileImmediate(conn, entry.stream_id, path)) {
+                conn.http09_pending_count -= 1;
+                if (i < conn.http09_pending_count) {
+                    conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
+                }
+                continue;
+            }
+            if (self.openHttp09OutSlot(conn, entry.stream_id, path)) |slot_idx| {
+                self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
+                conn.pacerConsume();
+                conn.http09_pending_count -= 1;
+                if (i < conn.http09_pending_count) {
+                    conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn peekHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
+        const slot = &conn.http09_req_asm[http09ReqAsmIndex(stream_id)];
+        if (slot.active and slot.stream_id == stream_id) return slot;
+        for (&conn.http09_req_asm) |*s| {
+            if (s.active and s.stream_id == stream_id) return s;
+        }
+        return null;
+    }
+
+    fn findHttp09ReqAssembly(conn: *ConnState, stream_id: u64) ?*Http09ReqAssembly {
+        const slot = &conn.http09_req_asm[http09ReqAsmIndex(stream_id)];
+        if (slot.active) {
+            if (slot.stream_id == stream_id) return slot;
+        } else {
+            slot.* = .{ .active = true, .stream_id = stream_id };
+            return slot;
+        }
+        for (&conn.http09_req_asm) |*s| {
+            if (!s.active) {
+                s.* = .{ .active = true, .stream_id = stream_id };
+                return s;
+            }
+        }
+        return null;
+    }
+
+    fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
+        // Quinn `serve_hq`: try a paced immediate send for the single-chunk fast
+        // path.  When the congestion window / pacer is closed (or the file spans
+        // multiple chunks), enqueue the response and let the *paced*
+        // flush/drain replay it — never send a slot chunk inline here, or
+        // quinn's ~1000-request batch turns into an unpaced burst that overruns
+        // the NS3 bottleneck queue.
+        if (self.http09SendFileImmediate(conn, stream_id, fs_path)) return true;
+        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return true;
+        }
+        // Pending is full (best effort): drain to free space, then retry.
+        self.drainHttp09Pending(conn);
+        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
+            self.drainHttp09Pending(conn);
+            return true;
+        }
+        // Last resort when the queue cannot absorb the open: open a slot so the
+        // request is not dropped (rare; the paced flush takes over from here).
+        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
+            self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
+            return true;
+        }
+        dbg("io: http/0.9 open queued failed (stream_id={} pending={})\n", .{ stream_id, conn.http09_pending_count });
+        return false;
+    }
+
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
         _ = src;
         dbg("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
@@ -4573,25 +5319,85 @@ pub const Server = struct {
             dbg("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
             return;
         }
+        // Quinn may send a zero-length STREAM+FIN after the request bytes.
         if (sf.data.len == 0) {
-            dbg("io: http09 stream_id={} empty data\n", .{sf.stream_id});
+            if (!sf.fin) return;
+            if (peekHttp09ReqAssembly(conn, sf.stream_id)) |req_asm| {
+                const req = http09_server.parseRequest(req_asm.buf[0..req_asm.len]) catch return;
+                var path_buf: [512]u8 = undefined;
+                const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch return;
+                if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
+                req_asm.reset();
+            }
             return;
         }
 
-        // Dedup: skip if a slot for this stream already exists (active or awaiting ACK).
-        // This prevents duplicate slots when both a 0-RTT request and a 1-RTT
-        // retransmit arrive for the same stream_id.
+        // Dedup: skip if this stream already has a response in flight or complete.
+        if (http09AlreadyResponded(conn, sf.stream_id)) return;
+        for (conn.http09_pending[0..conn.http09_pending_count]) |entry| {
+            if (entry.stream_id == sf.stream_id) {
+                self.drainHttp09Pending(conn);
+                if (http09AlreadyResponded(conn, sf.stream_id)) return;
+                break;
+            }
+        }
         for (&conn.http09_slots) |*slot| {
-            if ((slot.active or slot.awaiting_fin_ack) and slot.stream_id == sf.stream_id) return;
+            if (slot.active and slot.stream_id == sf.stream_id and slot.stream_offset == 0) {
+                // Only send inline when the window/pacer allow; otherwise the
+                // active slot is drained by the paced flush.
+                if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
+                    self.http09SendNextChunk(conn, slot);
+                    conn.pacerConsume();
+                }
+                return;
+            }
         }
 
-        var req_buf: [http09_server.max_request_len]u8 = undefined;
-        @memcpy(req_buf[0..sf.data.len], sf.data);
-        const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch |err| {
-            dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+        // Fast path: whole request in one STREAM frame (zquic client + most quinn streams).
+        if (sf.offset == 0 and peekHttp09ReqAssembly(conn, sf.stream_id) == null) {
+            const parse_result = http09_server.parseRequest(sf.data);
+            if (parse_result) |req| {
+                dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
+                var path_buf: [512]u8 = undefined;
+                const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
+                    dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
+                    return;
+                };
+                if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
+                return;
+            } else |err| {
+                if (err != error.Incomplete) {
+                    dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+                    return;
+                }
+                // Incomplete — buffer below.
+            }
+        }
+
+        const end = sf.offset + sf.data.len;
+        if (end > http09_req_asm_buf_len) return;
+
+        const req_asm = findHttp09ReqAssembly(conn, sf.stream_id) orelse {
+            dbg("io: http09 req assembly slots full (stream_id={})\n", .{sf.stream_id});
             return;
         };
-        dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
+        if (sf.offset == 0 and sf.data.len > 0) {
+            if (req_asm.len == 0 or sf.data.len >= req_asm.len) {
+                @memcpy(req_asm.buf[0..sf.data.len], sf.data);
+                req_asm.len = sf.data.len;
+            }
+        } else {
+            if (sf.offset > req_asm.len) return; // gap — wait for retransmit
+            @memcpy(req_asm.buf[sf.offset..end], sf.data);
+            if (end > req_asm.len) req_asm.len = end;
+        }
+
+        const req = http09_server.parseRequest(req_asm.buf[0..req_asm.len]) catch |err| {
+            if (err == error.Incomplete) return;
+            dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, req_asm.len });
+            req_asm.reset();
+            return;
+        };
 
         var path_buf: [512]u8 = undefined;
         const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
@@ -4599,35 +5405,9 @@ pub const Server = struct {
             return;
         };
 
-        const file = compat.fs.openFileAbsolute(fs_path, .{}) catch {
-            dbg("io: file not found: {s}\n", .{fs_path});
-            return;
-        };
-        const file_end = file.getEndPos() catch {
-            file.close();
-            return;
-        };
-
-        for (&conn.http09_slots) |*slot| {
-            if (slot.active or slot.awaiting_fin_ack) continue;
-            slot.* = .{
-                .active = true,
-                .stream_id = sf.stream_id,
-                .file = file,
-                .stream_offset = 0,
-                .file_end = file_end,
-            };
-            // Store the file path so we can reopen it for retransmission if a
-            // pre-FIN packet is lost after the file has been closed.
-            const path_len = @min(fs_path.len, slot.file_path.len);
-            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
-            slot.file_path_len = path_len;
-            conn.http09_active_count += 1;
-            dbg("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
-            return;
-        }
-        dbg("io: http/0.9 out slots full\n", .{});
-        file.close();
+        if (!self.http09OpenResolvedPath(conn, sf.stream_id, fs_path)) return;
+        req_asm.reset();
+        dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: compat.Address) void {
@@ -5351,6 +6131,12 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     for (&conn.raw_app_streams) |*slot| {
         slot.deinit(allocator);
     }
+    // Free any congestion-deferred HTTP/0.9 retransmit buffers.
+    for (conn.http09_rtx[0..conn.http09_rtx_count]) |*e| {
+        if (e.data.len > 0) allocator.free(e.data);
+        e.* = .{};
+    }
+    conn.http09_rtx_count = 0;
     // Free any retransmit buffers attached to in-flight LD entries so the
     // raw_application_streams send-side doesn't leak when a connection is
     // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
@@ -5503,18 +6289,9 @@ pub const Client = struct {
     /// Opaque STREAM receive buffers when `raw_application_streams` is set.
     raw_app_recv: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
-    /// Deferred ACK: instead of sending one ACK per received server packet,
-    /// we accumulate the highest received PN here and flush a single cumulative
-    /// ACK after draining all pending packets in the recv loop.  This reduces
-    /// the burst from (N ACKs + N GETs) to (1 ACK + N GETs), keeping the
-    /// combined burst under the NS3 DropTail queue limit of 25 packets.
-    deferred_ack_pn: ?u64 = null,
-    /// Minimum packet number seen since the last deferred ACK flush.
-    /// Together with deferred_ack_pn (the max), this lets flushDeferredAck
-    /// compute an accurate first_ack_range that covers all received packets,
-    /// preventing the server's k_packet_threshold loss detector from
-    /// mis-classifying contiguously-received packets as lost.
-    deferred_ack_min_pn: ?u64 = null,
+    /// Deferred ACK: accumulate received 1-RTT PNs and flush one ACK frame
+    /// after draining all pending packets in the recv loop.
+    app_ack: AppAckTracker = .{},
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -5556,6 +6333,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
+        const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
+        try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
         const dcid = ConnectionId.random(compat.random, 8);
         const scid = ConnectionId.random(compat.random, 8);
@@ -5578,6 +6357,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
         conn.max_udp_payload = pm.max_udp_payload;
         conn.app_stream_chunk = pm.app_stream_chunk;
+        conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             // Pre-derive v2 keys so processInitialPacket can detect and handle
@@ -5636,6 +6416,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
+        const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
+        try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
         const dcid = ConnectionId.random(compat.random, 8);
         const scid = ConnectionId.random(compat.random, 8);
@@ -5655,6 +6437,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
         conn.max_udp_payload = pm.max_udp_payload;
         conn.app_stream_chunk = pm.app_stream_chunk;
+        conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
@@ -5733,6 +6516,8 @@ pub const Client = struct {
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
     pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
         const now = compat.milliTimestamp();
+        self.maybeSendPlpmtuProbe();
+        self.maybeAutoKeyUpdate();
         if (self.conn.phase == .initial and self.initial_pkt_len > 0 and
             now - self.last_initial_retransmit_ms >= 500)
         {
@@ -5887,6 +6672,44 @@ pub const Client = struct {
         }
     }
 
+    /// RFC 8899: probe a larger UDP payload when PLPMTUD state allows it.
+    fn maybeSendPlpmtuProbe(self: *Client) void {
+        if (self.conn.phase != .connected or self.conn.draining) return;
+        const now_ms = compat.milliTimestamp();
+        const probe_size = self.conn.plpmtu.maybeProbeSize(now_ms) orelse return;
+        const overhead: usize = 48;
+        if (probe_size <= overhead) return;
+        const target_payload = @as(usize, probe_size) - overhead;
+        var probe_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        if (target_payload > probe_buf.len) return;
+        probe_buf[0] = 0x01;
+        if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
+        const pn = self.conn.app_pn;
+        self.conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            probe_buf[0..target_payload],
+            pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return;
+        self.conn.app_pn += 1;
+        self.conn.note1RttSent();
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+    }
+
+    fn maybeAutoKeyUpdate(self: *Client) void {
+        if (self.conn.phase != .connected or self.conn.draining) return;
+        const now_ms = compat.milliTimestamp();
+        if (self.conn.packets_since_key_update < auto_key_update_packet_threshold) return;
+        if (!self.conn.canInitiateKeyUpdate(now_ms)) return;
+        self.initiateClientKeyUpdate();
+        self.conn.packets_since_key_update = 0;
+    }
+
     /// Probe Timeout (PTO) handler (RFC 9002 §6.2) — client side.
     ///
     /// Mirrors `Server.checkPto`, but operates on the single `self.conn`
@@ -5929,6 +6752,7 @@ pub const Client = struct {
             ) catch return;
             const pn = self.conn.app_pn;
             self.conn.app_pn += 1;
+            self.conn.note1RttSent();
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return;
             self.conn.last_pto_ms = now_ms;
             self.conn.pto_count +|= 1;
@@ -6042,6 +6866,9 @@ pub const Client = struct {
         const sk_opt = std.mem.asBytes(&sk_buf);
         std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(self.sock);
+        const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
+        try compat.bind(self.sock, &bind_any.any, bind_any.getOsSockLen());
 
         // New random connection IDs.
         const dcid = ConnectionId.random(compat.random, 8);
@@ -6067,6 +6894,7 @@ pub const Client = struct {
         const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
         self.conn.max_udp_payload = pm.max_udp_payload;
         self.conn.app_stream_chunk = pm.app_stream_chunk;
+        self.conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         self.conn.init_keys = InitialSecrets.derive(dcid.slice());
 
         // Fresh TLS handshake state.
@@ -6083,6 +6911,7 @@ pub const Client = struct {
         self.streams_done = 0;
         self.requested = false;
         self.zerortt_count = 0;
+        self.app_ack.reset();
 
         // Clear packet buffers (ticket_store is preserved intentionally).
         self.initial_pkt = [_]u8{0} ** MAX_DATAGRAM_SIZE;
@@ -6243,6 +7072,9 @@ pub const Client = struct {
                 if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
                     self.send0RttRequests(server_addr) catch {};
                 }
+                // downloadUrls blocks with its own recv loop; extend the outer
+                // deadline so post-batch retransmits can still complete.
+                deadline = compat.milliTimestamp() + 120_000;
                 if (self.active_urls.len > 0) {
                     try self.downloadUrls(server_addr);
                 }
@@ -6303,7 +7135,8 @@ pub const Client = struct {
             const quic_tp = try buildEndpointTransportParams(
                 &quic_tp_buf,
                 self.conn.local_cid.slice(),
-                self.conn.max_udp_payload,
+                // Omit max_udp_payload_size — peer assumes RFC §18.2 default (65527).
+                0,
             );
 
             // Choose ClientHello variant based on flags.
@@ -6319,11 +7152,7 @@ pub const Client = struct {
                 // any other suite cannot be used as 0-RTT; fall through to
                 // 1-RTT resumption instead of silently sending packets the
                 // server can't decrypt.
-                if (self.ticket_store.get(now_ms)) |ticket| ed_inner: {
-                    if (ticket.cipher_suite != tls_hs.TLS_AES_128_GCM_SHA256) {
-                        dbg("io: 0-RTT skipped — ticket cipher 0x{x:0>4} not supported (only AES-128-GCM-SHA256 today)\n", .{ticket.cipher_suite});
-                        break :ed_inner;
-                    }
+                if (self.ticket_store.get(now_ms)) |ticket| {
                     var psk_bytes: [32]u8 = .{0} ** 32;
                     @memcpy(&psk_bytes, ticket.resumption_secret[0..@min(ticket.resumption_secret_len, 32)]);
                     const psk_info = tls_hs.PskInfo{
@@ -6343,17 +7172,8 @@ pub const Client = struct {
                     const ch_hash = tls_hs.peekHash(self.tls.transcript);
                     var cets: [32]u8 = undefined;
                     keys_mod.hkdfExpandLabel(&cets, &result.early_secret, "c e traffic", &ch_hash);
-                    const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                    var ekm = KeyMaterial{
-                        .secret = cets,
-                        .key = early_keys.key,
-                        .key32 = .{0} ** 32,
-                        .iv = early_keys.iv,
-                        .hp = early_keys.hp,
-                        .hp32 = .{0} ** 32,
-                    };
-                    ekm.initCachedContexts();
-                    self.early_km = ekm;
+                    const early_keys = session_mod.deriveEarlyKeysFromSecret(cets, ticket.cipher_suite);
+                    self.early_km = keyMaterialFromEarlyKeys(cets, early_keys);
                     // Remember the ticket's cipher so the 0-RTT send path
                     // protects each packet under the correct AEAD instead of
                     // whatever cipher `self.tls.cipher_suite` happens to
@@ -6403,25 +7223,31 @@ pub const Client = struct {
 
         // CRYPTO frame
         const crypto_len = try buildCryptoFrame(&frame_buf, 0, self.client_hello_bytes[0..ch_len]);
-        // Pad to 1200 bytes minimum (RFC 9000 §14.1)
-        const min_payload = 1200 - 100; // leave room for headers
-        if (crypto_len < min_payload) {
-            buildPaddingFrames(frame_buf[crypto_len..min_payload], min_payload - crypto_len);
-        }
-        const payload_len = @max(crypto_len, min_payload);
-
+        // RFC 9000 §14.1: UDP datagram payload MUST be ≥1200 bytes.  Quinn/rustls
+        // silently discard undersized Initials (observed at 1151 B without this loop).
         const init_km = self.conn.init_keys.?;
         const token = self.conn.retry_token[0..self.conn.retry_token_len];
-        const pkt_len = try buildInitialPacket(
-            &self.initial_pkt,
-            self.conn.remote_cid,
-            self.conn.local_cid,
-            token,
-            frame_buf[0..payload_len],
-            self.conn.init_pn,
-            &init_km.client,
-            self.conn.quicVersion(),
-        );
+        var payload_len = crypto_len;
+        var pkt_len: usize = 0;
+        while (true) {
+            pkt_len = try buildInitialPacket(
+                &self.initial_pkt,
+                self.conn.remote_cid,
+                self.conn.local_cid,
+                token,
+                frame_buf[0..payload_len],
+                self.conn.init_pn,
+                &init_km.client,
+                self.conn.quicVersion(),
+            );
+            if (pkt_len >= types.min_initial_mtu) break;
+            if (payload_len >= frame_buf.len) return error.BufferTooSmall;
+            const need = types.min_initial_mtu - pkt_len;
+            const add = @max(need, 4);
+            if (payload_len + add > frame_buf.len) return error.BufferTooSmall;
+            buildPaddingFrames(frame_buf[payload_len .. payload_len + add], add);
+            payload_len += add;
+        }
         self.conn.init_pn += 1;
         self.initial_pkt_len = pkt_len;
 
@@ -6549,13 +7375,13 @@ pub const Client = struct {
                 var pos = lh.consumed;
                 if (lh.header.packet_type == .initial) {
                     // Skip token_len + token.
-                    const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    const tok_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
                     const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
                     pos += tok_r.len + tok_len;
                 }
                 if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
                     if (pos >= buf.len) break :blk buf.len;
-                    const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    const len_r = varint.decodePermissive(buf[pos..]) catch break :blk buf.len;
                     const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
                     pos += len_r.len + payload_len;
                     break :blk @min(pos, buf.len);
@@ -6674,6 +7500,7 @@ pub const Client = struct {
             }
             return; // both v1 and v2 decryption failed
         };
+        self.conn.init_ecn_ect0_recv += 1;
 
         // Extract CRYPTO frames, skipping ACK and PADDING frames.
         var pos: usize = 0;
@@ -6757,6 +7584,7 @@ pub const Client = struct {
             self.conn.packet_cipher,
         ) catch return;
         const pt_len = dec.pt_len;
+        self.conn.hs_ecn_ect0_recv += 1;
         if (self.conn.hs_recv_pn == null or dec.pn > self.conn.hs_recv_pn.?)
             self.conn.hs_recv_pn = dec.pn;
 
@@ -6891,6 +7719,7 @@ pub const Client = struct {
             &plaintext,
             buf,
             pn_start,
+            buf.len,
             incoming_phase,
             &self.conn.app_server_km,
             &self.conn.app_server_km_prev,
@@ -6976,6 +7805,12 @@ pub const Client = struct {
                     continue;
                 };
                 if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked);
+                if (self.conn.plpmtu.probe_pn) |probe_pn| {
+                    if (largest_ack >= probe_pn) {
+                        self.conn.plpmtu.onProbeAcked(probe_pn);
+                        self.conn.syncPathMtuFields();
+                    }
+                }
                 if (ld_result.lost_bytes > 0) self.conn.cc.subBytesInFlight(ld_result.lost_bytes);
                 // ECN-CE feedback (RFC 9002 §B.4): mirror of the server arm.
                 if (ft == 0x03) {
@@ -6998,6 +7833,12 @@ pub const Client = struct {
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
                     const lp = lost_buf[li];
+                    if (self.conn.plpmtu.probing) {
+                        if (self.conn.plpmtu.probe_pn == lp.pn) {
+                            self.conn.plpmtu.onProbeLost();
+                            self.conn.syncPathMtuFields();
+                        }
+                    }
                     self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
                         self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
@@ -7048,11 +7889,8 @@ pub const Client = struct {
                 // PATH_RESPONSE — validate pending challenge.
                 const pr = transport_frames.PathResponse.parse(plaintext[pos..]) catch return;
                 pos += pr.consumed;
-                if (self.conn.path_challenge_data) |expected| {
-                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
-                        self.conn.path_challenge_data = null;
-                        dbg("io: client path validated\n", .{});
-                    }
+                if (self.conn.migration.handlePathResponse(pr.frame.data)) {
+                    dbg("io: client path validated\n", .{});
                 }
                 continue;
             }
@@ -7222,16 +8060,10 @@ pub const Client = struct {
             return;
         }
 
-        // Defer ACK: accumulate the highest received PN rather than sending
-        // one ACK per packet.  The actual ACK is flushed once after the recv
-        // drain loop in downloadUrls.  This keeps the combined burst
-        // (deferred ACK + next GET batch) well within the NS3 DropTail queue
-        // limit of 25 packets (1 ACK + 20 GETs = 21 ≤ 25).
-        if (decompressed_pn > (self.deferred_ack_pn orelse 0)) {
-            self.deferred_ack_pn = decompressed_pn;
-        }
-        if (self.deferred_ack_min_pn == null or decompressed_pn < self.deferred_ack_min_pn.?) {
-            self.deferred_ack_min_pn = decompressed_pn;
+        // Defer ACK until after the recv drain loop in downloadUrls.
+        if (self.app_ack.observe(decompressed_pn)) {
+            self.flushDeferredAck();
+            _ = self.app_ack.observe(decompressed_pn);
         }
     }
 
@@ -7253,29 +8085,20 @@ pub const Client = struct {
     /// this after processing inbound datagrams (typically once per event-loop
     /// iteration) so the peer receives ACKs and keeps sending application data.
     pub fn flushDeferredAck(self: *Client) void {
-        const largest_pn = self.deferred_ack_pn orelse return;
-        self.deferred_ack_pn = null;
-        // Compute first_ack_range: covers [min_pn .. largest_pn] assuming all
-        // packets in that window arrived (no gaps).  This prevents the server's
-        // k_packet_threshold loss detector from mis-classifying received packets
-        // as lost due to a sparse ACK (first_ack_range=0).
-        const min_pn = self.deferred_ack_min_pn orelse largest_pn;
-        self.deferred_ack_min_pn = null;
-        const first_ack_range = largest_pn - min_pn;
-        var ack_buf: [56]u8 = undefined;
-        const ack_len = if (self.conn.ecn_ect0_recv > 0 or
+        if (self.app_ack.range_count == 0) return;
+        const ecn: ?ack_frame_mod.EcnCounts = if (self.conn.ecn_ect0_recv > 0 or
             self.conn.ecn_ect1_recv > 0 or
             self.conn.ecn_ce_recv > 0)
-            buildAckEcnFrame(
-                &ack_buf,
-                largest_pn,
-                first_ack_range,
-                self.conn.ecn_ect0_recv,
-                self.conn.ecn_ect1_recv,
-                self.conn.ecn_ce_recv,
-            ) catch return
+            .{
+                .ect0 = self.conn.ecn_ect0_recv,
+                .ect1 = self.conn.ecn_ect1_recv,
+                .ecn_ce = self.conn.ecn_ce_recv,
+            }
         else
-            buildAckFrame(&ack_buf, largest_pn, first_ack_range) catch return;
+            null;
+        var ack_buf: [256]u8 = undefined;
+        const ack_len = self.app_ack.buildWireFrame(&ack_buf, ecn) catch return;
+        if (ack_len == 0) return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,
@@ -7287,6 +8110,7 @@ pub const Client = struct {
             self.conn.packet_cipher,
         ) catch return;
         self.conn.app_pn += 1;
+        self.conn.note1RttSent();
         _ = compat.sendto(
             self.sock,
             send_buf[0..pkt_len],
@@ -7294,7 +8118,10 @@ pub const Client = struct {
             &self.conn.peer.any,
             self.conn.peer.getOsSockLen(),
         ) catch {};
-        dbg("io: client flushed deferred ACK largest_pn={}\n", .{largest_pn});
+        dbg("io: client flushed deferred ACK largest_pn={} ranges={}\n", .{
+            self.app_ack.largest, self.app_ack.range_count,
+        });
+        self.app_ack.reset();
     }
 
     fn handleAppCrypto(self: *Client, data: []const u8) void {
@@ -8110,15 +8937,6 @@ pub const Client = struct {
             batch_start = batch_end;
         }
         dbg("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
-
-        // Close all stream files
-        for (&self.streams) |*s| {
-            if (s.active) {
-                s.file.close();
-                s.active = false;
-                self.http09FreeStreamReorder(s);
-            }
-        }
     }
 };
 
@@ -8427,7 +9245,7 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
     conn.peer_initial_max_stream_data_bidi_remote = 1_000;
     conn.peer_initial_max_stream_data_uni = 1_000;
 
-    // Fill the 64-entry table with one fresh entry per stream id.
+    // Fill the table with one fresh entry per stream id.
     var sid: u64 = 0;
     while (sid < conn.per_stream_send_max.len) : (sid += 1) {
         // Use stream ids of the same parity so we stay in one bucket; the
@@ -8439,7 +9257,7 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
     try std.testing.expectEqual(@as(u64, 9_999), conn.peerStreamSendLimit(0, true));
     // A brand-new stream cannot be inserted; lookup falls back to the
     // initial limit (under-send, never over-send).
-    const new_sid: u64 = 4_096;
+    const new_sid: u64 = @as(u64, conn.per_stream_send_max.len) * 4;
     try std.testing.expect(!conn.applyPeerMaxStreamData(new_sid, 9_999));
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
 }
@@ -8520,7 +9338,7 @@ test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 r
 
         var recv_buf: [256]u8 = undefined;
         const pn_start: usize = 1 + dcid.len;
-        const r = try unprotect1RttPacketWithPnTracking(&recv_buf, send_buf[0..n], pn_start, &km, cipher, null);
+        const r = try unprotect1RttPacketWithPnTracking(&recv_buf, send_buf[0..n], pn_start, n, &km, cipher, null);
         try std.testing.expectEqual(@as(u64, pn), r.pn);
         try std.testing.expectEqualSlices(u8, &plaintext, recv_buf[0..r.pt_len]);
     }
@@ -8528,14 +9346,14 @@ test "unprotect1RttPacketWithPnTracking: cipher param plumbed through (AES-256 r
 
 test "canSendAntiAmp: 3× rule before address validation" {
     var conn = makeConnForStreamTest();
-    conn.anti_amp_bytes_recv = 100;
-    conn.anti_amp_bytes_sent = 250;
+    conn.migration.anti_amp.bytes_recv = 100;
+    conn.migration.anti_amp.bytes_sent = 250;
     try std.testing.expect(conn.canSendAntiAmp(50)); // 250+50 = 300 = 3×100
     try std.testing.expect(!conn.canSendAntiAmp(51)); // would exceed
     conn.address_validated = true;
     try std.testing.expect(conn.canSendAntiAmp(10_000)); // no limit after validation
     conn.address_validated = false;
-    conn.anti_amp_bytes_recv = 0;
+    conn.migration.anti_amp.bytes_recv = 0;
     try std.testing.expect(!conn.canSendAntiAmp(1)); // can't send until recv > 0
 }
 

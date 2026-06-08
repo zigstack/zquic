@@ -178,6 +178,13 @@ pub const CongestionController = union(enum) {
         }
     }
 
+    /// Current congestion window in bytes (used by the pacer).
+    pub fn getCwnd(self: *const CongestionController) u64 {
+        switch (self.*) {
+            inline else => |cc| return cc.cwnd,
+        }
+    }
+
     pub fn setBytesInFlight(self: *CongestionController, val: u64) void {
         switch (self.*) {
             inline else => |*cc| cc.bytes_in_flight = val,

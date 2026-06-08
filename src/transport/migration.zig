@@ -22,6 +22,7 @@
 //!  - `PathState`: per-path validation state machine.
 //!  - `MigrationManager`: tracks multiple candidate paths and the active path.
 //!  - `PreferredAddress`: server-advertised preferred address.
+//!  - `AntiAmpLimiter`: RFC 9000 §8.1 anti-amplification accounting.
 
 const std = @import("std");
 const compat = @import("../compat.zig");
@@ -38,6 +39,28 @@ pub fn randomChallenge() ChallengeData {
     compat.random.bytes(&data);
     return data;
 }
+
+// ---------------------------------------------------------------------------
+// Anti-amplification (RFC 9000 §8.1)
+// ---------------------------------------------------------------------------
+
+pub const AntiAmpLimiter = struct {
+    bytes_recv: u64 = 0,
+    bytes_sent: u64 = 0,
+
+    pub fn onRecv(self: *AntiAmpLimiter, n: usize) void {
+        self.bytes_recv += @intCast(n);
+    }
+
+    pub fn onSent(self: *AntiAmpLimiter, n: usize) void {
+        self.bytes_sent += @intCast(n);
+    }
+
+    pub fn canSend(self: *const AntiAmpLimiter, pkt_len: usize) bool {
+        if (self.bytes_recv == 0) return false;
+        return self.bytes_sent + @as(u64, @intCast(pkt_len)) <= self.bytes_recv * 3;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // PathState
@@ -140,6 +163,10 @@ pub const MigrationManager = struct {
     active_path: usize = 0,
     /// Server-preferred address (null if not advertised).
     preferred_address: ?PreferredAddress = null,
+    /// RFC 9000 §8.1 byte accounting for unvalidated paths.
+    anti_amp: AntiAmpLimiter = .{},
+    /// Latest PATH_CHALLENGE we sent while waiting for PATH_RESPONSE.
+    pending_challenge: ?ChallengeData = null,
 
     /// Start probing a new candidate path.
     ///
@@ -151,7 +178,13 @@ pub const MigrationManager = struct {
         self.path_count += 1;
         const challenge = randomChallenge();
         self.paths[idx].startProbing(challenge, now_ms);
+        self.pending_challenge = challenge;
         return challenge;
+    }
+
+    /// Record a PATH_CHALLENGE for the current peer address (no new path slot).
+    pub fn notePathChallenge(self: *MigrationManager, challenge: ChallengeData) void {
+        self.pending_challenge = challenge;
     }
 
     /// Process a PATH_RESPONSE frame.
@@ -159,6 +192,11 @@ pub const MigrationManager = struct {
     /// If the response validates a candidate path, that path becomes active.
     /// Returns true if migration occurred.
     pub fn handlePathResponse(self: *MigrationManager, response: ChallengeData) bool {
+        if (self.pending_challenge) |expected| {
+            if (std.mem.eql(u8, &response, &expected)) {
+                self.pending_challenge = null;
+            }
+        }
         for (0..self.path_count) |i| {
             if (i == self.active_path) continue;
             if (self.paths[i].handleResponse(response)) {
@@ -186,6 +224,10 @@ pub const MigrationManager = struct {
     /// initial path is trusted).
     pub fn trustActivePath(self: *MigrationManager) void {
         self.paths[self.active_path].status = .validated;
+    }
+
+    pub fn setPreferredAddress(self: *MigrationManager, pa: PreferredAddress) void {
+        self.preferred_address = pa;
     }
 };
 
@@ -258,5 +300,13 @@ test "migration: PreferredAddress helpers" {
         .stateless_reset_token = .{0} ** 16,
     };
     try testing.expect(pa.hasIpv4());
-    try testing.expect(!pa.hasIpv6());
+    try std.testing.expect(!pa.hasIpv6());
+}
+
+test "migration: anti-amp 3x rule" {
+    var amp = AntiAmpLimiter{};
+    try std.testing.expect(!amp.canSend(100));
+    amp.onRecv(100);
+    try std.testing.expect(amp.canSend(300));
+    try std.testing.expect(!amp.canSend(301));
 }

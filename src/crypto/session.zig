@@ -29,6 +29,7 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
 const crypto_keys = @import("keys.zig");
+const tls_hs = @import("../tls/handshake.zig");
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -231,25 +232,14 @@ pub const TicketStore = struct {
 // Early Data (0-RTT) Key Derivation
 // ---------------------------------------------------------------------------
 
-/// 0-RTT key material derived from a PSK.
-///
-/// **Only TLS_AES_128_GCM_SHA256 is supported today.** The field sizes are
-/// fixed to AES-128 dimensions (16-byte key, 16-byte HP key, 12-byte IV) and
-/// the derivation uses SHA-256.  Per RFC 9001 §5.6 / RFC 8446 §4.6.1 a PSK
-/// is bound to a single cipher suite, and the early traffic secret MUST be
-/// derived with that cipher suite's hash.  To support AES-256-GCM-SHA384 or
-/// ChaCha20-Poly1305-SHA256 0-RTT we would need:
-///   - 32-byte `key` / `hp` slots (a tagged union, or a parallel struct);
-///   - SHA-384 HKDF for AES-256 (and SHA-384-sized zeros in `Extract`).
-/// Callers must verify the ticket's `cipher_suite` is 0x1301 before invoking
-/// `deriveEarlyKeysFromSecret`.
+/// 0-RTT key material derived from a PSK and negotiated cipher suite.
 pub const EarlyDataKeys = struct {
-    /// Write key (client → server for 0-RTT).
-    key: [16]u8,
-    /// IV for the AEAD.
-    iv: [12]u8,
-    /// Header protection key.
-    hp: [16]u8,
+    cipher_suite: u16 = tls_hs.TLS_AES_128_GCM_SHA256,
+    key: [32]u8 = .{0} ** 32,
+    key_len: u8 = 16,
+    iv: [12]u8 = .{0} ** 12,
+    hp: [32]u8 = .{0} ** 32,
+    hp_len: u8 = 16,
 };
 
 /// Derive client_early_traffic_secret from PSK and ClientHello transcript hash.
@@ -266,21 +256,25 @@ pub fn deriveEarlyTrafficSecret(psk: [32]u8, ch_hash: [32]u8) [32]u8 {
     return cets;
 }
 
-/// Derive QUIC 0-RTT keys from the client_early_traffic_secret.
-///
-/// **AES-128-GCM-SHA256 only.** See `EarlyDataKeys` for the rationale and
-/// what would need to change to support AES-256 or ChaCha20.  Callers MUST
-/// have verified the ticket's negotiated cipher suite is 0x1301 before
-/// reaching this function; mis-derived keys are silently wrong on the wire
-/// and the peer will reject them with an AEAD tag failure.
-pub fn deriveEarlyKeysFromSecret(early_traffic_secret: [32]u8) EarlyDataKeys {
-    var key: [16]u8 = undefined;
-    var iv: [12]u8 = undefined;
-    var hp: [16]u8 = undefined;
-    crypto_keys.hkdfExpandLabel(&key, &early_traffic_secret, "quic key", &.{});
-    crypto_keys.hkdfExpandLabel(&iv, &early_traffic_secret, "quic iv", &.{});
-    crypto_keys.hkdfExpandLabel(&hp, &early_traffic_secret, "quic hp", &.{});
-    return .{ .key = key, .iv = iv, .hp = hp };
+/// Derive QUIC 0-RTT keys from the client_early_traffic_secret and cipher suite.
+pub fn deriveEarlyKeysFromSecret(early_traffic_secret: [32]u8, cipher_suite: u16) EarlyDataKeys {
+    var out: EarlyDataKeys = .{ .cipher_suite = cipher_suite };
+    const key_len: u8 = switch (cipher_suite) {
+        tls_hs.TLS_AES_128_GCM_SHA256 => 16,
+        tls_hs.TLS_AES_256_GCM_SHA384, tls_hs.TLS_CHACHA20_POLY1305_SHA256 => 32,
+        else => 16,
+    };
+    out.key_len = key_len;
+    out.hp_len = key_len;
+    crypto_keys.hkdfExpandLabel(out.key[0..key_len], &early_traffic_secret, "quic key", &.{});
+    crypto_keys.hkdfExpandLabel(&out.iv, &early_traffic_secret, "quic iv", &.{});
+    crypto_keys.hkdfExpandLabel(out.hp[0..key_len], &early_traffic_secret, "quic hp", &.{});
+    return out;
+}
+
+/// Legacy single-arg wrapper (AES-128).
+pub fn deriveEarlyKeysFromSecretLegacy(early_traffic_secret: [32]u8) EarlyDataKeys {
+    return deriveEarlyKeysFromSecret(early_traffic_secret, tls_hs.TLS_AES_128_GCM_SHA256);
 }
 
 /// Derive 0-RTT (early data) AEAD keys from a session ticket's PSK.
@@ -301,7 +295,7 @@ pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
         0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
     };
     const cets = deriveEarlyTrafficSecret(psk, empty_hash);
-    return deriveEarlyKeysFromSecret(cets);
+    return deriveEarlyKeysFromSecret(cets, ticket.cipher_suite);
 }
 
 // ---------------------------------------------------------------------------
