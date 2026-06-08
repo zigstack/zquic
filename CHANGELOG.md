@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.9] - 2026-06-08
+
+### Fixed
+
+- **`Client.init` compile error in v1.6.8.** Partial struct literals must
+  include `.conn = .{}` before `configureNewConn` fills the field.
+
+---
+
 ## [v1.6.8] - 2026-06-08
 
 ### Fixed

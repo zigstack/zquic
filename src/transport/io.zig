@@ -6387,6 +6387,7 @@ pub const Client = struct {
             .config = config,
             .sock = sock,
             .tls = tls_client,
+            .conn = .{},
             .active_urls = config.urls,
             .owns_socket = true,
         };
@@ -6439,6 +6440,7 @@ pub const Client = struct {
             .config = config,
             .sock = sock,
             .tls = tls_client,
+            .conn = .{},
             .active_urls = config.urls,
             .owns_socket = take_ownership,
         };
