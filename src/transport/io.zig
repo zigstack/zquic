@@ -929,6 +929,17 @@ const Http09PendingOpen = struct {
     path: [512]u8 = undefined,
 };
 
+/// A lost immediate-mux STREAM frame waiting to be retransmitted under
+/// congestion control.  `data` is heap-owned (the same buffer the loss
+/// detector surfaced); ownership transfers back into a fresh SentPacket when
+/// the entry is drained, or is freed if the queue is torn down.
+const Http09Rtx = struct {
+    stream_id: u64 = 0,
+    offset: u64 = 0,
+    fin: bool = false,
+    data: []u8 = &.{},
+};
+
 /// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
 const http09_req_asm_buf_len = 256;
 const Http09ReqAssembly = struct {
@@ -1290,6 +1301,13 @@ pub const ConnState = struct {
     /// Streams that already received an HTTP/0.9 response (immediate path has no slot).
     http09_responded: [http09_pending_max]u64 = undefined,
     http09_responded_count: u16 = 0,
+    /// Lost immediate-mux STREAM frames awaiting a congestion-controlled
+    /// retransmission (drained by flushPendingHttp09Responses).  Without this
+    /// the onAck loss handler resends every lost frame immediately, bypassing
+    /// cwnd, which under quinn's ~2000-stream burst snowballs into a retransmit
+    /// storm that overflows the NS3 queue and the loss-detector ring.
+    http09_rtx: [http09_pending_max]Http09Rtx = [_]Http09Rtx{.{}} ** http09_pending_max,
+    http09_rtx_count: u16 = 0,
     /// Partial HTTP/0.9 requests reassembled until FIN.
     http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
     /// Number of currently active HTTP/3 response slots.
@@ -1542,6 +1560,9 @@ pub const ConnState = struct {
     rtt: recovery.RttEstimator = .{},
     // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
     ld: recovery.LossDetector = .{},
+    // Token-bucket pacer state (see ConnState.pacerAllow).
+    pacing_tokens: f64 = 0,
+    pacing_last_ms: i64 = 0,
 
     // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
     // Set on the client when config.v2 = true so we can decrypt a v2 Initial
@@ -1696,6 +1717,34 @@ pub const ConnState = struct {
             }
         }
         return null;
+    }
+
+    /// Token-bucket pacer (RFC 9002 §7.7).  Spreads data sends across the RTT
+    /// so a cwnd-sized response does not leave as one instantaneous burst.  The
+    /// NS3 interop path has a 25-packet DropTail bottleneck queue, so an unpaced
+    /// ~900-packet reply to quinn's multiplexing burst drops ~35% and collapses
+    /// the connection.  Tokens are denominated in bytes; one packet costs one
+    /// MSS so the effective rate is cwnd_packets / srtt.
+    fn pacerAllow(self: *ConnState, now_ms: i64) bool {
+        const srtt = @max(self.rtt.srtt_ms, 1.0);
+        const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
+        const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
+        if (self.pacing_last_ms == 0) {
+            self.pacing_last_ms = now_ms;
+            self.pacing_tokens = @floatFromInt(congestion.mss);
+        }
+        const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
+        self.pacing_last_ms = now_ms;
+        self.pacing_tokens += rate * elapsed;
+        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
+        if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
+        return self.pacing_tokens >= @as(f64, @floatFromInt(congestion.mss));
+    }
+
+    /// Consume one packet's worth of pacing credit after an actual send.
+    fn pacerConsume(self: *ConnState) void {
+        self.pacing_tokens -= @floatFromInt(congestion.mss);
+        if (self.pacing_tokens < 0) self.pacing_tokens = 0;
     }
 
     /// RFC 9001 §6.5: minimum spacing between locally-initiated key updates.
@@ -2371,7 +2420,7 @@ pub const Server = struct {
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
                     if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
-                        conn.http3_active_count > 0)
+                        conn.http09_rtx_count > 0 or conn.http3_active_count > 0)
                     {
                         poll_timeout_ms = 10;
                         break;
@@ -4106,10 +4155,22 @@ pub const Server = struct {
                         // it via `sendRawStreamDataInner` so the bytes get a
                         // fresh PN and the new SentPacket adopts the buffer.
                         if (lp.stream_data) |buf| {
-                            self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
-                            // ownership of `buf` is transferred into the new
-                            // SentPacket (or freed inside *Inner on draining /
-                            // serialize failure); we must NOT touch it again.
+                            // Retransmissions are subject to the congestion
+                            // window (RFC 9002 §6.2.4 / §7).  When cwnd has room
+                            // resend immediately; otherwise queue the frame so
+                            // flushPendingHttp09Responses replays it as ACKs open
+                            // the window.  This paces recovery and prevents the
+                            // unbounded retransmit storm that overflowed the NS3
+                            // queue and the loss-detector ring.
+                            if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
+                                self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
+                                conn.pacerConsume();
+                                // ownership of `buf` is transferred into the new
+                                // SentPacket (or freed inside *Inner on draining /
+                                // serialize failure); we must NOT touch it again.
+                            } else if (!http09QueueRtx(conn, lp.stream_id, lp.stream_offset, lp.stream_fin, buf)) {
+                                self.allocator.free(buf);
+                            }
                         }
                     }
                 }
@@ -4450,21 +4511,24 @@ pub const Server = struct {
             // Batch full — flush immediately before enqueuing more.
             self.send_batch.flush(self.sock);
         }
-        // Congestion control: update bytes in flight.
-        conn.cc.onPacketSent(@intCast(pkt_len));
-        // Loss detection: record this packet.  Discard return value — this
-        // tracker can fill (max_tracked) under sustained loss; in that case
-        // the packet is dropped from the LD.  The raw-app retransmit path
-        // (`Server.sendRawStreamData` etc.) is responsible for freeing
-        // `stream_data` if it ever attaches a buffer to a SentPacket that
-        // does not get recorded.
-        _ = conn.ld.onPacketSent(.{
+        // Loss detection: record this packet.  The tracker can fill
+        // (max_tracked) under a large burst; if it does the packet is *not*
+        // recorded.  The raw-app retransmit path (`Server.sendRawStreamData`
+        // etc.) is responsible for freeing `stream_data` if it ever attaches a
+        // buffer to a SentPacket that does not get recorded.
+        const tracked = conn.ld.onPacketSent(.{
             .pn = conn.app_pn - 1,
             .send_time_ms = @intCast(compat.milliTimestamp()),
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
         });
+        // Congestion control: only count the packet toward bytes_in_flight when
+        // the loss detector is tracking it.  An untracked packet can never be
+        // removed on ACK or loss, so counting it would leak in-flight bytes
+        // permanently and pin canSend() to false — the connection would make no
+        // further data progress and degrade into a PTO-only PING loop.
+        if (tracked) conn.cc.onPacketSent(@intCast(pkt_len));
         if (has_fin) {
             dbg("io: server FIN PACKET enqueued {} bytes\n", .{pkt_len});
         }
@@ -4572,7 +4636,8 @@ pub const Server = struct {
                 dbg("io: http09 stream_id={} single-chunk FIN sent, slot released\n", .{slot.stream_id});
                 http09UntrackActiveSlot(conn, slot_idx);
                 slot.* = .{};
-                self.drainHttp09Pending(conn);
+                // NB: no drainHttp09Pending here — this runs inside the drain
+                // loop and re-entering would corrupt its swap-remove iteration.
                 return;
             }
             @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
@@ -4584,7 +4649,6 @@ pub const Server = struct {
             slot.active = false;
             http09UntrackActiveSlot(conn, slot_idx);
             dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, slot.fin_pkt_pn });
-            self.drainHttp09Pending(conn);
         }
     }
 
@@ -4603,10 +4667,24 @@ pub const Server = struct {
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
                     if (!conn.has_app_keys) continue;
+                    // Drain congestion-deferred retransmissions first so lost
+                    // data takes priority over fresh responses (RFC 9002 §7).
+                    while (conn.http09_rtx_count > 0 and budget > 0 and
+                        conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp()))
+                    {
+                        conn.http09_rtx_count -= 1;
+                        const e = conn.http09_rtx[conn.http09_rtx_count];
+                        conn.http09_rtx[conn.http09_rtx_count] = .{};
+                        self.sendRawStreamDataInner(conn, e.stream_id, e.offset, e.data, e.fin, e.data);
+                        conn.pacerConsume();
+                        progressed = true;
+                        budget -= 1;
+                    }
                     if (conn.http09_active_list_n > 0) {
                         var i: u16 = 0;
                         while (i < conn.http09_active_list_n and budget > 0) {
                             if (!conn.cc.canSend(congestion.mss)) break;
+                            if (!conn.pacerAllow(compat.milliTimestamp())) break;
                             const slot_idx = conn.http09_active_indices[i];
                             const slot = &conn.http09_slots[slot_idx];
                             if (!slot.active) {
@@ -4614,6 +4692,7 @@ pub const Server = struct {
                                 continue;
                             }
                             self.http09SendNextChunk(conn, slot);
+                            conn.pacerConsume();
                             progressed = true;
                             budget -= 1;
                             if (!slot.active) continue;
@@ -4624,7 +4703,9 @@ pub const Server = struct {
                             if (!slot.active) continue;
                             if (budget == 0) return;
                             if (!conn.cc.canSend(congestion.mss)) break;
+                            if (!conn.pacerAllow(compat.milliTimestamp())) break;
                             self.http09SendNextChunk(conn, slot);
+                            conn.pacerConsume();
                             progressed = true;
                             budget -= 1;
                         }
@@ -4734,6 +4815,12 @@ pub const Server = struct {
                     if (budget == 0) return;
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
+                    // Respect the congestion window and pacer: FIN retransmits
+                    // are data and must not bypass cwnd, otherwise thousands of
+                    // awaiting mux slots produce a ~160 pkt/s storm that
+                    // overflows the NS3 queue (RFC 9002 §7/§7.7).
+                    if (!conn.cc.canSend(congestion.mss)) break;
+                    if (!conn.pacerAllow(now)) break;
 
                     if (slot.fin_retransmit_count >= MAX_FIN_RETRANSMITS) {
                         dbg("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
@@ -4746,6 +4833,7 @@ pub const Server = struct {
                     budget -= 1;
                     dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
+                    conn.pacerConsume();
                 }
             }
         }
@@ -5079,6 +5167,17 @@ pub const Server = struct {
         const max_inline = conn.app_stream_chunk;
         if (file_end > max_inline) return false;
 
+        // Congestion control + pacing (RFC 9002 §7 / §7.7): the immediate path
+        // must respect both the congestion window and the pacer like every other
+        // data send.  Returning false here lets the caller queue the response in
+        // http09_pending, which flushPendingHttp09Responses drains as ACKs open
+        // the window.  Without this gate quinn's ~1000-stream burst is answered
+        // in one unthrottled blast that overflows the NS3 25-packet queue (mass
+        // loss) *and* the 2048-entry loss-detector ring, permanently leaking
+        // bytes_in_flight and wedging the connection into a PING-only PTO loop.
+        if (!conn.cc.canSend(congestion.mss)) return false;
+        if (!conn.pacerAllow(compat.milliTimestamp())) return false;
+
         var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
         const to_read = @min(max_inline, file_buf.len);
         const n = file.read(file_buf[0..to_read]) catch return false;
@@ -5087,10 +5186,29 @@ pub const Server = struct {
         const fc_before = conn.fc_bytes_sent;
         self.sendRawStreamDataInner(conn, stream_id, 0, file_buf[0..n], true, null);
         if (conn.fc_bytes_sent <= fc_before) return false;
+        conn.pacerConsume();
 
         http09MarkResponded(conn, stream_id);
         dbg("io: http09 stream_id={} immediate send n={} (quinn-style)\n", .{ stream_id, n });
-        self.drainHttp09Pending(conn);
+        // NB: do not call drainHttp09Pending here.  http09SendFileImmediate is
+        // itself invoked from inside drainHttp09Pending's loop; re-entering it
+        // would swap-remove entries out from under that loop and silently drop
+        // queued requests.  The paced flush drains the queue.
+        return true;
+    }
+
+    /// Queue a lost immediate-mux STREAM frame for congestion-controlled
+    /// retransmission.  Takes ownership of `data`; returns false (caller frees)
+    /// only if the queue is full.
+    fn http09QueueRtx(conn: *ConnState, stream_id: u64, offset: u64, fin: bool, data: []u8) bool {
+        if (conn.http09_rtx_count >= http09_pending_max) return false;
+        conn.http09_rtx[conn.http09_rtx_count] = .{
+            .stream_id = stream_id,
+            .offset = offset,
+            .fin = fin,
+            .data = data,
+        };
+        conn.http09_rtx_count += 1;
         return true;
     }
 
@@ -5112,6 +5230,11 @@ pub const Server = struct {
     fn drainHttp09Pending(self: *Server, conn: *ConnState) void {
         var i: u16 = 0;
         while (i < conn.http09_pending_count) {
+            // Pace the drain: stop as soon as the congestion window or the
+            // pacer is exhausted so queued responses leave smoothly instead of
+            // as a burst that overruns the bottleneck queue (RFC 9002 §7/§7.7).
+            if (!conn.cc.canSend(congestion.mss)) break;
+            if (!conn.pacerAllow(compat.milliTimestamp())) break;
             const entry = conn.http09_pending[i];
             const path = entry.path[0..entry.path_len];
             if (self.http09SendFileImmediate(conn, entry.stream_id, path)) {
@@ -5123,6 +5246,7 @@ pub const Server = struct {
             }
             if (self.openHttp09OutSlot(conn, entry.stream_id, path)) |slot_idx| {
                 self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
+                conn.pacerConsume();
                 conn.http09_pending_count -= 1;
                 if (i < conn.http09_pending_count) {
                     conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
@@ -5160,27 +5284,27 @@ pub const Server = struct {
     }
 
     fn http09OpenResolvedPath(self: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) bool {
-        // Quinn `serve_hq`: each stream opens the file and copies it to the send
-        // stream in the same task — no slot pool or flush-queue delay.
+        // Quinn `serve_hq`: try a paced immediate send for the single-chunk fast
+        // path.  When the congestion window / pacer is closed (or the file spans
+        // multiple chunks), enqueue the response and let the *paced*
+        // flush/drain replay it — never send a slot chunk inline here, or
+        // quinn's ~1000-request batch turns into an unpaced burst that overruns
+        // the NS3 bottleneck queue.
         if (self.http09SendFileImmediate(conn, stream_id, fs_path)) return true;
-        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
-            self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
-            self.drainHttp09Pending(conn);
-            return true;
-        }
         if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
             self.drainHttp09Pending(conn);
             return true;
         }
-        // Slots and pending may have freed since the first attempt (CC flush).
+        // Pending is full (best effort): drain to free space, then retry.
         self.drainHttp09Pending(conn);
-        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
-            self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
+        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
             self.drainHttp09Pending(conn);
             return true;
         }
-        if (enqueueHttp09Pending(conn, stream_id, fs_path)) {
-            self.drainHttp09Pending(conn);
+        // Last resort when the queue cannot absorb the open: open a slot so the
+        // request is not dropped (rare; the paced flush takes over from here).
+        if (self.openHttp09OutSlot(conn, stream_id, fs_path)) |slot_idx| {
+            self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
             return true;
         }
         dbg("io: http/0.9 open queued failed (stream_id={} pending={})\n", .{ stream_id, conn.http09_pending_count });
@@ -5219,7 +5343,12 @@ pub const Server = struct {
         }
         for (&conn.http09_slots) |*slot| {
             if (slot.active and slot.stream_id == sf.stream_id and slot.stream_offset == 0) {
-                self.http09SendNextChunk(conn, slot);
+                // Only send inline when the window/pacer allow; otherwise the
+                // active slot is drained by the paced flush.
+                if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
+                    self.http09SendNextChunk(conn, slot);
+                    conn.pacerConsume();
+                }
                 return;
             }
         }
@@ -6002,6 +6131,12 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     for (&conn.raw_app_streams) |*slot| {
         slot.deinit(allocator);
     }
+    // Free any congestion-deferred HTTP/0.9 retransmit buffers.
+    for (conn.http09_rtx[0..conn.http09_rtx_count]) |*e| {
+        if (e.data.len > 0) allocator.free(e.data);
+        e.* = .{};
+    }
+    conn.http09_rtx_count = 0;
     // Free any retransmit buffers attached to in-flight LD entries so the
     // raw_application_streams send-side doesn't leak when a connection is
     // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
