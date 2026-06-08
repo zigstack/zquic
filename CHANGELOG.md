@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.10] - 2026-06-08
+
+### Fixed
+
+- **`Client.initInPlace` / `initFromSocketInPlace`.** New in-place initializers for
+  heap-allocated clients (avoids a stack-sized return copy in downstream users
+  like zig-libp2p).  Zero the output struct before populating fields so
+  `initial_pkt_len` and similar state is not left undefined.
+
+### Added
+
+- **`Client.initInPlace` and `Client.initFromSocketInPlace`.** Write connection
+  state directly into caller-owned storage; `init` / `initFromSocket` delegate
+  to these helpers.
+
+---
+
 ## [v1.6.9] - 2026-06-08
 
 ### Fixed

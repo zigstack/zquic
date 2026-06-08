@@ -6366,7 +6366,7 @@ pub const Client = struct {
         }
     }
 
-    pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
+    pub fn initInPlace(allocator: std.mem.Allocator, config: ClientConfig, out: *Client) !void {
         const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         errdefer compat.close(sock);
 
@@ -6381,17 +6381,15 @@ pub const Client = struct {
         const dcid = ConnectionId.random(compat.random, 8);
         const scid = ConnectionId.random(compat.random, 8);
 
-        const tls_client = ClientHandshake.init();
-        var client: Client = .{
-            .allocator = allocator,
-            .config = config,
-            .sock = sock,
-            .tls = tls_client,
-            .conn = .{},
-            .active_urls = config.urls,
-            .owns_socket = true,
-        };
-        configureNewConn(&client.conn, config, dcid, scid);
+        out.* = undefined;
+        @memset(std.mem.asBytes(out), 0);
+        out.allocator = allocator;
+        out.config = config;
+        out.sock = sock;
+        out.tls = ClientHandshake.init();
+        out.active_urls = config.urls;
+        out.owns_socket = true;
+        configureNewConn(&out.conn, config, dcid, scid);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -6410,19 +6408,25 @@ pub const Client = struct {
                 try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
-        client.client_cert_der = client_cert_der;
-        client.client_cert_owned = client_cert_owned;
-        client.client_private_key = client_private_key;
+        out.client_cert_der = client_cert_der;
+        out.client_cert_owned = client_cert_owned;
+        out.client_private_key = client_private_key;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
+        var client: Client = undefined;
+        try initInPlace(allocator, config, &client);
         return client;
     }
 
     /// Build client state around an existing IPv4 UDP socket (e.g. shared with another protocol).
-    pub fn initFromSocket(
+    pub fn initFromSocketInPlace(
         allocator: std.mem.Allocator,
         config: ClientConfig,
         sock: std.posix.socket_t,
         take_ownership: bool,
-    ) !Client {
+        out: *Client,
+    ) !void {
         var sk_buf: i32 = 8 * 1024 * 1024;
         const sk_opt = std.mem.asBytes(&sk_buf);
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
@@ -6434,17 +6438,15 @@ pub const Client = struct {
         const dcid = ConnectionId.random(compat.random, 8);
         const scid = ConnectionId.random(compat.random, 8);
 
-        const tls_client = ClientHandshake.init();
-        var client: Client = .{
-            .allocator = allocator,
-            .config = config,
-            .sock = sock,
-            .tls = tls_client,
-            .conn = .{},
-            .active_urls = config.urls,
-            .owns_socket = take_ownership,
-        };
-        configureNewConn(&client.conn, config, dcid, scid);
+        out.* = undefined;
+        @memset(std.mem.asBytes(out), 0);
+        out.allocator = allocator;
+        out.config = config;
+        out.sock = sock;
+        out.tls = ClientHandshake.init();
+        out.active_urls = config.urls;
+        out.owns_socket = take_ownership;
+        configureNewConn(&out.conn, config, dcid, scid);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -6463,9 +6465,19 @@ pub const Client = struct {
                 try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
-        client.client_cert_der = client_cert_der;
-        client.client_cert_owned = client_cert_owned;
-        client.client_private_key = client_private_key;
+        out.client_cert_der = client_cert_der;
+        out.client_cert_owned = client_cert_owned;
+        out.client_private_key = client_private_key;
+    }
+
+    pub fn initFromSocket(
+        allocator: std.mem.Allocator,
+        config: ClientConfig,
+        sock: std.posix.socket_t,
+        take_ownership: bool,
+    ) !Client {
+        var client: Client = undefined;
+        try initFromSocketInPlace(allocator, config, sock, take_ownership, &client);
         return client;
     }
 
