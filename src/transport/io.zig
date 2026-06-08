@@ -216,18 +216,22 @@ const AppAckTracker = struct {
     /// and the caller should flush an ACK before accepting more PNs.
     fn observe(self: *AppAckTracker, pn: u64) bool {
         if (pn > self.largest) self.largest = pn;
+        if (self.range_count > 0) {
+            for (self.ranges[0..self.range_count]) |*r| {
+                if (pn >= r[0] and pn <= r[1]) return self.range_count >= 48;
+                if (pn + 1 == r[0]) {
+                    r[0] = pn;
+                    return self.range_count >= 48;
+                }
+                if (pn == r[1] + 1) {
+                    r[1] = pn;
+                    return self.range_count >= 48;
+                }
+            }
+        }
         if (self.range_count == 0) {
             self.ranges[0] = .{ pn, pn };
             self.range_count = 1;
-            return self.range_count >= 48;
-        }
-        const last = &self.ranges[self.range_count - 1];
-        if (pn + 1 == last[0]) {
-            last[0] = pn;
-            return self.range_count >= 48;
-        }
-        if (pn == last[1] + 1) {
-            last[1] = pn;
             return self.range_count >= 48;
         }
         if (self.range_count < self.ranges.len) {
@@ -245,12 +249,12 @@ const AppAckTracker = struct {
         for (self.ranges[0..n], 0..) |r, i| {
             sorted[i] = .{ .smallest = r[0], .largest = r[1] };
         }
-        // Sort by largest PN descending (ACK frame wire order).
+        // Sort by smallest PN descending (ACK wire order: highest block first).
         var i: usize = 0;
         while (i < n) : (i += 1) {
             var j: usize = i + 1;
             while (j < n) : (j += 1) {
-                if (sorted[j].largest > sorted[i].largest) {
+                if (sorted[j].smallest > sorted[i].smallest) {
                     const tmp = sorted[i];
                     sorted[i] = sorted[j];
                     sorted[j] = tmp;
