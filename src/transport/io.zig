@@ -6324,23 +6324,17 @@ pub const Client = struct {
     client_cert_owned: bool = false,
     client_private_key: tls_vendor.config.PrivateKey = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
-        const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        errdefer compat.close(sock);
-
-        var sk_buf: i32 = 8 * 1024 * 1024;
-        const sk_opt = std.mem.asBytes(&sk_buf);
-        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
-        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
-        setupEcnSocket(sock);
-        const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
-        try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
-
-        const dcid = ConnectionId.random(compat.random, 8);
-        const scid = ConnectionId.random(compat.random, 8);
-
-        const tls_client = ClientHandshake.init();
-        var conn = ConnState{
+    /// Populate a fresh client `ConnState` in-place.  Mutates `conn` through a
+    /// pointer so `Client.init` does not stack-allocate a second ~MiB
+    /// `ConnState` alongside the returned `Client` (overflows default test-thread
+    /// stacks after the http/0.9 server arrays grew in v1.6.7).
+    fn configureNewConn(
+        conn: *ConnState,
+        config: ClientConfig,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+    ) void {
+        conn.* = .{
             .local_cid = scid,
             .remote_cid = dcid,
             .peer = undefined,
@@ -6364,13 +6358,39 @@ pub const Client = struct {
             // a server Initial that uses QUIC v2 (compatible version negotiation).
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
         }
-        // Open qlog file for this client connection, named after the DCID.
         if (config.qlog_dir) |qd| {
             conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "client");
             var dst_buf: [64]u8 = undefined;
             const dst_str = std.fmt.bufPrint(&dst_buf, "{s}:{}", .{ config.host, config.port }) catch "?";
             conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
         }
+    }
+
+    pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
+        const sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer compat.close(sock);
+
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
+        const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
+        try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
+
+        const dcid = ConnectionId.random(compat.random, 8);
+        const scid = ConnectionId.random(compat.random, 8);
+
+        const tls_client = ClientHandshake.init();
+        var client: Client = .{
+            .allocator = allocator,
+            .config = config,
+            .sock = sock,
+            .tls = tls_client,
+            .active_urls = config.urls,
+            .owns_socket = true,
+        };
+        configureNewConn(&client.conn, config, dcid, scid);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -6389,19 +6409,10 @@ pub const Client = struct {
                 try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
-
-        return .{
-            .allocator = allocator,
-            .config = config,
-            .sock = sock,
-            .tls = tls_client,
-            .conn = conn,
-            .active_urls = config.urls,
-            .owns_socket = true,
-            .client_cert_der = client_cert_der,
-            .client_cert_owned = client_cert_owned,
-            .client_private_key = client_private_key,
-        };
+        client.client_cert_der = client_cert_der;
+        client.client_cert_owned = client_cert_owned;
+        client.client_private_key = client_private_key;
+        return client;
     }
 
     /// Build client state around an existing IPv4 UDP socket (e.g. shared with another protocol).
@@ -6423,31 +6434,15 @@ pub const Client = struct {
         const scid = ConnectionId.random(compat.random, 8);
 
         const tls_client = ClientHandshake.init();
-        var conn = ConnState{
-            .local_cid = scid,
-            .remote_cid = dcid,
-            .peer = undefined,
-            .use_v2 = false,
-            .next_local_uni_stream_id = 2,
-            .next_local_bidi_stream_id = 0,
+        var client: Client = .{
+            .allocator = allocator,
+            .config = config,
+            .sock = sock,
+            .tls = tls_client,
+            .active_urls = config.urls,
+            .owns_socket = take_ownership,
         };
-        if (config.cubic) {
-            conn.cc = congestion.CongestionController.init(.cubic);
-        }
-        const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
-        conn.max_udp_payload = pm.max_udp_payload;
-        conn.app_stream_chunk = pm.app_stream_chunk;
-        conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
-        conn.init_keys = InitialSecrets.derive(dcid.slice());
-        if (config.v2) {
-            conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
-        }
-        if (config.qlog_dir) |qd| {
-            conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "client");
-            var dst_buf: [64]u8 = undefined;
-            const dst_str = std.fmt.bufPrint(&dst_buf, "{s}:{}", .{ config.host, config.port }) catch "?";
-            conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
-        }
+        configureNewConn(&client.conn, config, dcid, scid);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -6466,19 +6461,10 @@ pub const Client = struct {
                 try loadPrivateKey(allocator, config.client_key_path);
             client_cert_owned = true;
         }
-
-        return .{
-            .allocator = allocator,
-            .config = config,
-            .sock = sock,
-            .tls = tls_client,
-            .conn = conn,
-            .active_urls = config.urls,
-            .owns_socket = take_ownership,
-            .client_cert_der = client_cert_der,
-            .client_cert_owned = client_cert_owned,
-            .client_private_key = client_private_key,
-        };
+        client.client_cert_der = client_cert_der;
+        client.client_cert_owned = client_cert_owned;
+        client.client_private_key = client_private_key;
+        return client;
     }
 
     pub fn deinit(self: *Client) void {
