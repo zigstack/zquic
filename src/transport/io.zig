@@ -1513,6 +1513,14 @@ pub const ConnState = struct {
     last_ack_ms: i64 = 0,
     pto_count: u32 = 0,
     last_pto_ms: i64 = 0,
+    /// Wall-clock time we last sent a keepalive PING (independent from
+    /// `last_pto_ms` so a keepalive does not poison PTO backoff math).
+    /// Drives [`Server.checkPto`] / [`Client.checkPto`] keepalive emission
+    /// (RFC 9000 §10.1.2): when our application is receive-only or quiet
+    /// (`bytes_in_flight == 0`) we still need to elicit an ACK every
+    /// `max_idle_timeout / 2`, otherwise the peer's idle timer expires
+    /// silently and rust-libp2p / quic-go surface it as an error close.
+    last_keepalive_ms: i64 = 0,
     goaway_sent: bool = false,
 
     // ── Stateless Reset (RFC 9000 §10.3) ─────────────────────────────────────
@@ -4786,23 +4794,54 @@ pub const Server = struct {
             const conn = if (cslot.*) |*c| c else continue;
             if (!conn.has_app_keys) continue;
             if (conn.draining) continue;
-            // Only probe when there are packets in flight (otherwise there is
-            // nothing to recover and no need to elicit an ACK).
-            if (conn.cc.getBytesInFlight() == 0) continue;
-            // Require at least one ACK to have been received so we have a
-            // meaningful RTT estimate; before that, last_ack_ms == 0.
+
+            // Branch 1: PTO probe (RFC 9002 §6.2). Only when we have unACKed
+            // packets in flight and the smoothed-RTT-derived PTO deadline
+            // has passed since the last ACK we processed.
+            pto_block: {
+                if (conn.cc.getBytesInFlight() == 0) break :pto_block;
+                if (conn.last_ack_ms == 0) break :pto_block;
+                const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count));
+                const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
+                const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
+                if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+                    const ping_frame = [_]u8{0x01};
+                    self.send1Rtt(conn, &ping_frame, conn.peer);
+                    conn.last_pto_ms = now_ms;
+                    conn.pto_count +|= 1;
+                    dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
+                        conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.getBytesInFlight(),
+                    });
+                    continue;
+                }
+            }
+
+            // Branch 2: keepalive PING (RFC 9000 §10.1.2). When we have nothing
+            // in flight to drive PTO but the peer is also quiet, we must elicit
+            // an ACK at least every `max_idle_timeout / 2` so the peer's idle
+            // timer does not silently expire. Without this branch, asymmetric
+            // gossipsub patterns (we mostly receive, the peer mostly sends)
+            // cause rust-libp2p / quic-go to close the connection with an
+            // error-class reason after the idle deadline. The check uses the
+            // effective idle timeout (min of local and peer) and triggers at
+            // half that, leaving a full PTO worth of slack for the ACK to
+            // arrive before the peer would timeout.
             if (conn.last_ack_ms == 0) continue;
-            const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count));
+            const idle_ms_u64: u64 = if (conn.peer_max_idle_timeout_ms == 0)
+                30_000
+            else
+                @min(@as(u64, 30_000), conn.peer_max_idle_timeout_ms);
+            const keepalive_interval_ms: i64 = @intCast(idle_ms_u64 / 2);
             const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
-            const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
-            if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
-                // Send a PING probe bypassing the congestion window.
+            const elapsed_since_keepalive: i64 = now_ms - conn.last_keepalive_ms;
+            if (elapsed_since_ack >= keepalive_interval_ms and
+                elapsed_since_keepalive >= keepalive_interval_ms)
+            {
                 const ping_frame = [_]u8{0x01};
                 self.send1Rtt(conn, &ping_frame, conn.peer);
-                conn.last_pto_ms = now_ms;
-                conn.pto_count +|= 1;
-                dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
-                    conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.getBytesInFlight(),
+                conn.last_keepalive_ms = now_ms;
+                dbg("io: server keepalive PING sent pn={} interval_ms={}\n", .{
+                    conn.app_pn - 1, keepalive_interval_ms,
                 });
             }
         }
@@ -6750,39 +6789,70 @@ pub const Client = struct {
     fn checkPto(self: *Client) void {
         if (self.conn.phase != .connected) return;
         if (self.conn.draining) return;
-        if (self.conn.cc.getBytesInFlight() == 0) return;
-        // Need at least one prior ACK so the RTT estimate is meaningful.
+        // Need at least one prior ACK before either branch runs so the RTT
+        // estimate is meaningful and we have evidence the peer is responsive.
         if (self.conn.last_ack_ms == 0) return;
         const now_ms = compat.milliTimestamp();
-        const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count));
-        const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
-        const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
-        if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
-            // PING frame (RFC 9000 §19.2): single byte 0x01.  Wrapped in a
-            // 1-RTT packet using the same path sendRawStreamDataInner uses,
-            // bypassing the congestion window because a probe must go out
-            // regardless of cc state (RFC 9002 §6.2).
-            const ping_frame = [_]u8{0x01};
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                &ping_frame,
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.packet_cipher,
-            ) catch return;
-            const pn = self.conn.app_pn;
-            self.conn.app_pn += 1;
-            self.conn.note1RttSent();
-            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return;
-            self.conn.last_pto_ms = now_ms;
-            self.conn.pto_count +|= 1;
-            dbg("io: client PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
-                pn, self.conn.pto_count, pto_delay, self.conn.cc.getBytesInFlight(),
-            });
+
+        // Branch 1: PTO probe (RFC 9002 §6.2). Only when we have unACKed
+        // bytes in flight; otherwise there is nothing to recover.
+        if (self.conn.cc.getBytesInFlight() > 0) {
+            const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count));
+            const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
+            const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
+            if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+                if (self.sendOnePingFrame()) {
+                    self.conn.last_pto_ms = now_ms;
+                    self.conn.pto_count +|= 1;
+                    dbg("io: client PTO probe sent pto_count={} pto_delay={}ms bif={}\n", .{
+                        self.conn.pto_count, pto_delay, self.conn.cc.getBytesInFlight(),
+                    });
+                }
+                return;
+            }
         }
+
+        // Branch 2: keepalive PING (RFC 9000 §10.1.2). Even when nothing is
+        // in flight, send a PING every `max_idle_timeout / 2` so the peer's
+        // idle timer keeps refreshing. Without this, asymmetric gossipsub
+        // patterns (we mostly receive) cause rust-libp2p / quic-go to close
+        // the connection with an error-class reason after the idle deadline.
+        const idle_ms_u64: u64 = if (self.conn.peer_max_idle_timeout_ms == 0)
+            30_000
+        else
+            @min(@as(u64, 30_000), self.conn.peer_max_idle_timeout_ms);
+        const keepalive_interval_ms: i64 = @intCast(idle_ms_u64 / 2);
+        const elapsed_since_ack: i64 = now_ms - self.conn.last_ack_ms;
+        const elapsed_since_keepalive: i64 = now_ms - self.conn.last_keepalive_ms;
+        if (elapsed_since_ack >= keepalive_interval_ms and
+            elapsed_since_keepalive >= keepalive_interval_ms)
+        {
+            if (self.sendOnePingFrame()) {
+                self.conn.last_keepalive_ms = now_ms;
+                dbg("io: client keepalive PING sent interval_ms={}\n", .{keepalive_interval_ms});
+            }
+        }
+    }
+
+    /// Send a single PING frame in a fresh 1-RTT packet, bypassing the
+    /// congestion window. Returns false if packet build or `sendto` fails.
+    /// Shared between PTO probe and idle keepalive (RFC 9000 §10.1.2).
+    fn sendOnePingFrame(self: *Client) bool {
+        const ping_frame = [_]u8{0x01};
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            &ping_frame,
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return false;
+        self.conn.app_pn += 1;
+        self.conn.note1RttSent();
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return false;
+        return true;
     }
 
     /// Opaque receive buffer for an inbound raw-application stream on a **client**.

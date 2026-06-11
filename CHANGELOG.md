@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.17] - 2026-06-11
+
+### Fixed
+
+- **Idle-timeout keepalive PINGs (RFC 9000 §10.1.2).** `checkPto` only sent
+  PING probes when `bytes_in_flight > 0`. When the application was quiet or
+  receive-only (e.g. zeam's gossipsub QUIC connection while ethlambda is the
+  busy publisher between zeam slots), no ACK-eliciting packet went out for
+  the full `peer_max_idle_timeout` window, so the peer's idle timer expired
+  silently and rust-libp2p / quic-go closed the connection with an
+  error-class reason. Now both `Server.checkPto` and `Client.checkPto` emit a
+  PING every `min(local, peer) max_idle_timeout / 2` independently of
+  `bytes_in_flight`. PTO and keepalive use separate bookkeeping
+  (`last_pto_ms` vs new `last_keepalive_ms`) so a keepalive does not poison
+  PTO backoff.
+
+---
+
 ## [v1.6.15] - 2026-06-08
 
 ### Fixed
