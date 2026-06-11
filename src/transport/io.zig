@@ -6806,14 +6806,67 @@ pub const Client = struct {
     }
 
     /// Send one raw STREAM frame on 1-RTT (embedder tracks per-stream offsets).
+    /// Returns the number of payload bytes accepted (0 when rejected so the
+    /// embedder must not advance its send offset).
     pub fn sendRawStreamData(
         self: *Client,
         stream_id: u64,
         offset: u64,
         data: []const u8,
         fin: bool,
-    ) void {
-        self.sendRawStreamDataInner(stream_id, offset, data, fin, null);
+    ) usize {
+        return self.sendRawStreamDataInner(stream_id, offset, data, fin, null);
+    }
+
+    /// Send one ack-eliciting 1-RTT packet with `payload` frames.  Updates
+    /// LD+CC like `Server.send1Rtt`.  Returns the packet number sent, or
+    /// null if not connected or wire I/O fails.
+    fn sendClient1Rtt(self: *Client, payload: []const u8) ?u64 {
+        if (self.conn.phase != .connected or !self.conn.has_app_keys) return null;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            payload,
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.packet_cipher,
+        ) catch return null;
+        const pn = self.conn.app_pn;
+        self.conn.app_pn += 1;
+        self.conn.note1RttSent();
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return null;
+        const tracked = self.conn.ld.onPacketSent(.{
+            .pn = pn,
+            .send_time_ms = @intCast(compat.milliTimestamp()),
+            .size = pkt_len,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+        if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
+        return pn;
+    }
+
+    /// Enqueue a fresh stream send when flow-control or congestion blocks the
+    /// wire path.  Returns bytes accepted (data.len) or 0 on queue overflow.
+    fn clientEnqueueFreshStream(
+        self: *Client,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) usize {
+        if (!enqueuePendingStreamSend(&self.conn, self.allocator, stream_id, offset, data, fin)) {
+            log.warn("io: client pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; marking conn draining to force redial\n", .{
+                self.conn.pending_stream_sends.items.len, self.conn.pending_stream_send_bytes, stream_id,
+            });
+            self.conn.draining = true;
+            const pto: u64 = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);
+            self.conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
+            return 0;
+        }
+        return data.len;
     }
 
     /// Internal: optionally adopt `owned_buf` (already heap-allocated by an
@@ -6828,10 +6881,10 @@ pub const Client = struct {
         data: []const u8,
         fin: bool,
         owned_buf: ?[]u8,
-    ) void {
+    ) usize {
         if (self.conn.phase != .connected or !self.conn.has_app_keys) {
             if (owned_buf) |b| self.allocator.free(b);
-            return;
+            return 0;
         }
         // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Mirror
         // of Server.sendRawStreamDataInner.  Retransmits (owned_buf set)
@@ -6857,21 +6910,10 @@ pub const Client = struct {
                     });
                     var blk_buf: [24]u8 = undefined;
                     blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
-                    const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return;
-                    const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return;
+                    const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return 0;
+                    const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return 0;
                     const blk_frame = blk_buf[0 .. 1 + sid_enc.len + lim_enc.len];
-                    var send_blk: [MAX_DATAGRAM_SIZE]u8 = undefined;
-                    const blk_pkt_len = build1RttPacketFull(
-                        &send_blk,
-                        self.conn.remote_cid,
-                        blk_frame,
-                        self.conn.app_pn,
-                        &self.conn.app_client_km,
-                        self.conn.key_phase_bit,
-                        self.conn.packet_cipher,
-                    ) catch return;
-                    self.conn.app_pn += 1;
-                    _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                    _ = self.sendClient1Rtt(blk_frame);
                 }
                 if (exceeds_conn) {
                     dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — enqueueing pending + DATA_BLOCKED\n", .{
@@ -6879,29 +6921,16 @@ pub const Client = struct {
                     });
                     var blk_buf: [16]u8 = undefined;
                     blk_buf[0] = 0x14;
-                    const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return;
-                    var send_blk: [MAX_DATAGRAM_SIZE]u8 = undefined;
-                    const blk_pkt_len = build1RttPacketFull(
-                        &send_blk,
-                        self.conn.remote_cid,
-                        blk_buf[0 .. 1 + enc.len],
-                        self.conn.app_pn,
-                        &self.conn.app_client_km,
-                        self.conn.key_phase_bit,
-                        self.conn.packet_cipher,
-                    ) catch return;
-                    self.conn.app_pn += 1;
-                    _ = compat.sendto(self.sock, send_blk[0..blk_pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                    const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return 0;
+                    _ = self.sendClient1Rtt(blk_buf[0 .. 1 + enc.len]);
                 }
-                if (!enqueuePendingStreamSend(&self.conn, self.allocator, stream_id, offset, data, fin)) {
-                    log.warn("io: client pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; marking conn draining to force redial\n", .{
-                        self.conn.pending_stream_sends.items.len, self.conn.pending_stream_send_bytes, stream_id,
-                    });
-                    self.conn.draining = true;
-                    const pto: u64 = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);
-                    self.conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
-                }
-                return;
+                return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+            }
+            // Congestion + pacer gate (mirrors Server.sendRawStreamDataInner).
+            if (!self.conn.cc.canSend(congestion.mss) or
+                !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
+            {
+                return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
             }
         }
         const sf = stream_frame_mod.StreamFrame{
@@ -6914,7 +6943,7 @@ pub const Client = struct {
         var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const flen = sf.serialize(&frame_buf) catch {
             if (owned_buf) |b| self.allocator.free(b);
-            return;
+            return 0;
         };
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
@@ -6927,18 +6956,21 @@ pub const Client = struct {
             self.conn.packet_cipher,
         ) catch {
             if (owned_buf) |b| self.allocator.free(b);
-            return;
+            return 0;
         };
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
-        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {
+            if (owned_buf) |b| self.allocator.free(b);
+            return 0;
+        };
         // Charge fresh-send bytes against the connection-level limit.
         if (is_fresh) self.conn.fc_bytes_sent +|= data.len;
 
         // Track for retransmit.  See Server.sendRawStreamDataInner for the
         // ownership-transfer protocol; the Client mirrors it.
         const buf = owned_buf orelse blk: {
-            const dup = self.allocator.dupe(u8, data) catch return;
+            const dup = self.allocator.dupe(u8, data) catch return 0;
             break :blk dup;
         };
         self.conn.note1RttSent();
@@ -6959,12 +6991,16 @@ pub const Client = struct {
         // branch 1 (cc.getBytesInFlight() > 0) never fires, tail losses on
         // the outbound client path are not PTO-probed, and quinn peers wedge
         // on undelivered gossip STREAM frames.
-        if (recorded) self.conn.cc.onPacketSent(@intCast(pkt_len));
+        if (recorded) {
+            self.conn.cc.onPacketSent(@intCast(pkt_len));
+            if (is_fresh) self.conn.pacerConsume();
+        }
         if (!recorded) {
             // LD full — caller's data has already gone on the wire; we just
             // can't retransmit it on loss.  Free the buffer to avoid the leak.
             self.allocator.free(buf);
         }
+        return data.len;
     }
 
     /// Try to put queued raw STREAM bytes (`pending_stream_sends`) on the
@@ -6987,6 +7023,11 @@ pub const Client = struct {
             if (projected > self.conn.fc_send_max) {
                 i += 1;
                 continue;
+            }
+            if (!self.conn.cc.canSend(congestion.mss) or
+                !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
+            {
+                return;
             }
             const stream_id = p.stream_id;
             const offset = p.offset;
@@ -7037,7 +7078,10 @@ pub const Client = struct {
                 .stream_data = buf,
                 .stream_fin = fin,
             });
-            if (recorded) self.conn.cc.onPacketSent(@intCast(pkt_len));
+            if (recorded) {
+                self.conn.cc.onPacketSent(@intCast(pkt_len));
+                self.conn.pacerConsume();
+            }
             if (!recorded) self.allocator.free(buf);
             // `orderedRemove` slid the tail down by one; next entry is at the same index.
         }
@@ -7057,19 +7101,7 @@ pub const Client = struct {
         if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
         const pn = self.conn.app_pn;
         self.conn.plpmtu.beginProbe(probe_size, pn, now_ms);
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacketFull(
-            &send_buf,
-            self.conn.remote_cid,
-            probe_buf[0..target_payload],
-            pn,
-            &self.conn.app_client_km,
-            self.conn.key_phase_bit,
-            self.conn.packet_cipher,
-        ) catch return;
-        self.conn.app_pn += 1;
-        self.conn.note1RttSent();
-        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        _ = self.sendClient1Rtt(probe_buf[0..target_payload]);
     }
 
     fn maybeAutoKeyUpdate(self: *Client) void {
@@ -7181,31 +7213,7 @@ pub const Client = struct {
     /// Shared between PTO probe and idle keepalive (RFC 9000 §10.1.2).
     fn sendOnePingFrame(self: *Client) bool {
         const ping_frame = [_]u8{0x01};
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacketFull(
-            &send_buf,
-            self.conn.remote_cid,
-            &ping_frame,
-            self.conn.app_pn,
-            &self.conn.app_client_km,
-            self.conn.key_phase_bit,
-            self.conn.packet_cipher,
-        ) catch return false;
-        const pn = self.conn.app_pn;
-        self.conn.app_pn += 1;
-        self.conn.note1RttSent();
-        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return false;
-        // Mirror Server.checkPto → send1Rtt: PTO/keepalive PINGs must be
-        // tracked so branch-1 probes can elicit ACKs that unblock tail loss.
-        const tracked = self.conn.ld.onPacketSent(.{
-            .pn = pn,
-            .send_time_ms = @intCast(compat.milliTimestamp()),
-            .size = pkt_len,
-            .ack_eliciting = true,
-            .in_flight = true,
-        });
-        if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
-        return true;
+        return self.sendClient1Rtt(&ping_frame) != null;
     }
 
     /// Opaque receive buffer for an inbound raw-application stream on a **client**.
@@ -8308,7 +8316,7 @@ pub const Client = struct {
                     }
                     self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
-                        self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
+                        _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
                         // ownership transferred into the new SentPacket.
                     }
                 }
