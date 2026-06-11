@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.6.18] - 2026-06-11
+
+### Fixed
+
+- **Connection-lost declaration when CONNECTION_CLOSE is dropped (RFC 9002 §6.2,
+  RFC 9000 §10.2).** v1.6.17's keepalive PING refreshes the peer's idle timer
+  while ACKs flow, but offers no recovery when the path itself fails:
+  if every probe and keepalive is dropped (kernel UDP buffer overflow, NAT
+  rebind, peer crash) the `draining` flag only ever flips on receipt of a
+  CONNECTION_CLOSE frame — which by definition cannot arrive in those
+  conditions. Result: zig-libp2p's `detectOutboundConnectionClose` never
+  fires, the dead slot lingers, and the application keeps publishing into
+  the void. `checkPto` now adds a third branch on both `Server` and
+  `Client`: if the peer has not ACK'd anything for `2 ×
+  effective_max_idle_timeout` (60 s with the 30 s default), the connection
+  is declared lost — `draining = true` is set and the standard `3 × PTO`
+  draining deadline is armed so the application layer can evict and redial.
+
+---
+
 ## [v1.6.17] - 2026-06-11
 
 ### Fixed
