@@ -153,7 +153,53 @@ pub const TransportParamsOpts = struct {
     /// `preferred_address` (0x0d): server-only; alternate address + CID + reset
     /// token for active migration (RFC 9000 §9.6 / §18.2).
     preferred_address: ?PreferredAddressTp = null,
+    /// `initial_max_data` (0x04): connection-level flow-control window.
+    initial_max_data: u64 = 67_108_864,
+    /// `initial_max_stream_data_bidi_local` (0x05).
+    initial_max_stream_data_bidi_local: u64 = 16_777_216,
+    /// `initial_max_stream_data_bidi_remote` (0x06).
+    initial_max_stream_data_bidi_remote: u64 = 16_777_216,
+    /// `initial_max_stream_data_uni` (0x07).
+    initial_max_stream_data_uni: u64 = 16_777_216,
+    /// `initial_max_streams_bidi` (0x08).
+    initial_max_streams_bidi: u64 = 1000,
+    /// `initial_max_streams_uni` (0x09).
+    initial_max_streams_uni: u64 = 1000,
 };
+
+/// Preset transport-parameter profiles for common embedders.
+pub const TransportParamsPreset = enum {
+    /// zquic defaults (64 MiB conn / 16 MiB stream / 1000 streams).
+    default,
+    /// Match `libp2p-quic` / quinn defaults used by rust-libp2p.
+    libp2p,
+};
+
+/// Build [`TransportParamsOpts`] for `preset`, filling libp2p-quic-aligned limits when requested.
+pub fn transportParamsForPreset(
+    preset: TransportParamsPreset,
+    initial_source_cid: []const u8,
+    max_udp_payload_size: u64,
+) TransportParamsOpts {
+    var opts = TransportParamsOpts{
+        .initial_source_cid = initial_source_cid,
+        .max_udp_payload_size = max_udp_payload_size,
+    };
+    switch (preset) {
+        .default => {},
+        .libp2p => {
+            // libp2p-quic Config::new defaults (quinn stream_receive_window = 10 MiB,
+            // receive_window = 15 MiB, max_concurrent_bidi_streams = 256).
+            opts.initial_max_data = 15_000_000;
+            opts.initial_max_stream_data_bidi_local = 10_000_000;
+            opts.initial_max_stream_data_bidi_remote = 10_000_000;
+            opts.initial_max_stream_data_uni = 10_000_000;
+            opts.initial_max_streams_bidi = 256;
+            opts.initial_max_streams_uni = 0;
+        },
+    }
+    return opts;
+}
 
 fn writeParamVarint(
     buf: []u8,
@@ -217,13 +263,12 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     var pos: usize = 0;
 
     pos = try writeParamVarint(out, pos, 0x01, 30_000); // max_idle_timeout
-    pos = try writeParamVarint(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
-    pos = try writeParamVarint(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
-    pos = try writeParamVarint(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
-    pos = try writeParamVarint(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
-    // Stay at <=1000 so quic-interop-runner's multiplexing test still passes.
-    pos = try writeParamVarint(out, pos, 0x08, 1000); // initial_max_streams_bidi
-    pos = try writeParamVarint(out, pos, 0x09, 1000); // initial_max_streams_uni
+    pos = try writeParamVarint(out, pos, 0x04, opts.initial_max_data);
+    pos = try writeParamVarint(out, pos, 0x05, opts.initial_max_stream_data_bidi_local);
+    pos = try writeParamVarint(out, pos, 0x06, opts.initial_max_stream_data_bidi_remote);
+    pos = try writeParamVarint(out, pos, 0x07, opts.initial_max_stream_data_uni);
+    pos = try writeParamVarint(out, pos, 0x08, opts.initial_max_streams_bidi);
+    pos = try writeParamVarint(out, pos, 0x09, opts.initial_max_streams_uni);
     // ack_delay_exponent (0x0a): we encode ACK Delay with the §18.2 default
     // exponent of 3, so advertise 3 explicitly. Without this the peer
     // assumes 3 anyway, but quinn double-checks the value when present.

@@ -2038,6 +2038,8 @@ pub const ServerConfig = struct {
     max_udp_payload: ?u16 = null,
     /// Optional preferred address to advertise in transport parameters (TP 0x0d).
     preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
+    /// QUIC transport-parameter profile advertised during the TLS handshake.
+    transport_params_preset: quic_tls_mod.TransportParamsPreset = .default,
 };
 
 /// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
@@ -3194,17 +3196,15 @@ pub const Server = struct {
             conn.stateless_reset_token_set = true;
         }
         var tp_buf: [512]u8 = undefined;
-        const tp_len = quic_tls_mod.buildTransportParams(&tp_buf, .{
-            .initial_source_cid = conn.local_cid.slice(),
-            .original_destination_cid = odcid,
-            .stateless_reset_token = conn.stateless_reset_token,
-            // Advertise our actual receive-side UDP payload limit so the
-            // peer doesn't oversize datagrams (RFC 9000 §18.2). When the
-            // server doesn't actively migrate, the param is omitted (we
-            // still accept incoming migration if the peer initiates).
-            .max_udp_payload_size = conn.max_udp_payload,
-            .preferred_address = self.config.preferred_address,
-        }) catch |err| {
+        var tp_opts = quic_tls_mod.transportParamsForPreset(
+            self.config.transport_params_preset,
+            conn.local_cid.slice(),
+            conn.max_udp_payload,
+        );
+        tp_opts.original_destination_cid = odcid;
+        tp_opts.stateless_reset_token = conn.stateless_reset_token;
+        tp_opts.preferred_address = self.config.preferred_address;
+        const tp_len = quic_tls_mod.buildTransportParams(&tp_buf, tp_opts) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
         };
@@ -4874,6 +4874,10 @@ pub const Server = struct {
     /// RFC 9000 §10.2.3: after sending CONNECTION_CLOSE the endpoint enters the
     /// draining state and MUST NOT send any further packets except for additional
     /// CONNECTION_CLOSE copies to handle packet loss.
+    pub fn closeConnection(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8) void {
+        self.sendConnectionClose(conn, error_code, reason, conn.peer);
+    }
+
     fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: compat.Address) void {
         var buf: [256]u8 = undefined;
         const payload = prepareTransportConnectionClose(conn, error_code, reason, &buf) orelse return;
@@ -6134,6 +6138,8 @@ pub const ClientConfig = struct {
     /// In-memory PEM client private key. Same precedence/lifetime semantics
     /// as `client_cert_pem`.
     client_key_pem: ?[]const u8 = null,
+    /// QUIC transport-parameter profile advertised during the TLS handshake.
+    transport_params_preset: quic_tls_mod.TransportParamsPreset = .default,
 };
 
 /// TLS ALPN value for `ClientConfig`.
@@ -7154,6 +7160,7 @@ pub const Client = struct {
                 self.conn.local_cid.slice(),
                 // Omit max_udp_payload_size — peer assumes RFC §18.2 default (65527).
                 0,
+                self.config.transport_params_preset,
             );
 
             // Choose ClientHello variant based on flags.
@@ -8105,6 +8112,10 @@ pub const Client = struct {
     }
 
     /// Send a CONNECTION_CLOSE frame (QUIC layer, type 0x1c) and enter draining.
+    pub fn closeConnection(self: *Client, error_code: u64, reason: []const u8) void {
+        self.sendConnectionClose(error_code, reason);
+    }
+
     fn sendConnectionClose(self: *Client, error_code: u64, reason: []const u8) void {
         var buf: [256]u8 = undefined;
         const payload = prepareTransportConnectionClose(&self.conn, error_code, reason, &buf) orelse return;
@@ -8987,14 +8998,10 @@ fn buildEndpointTransportParams(
     buf: []u8,
     initial_source_cid: []const u8,
     max_udp_payload_size: u64,
+    preset: quic_tls_mod.TransportParamsPreset,
 ) (varint.EncodeError || varint.DecodeError)![]const u8 {
-    const n = try quic_tls_mod.buildTransportParams(buf, .{
-        .initial_source_cid = initial_source_cid,
-        // Advertise our actual receive-side UDP payload limit so the server
-        // doesn't oversize datagrams (RFC 9000 §18.2). Pass-through 0 means
-        // omit (peer assumes the §18.2 default of 65527).
-        .max_udp_payload_size = max_udp_payload_size,
-    });
+    const opts = quic_tls_mod.transportParamsForPreset(preset, initial_source_cid, max_udp_payload_size);
+    const n = try quic_tls_mod.buildTransportParams(buf, opts);
     return buf[0..n];
 }
 
