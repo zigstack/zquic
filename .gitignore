@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+zig-pkg/
 interop-results*/
 local-interop-results/
 zquic-interop-image/

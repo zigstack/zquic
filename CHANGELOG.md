@@ -11,6 +11,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.7.0] - 2026-06-11
+
+### Fixed
+
+- **Stop silently dropping flow-control-blocked raw STREAM bytes (RFC 9000
+  §4, §19.9, §19.13).** When the peer's per-stream (`peer_initial_max_stream_data_*`
+  / MAX_STREAM_DATA) or connection-level (`peer_initial_max_data` / MAX_DATA)
+  receive window was exhausted, both `Server.sendRawStreamData` and
+  `Client.sendRawStreamData` used to emit a STREAM_DATA_BLOCKED / DATA_BLOCKED
+  frame and then **silently discard the application's bytes**. The embedder
+  has no return value to inspect and the writer adapter advances its own
+  `send_offset` unconditionally, so any flow-control hit left a permanent
+  hole in the QUIC stream: the receiver could not parse messages past
+  that gap, never read the bytes, never issued MAX_STREAM_DATA, and the
+  connection eventually idle-closed with `reason=error`. This was the
+  root cause of the zeam ↔ ethlambda gossipsub wedge described in the
+  zig-libp2p v0.1.43 changelog. The previous fixes (zquic v1.6.17
+  keepalive PINGs, v1.6.18 connection-lost detection, zig-libp2p
+  v0.1.43 app-layer gossip keepalive) all addressed downstream
+  symptoms of the silent drop.
+
+  Each `ConnState` now owns a `pending_stream_sends` queue (capped at
+  1024 entries / 8 MB per connection). On gate failure the bytes are
+  duplicated onto the heap and enqueued instead of dropped, and the
+  STREAM_DATA_BLOCKED / DATA_BLOCKED frame is still emitted so the peer
+  knows to issue credit. `Server.drainPendingStreamSends` /
+  `Client.drainPendingStreamSends` walk the queue and put entries on
+  the wire whenever credit allows; ownership of the buffer transfers
+  into the loss detector so the bytes are retransmittable. Drain is
+  invoked from the MAX_DATA / MAX_STREAM_DATA frame handlers and as a
+  safety net on every `checkPto` tick. On queue overflow the connection
+  is marked `draining` so the embedder reconnects rather than punching
+  a hole in the stream.
+
+  Three new unit tests pin the enqueue ordering, the per-entry cap, and
+  the per-byte cap.
+
+---
+
 ## [v1.6.18] - 2026-06-11
 
 ### Fixed
