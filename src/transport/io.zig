@@ -6941,6 +6941,7 @@ pub const Client = struct {
             const dup = self.allocator.dupe(u8, data) catch return;
             break :blk dup;
         };
+        self.conn.note1RttSent();
         const recorded = self.conn.ld.onPacketSent(.{
             .pn = pn,
             .send_time_ms = @intCast(compat.milliTimestamp()),
@@ -6953,6 +6954,12 @@ pub const Client = struct {
             .stream_data = buf,
             .stream_fin = fin,
         });
+        // Mirror Server.send1Rtt: only count toward bytes_in_flight when the
+        // loss detector is tracking the packet.  Without this, checkPto
+        // branch 1 (cc.getBytesInFlight() > 0) never fires, tail losses on
+        // the outbound client path are not PTO-probed, and quinn peers wedge
+        // on undelivered gossip STREAM frames.
+        if (recorded) self.conn.cc.onPacketSent(@intCast(pkt_len));
         if (!recorded) {
             // LD full — caller's data has already gone on the wire; we just
             // can't retransmit it on loss.  Free the buffer to avoid the leak.
@@ -7017,6 +7024,7 @@ pub const Client = struct {
             self.conn.app_pn += 1;
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
             self.conn.fc_bytes_sent +|= buf.len;
+            self.conn.note1RttSent();
             const recorded = self.conn.ld.onPacketSent(.{
                 .pn = pn,
                 .send_time_ms = @intCast(compat.milliTimestamp()),
@@ -7029,6 +7037,7 @@ pub const Client = struct {
                 .stream_data = buf,
                 .stream_fin = fin,
             });
+            if (recorded) self.conn.cc.onPacketSent(@intCast(pkt_len));
             if (!recorded) self.allocator.free(buf);
             // `orderedRemove` slid the tail down by one; next entry is at the same index.
         }
@@ -7182,9 +7191,20 @@ pub const Client = struct {
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
         ) catch return false;
+        const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
         self.conn.note1RttSent();
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return false;
+        // Mirror Server.checkPto → send1Rtt: PTO/keepalive PINGs must be
+        // tracked so branch-1 probes can elicit ACKs that unblock tail loss.
+        const tracked = self.conn.ld.onPacketSent(.{
+            .pn = pn,
+            .send_time_ms = @intCast(compat.milliTimestamp()),
+            .size = pkt_len,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+        if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
         return true;
     }
 
@@ -9894,4 +9914,25 @@ test "localCidCount: seq 0 plus pool entries" {
     const tok: [16]u8 = .{0} ** 16;
     _ = conn.cidPoolReserve(cid, tok);
     try std.testing.expectEqual(@as(u64, 2), conn.localCidCount());
+}
+
+test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
+    var conn = makeConnForStreamTest();
+    const pkt_len: usize = 1200;
+    const pn: u64 = 7;
+    const recorded = conn.ld.onPacketSent(.{
+        .pn = pn,
+        .send_time_ms = 0,
+        .size = pkt_len,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    if (recorded) conn.cc.onPacketSent(@intCast(pkt_len));
+    try std.testing.expect(recorded);
+    try std.testing.expectEqual(@as(u64, @intCast(pkt_len)), conn.cc.getBytesInFlight());
+
+    var lost_buf: [8]recovery.SentPacket = undefined;
+    const ld_result = try conn.ld.onAck(pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
+    if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked);
+    try std.testing.expectEqual(@as(u64, 0), conn.cc.getBytesInFlight());
 }
