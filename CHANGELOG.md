@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Client outbound 1-RTT sends now update congestion-control `bytes_in_flight`.**
+  `Client.sendRawStreamDataInner`, `Client.drainPendingStreamSends`, and
+  `Client.sendOnePingFrame` recorded packets in the loss detector but never
+  called `cc.onPacketSent`, unlike the symmetric `Server.send1Rtt` path.
+  `checkPto` branch 1 only probes when `cc.getBytesInFlight() > 0`, so tail
+  losses on the outbound client path (zeam → quinn) were never PTO-recovered;
+  gossip STREAM frames stalled, keepalive PINGs continued with advancing PNs,
+  and the quinn peer eventually logged mass `decryption failed` before
+  `ConnectionError(TimedOut)`.
+
 ---
 
 ## [v1.7.0] - 2026-06-11
