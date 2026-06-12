@@ -966,9 +966,9 @@ const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
-/// Returns false when the per-connection caps are exhausted; the caller
-/// must then mark the connection draining (the alternative — silently
-/// dropping — corrupts stream offsets).
+/// Returns false when the per-connection caps are exhausted; callers must
+/// surface backpressure (return 0 / do not advance embedder offsets) rather
+/// than silently dropping or tearing down the connection.
 fn enqueuePendingStreamSend(
     conn: *ConnState,
     allocator: std.mem.Allocator,
@@ -977,6 +977,11 @@ fn enqueuePendingStreamSend(
     data: []const u8,
     fin: bool,
 ) bool {
+    // Embedder may retry the same offset after a backpressure 0; treat as
+    // already accepted so we do not fill the queue with duplicate copies.
+    for (conn.pending_stream_sends.items) |e| {
+        if (e.stream_id == stream_id and e.offset == offset) return true;
+    }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
     if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
     const dup = allocator.dupe(u8, data) catch return false;
@@ -1000,6 +1005,15 @@ fn freePendingStreamSends(conn: *ConnState, allocator: std.mem.Allocator) void {
     conn.pending_stream_sends.deinit(allocator);
     conn.pending_stream_sends = .empty;
     conn.pending_stream_send_bytes = 0;
+}
+
+fn warnPendingStreamSendQueueFull(conn: *ConnState, stream_id: u64, side: []const u8) void {
+    const now = compat.milliTimestamp();
+    if (now - conn.pending_stream_send_queue_full_warn_ms < 5000) return;
+    conn.pending_stream_send_queue_full_warn_ms = now;
+    log.warn("io: {s} pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; returning backpressure to embedder\n", .{
+        side, conn.pending_stream_sends.items.len, conn.pending_stream_send_bytes, stream_id,
+    });
 }
 
 /// Inbound HTTP/0.9 request bytes accumulated until FIN (quinn splits some GETs).
@@ -1378,6 +1392,8 @@ pub const ConnState = struct {
     /// `checkPto` tick as a safety net.
     pending_stream_sends: std.ArrayList(PendingStreamSend) = .empty,
     pending_stream_send_bytes: usize = 0,
+    /// Rate-limit `pending-stream-send queue full` warnings (ms).
+    pending_stream_send_queue_full_warn_ms: i64 = 0,
     /// Partial HTTP/0.9 requests reassembled until FIN.
     http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
     /// Number of currently active HTTP/3 response slots.
@@ -2397,13 +2413,9 @@ pub const Server = struct {
                 // here used to leave a permanent hole in the stream
                 // because the embedder advances its own send_offset
                 // unconditionally (see quic_raw_stream_io.zig).
+                self.drainPendingStreamSends(conn);
                 if (!enqueuePendingStreamSend(conn, self.allocator, stream_id, offset, data, fin)) {
-                    log.warn("io: server pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; marking conn draining to force redial\n", .{
-                        conn.pending_stream_sends.items.len, conn.pending_stream_send_bytes, stream_id,
-                    });
-                    conn.draining = true;
-                    const pto: u64 = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
-                    conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
+                    warnPendingStreamSendQueueFull(conn, stream_id, "server");
                 }
                 return;
             }
@@ -6790,6 +6802,9 @@ pub const Client = struct {
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
     pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
         const now = compat.milliTimestamp();
+        // Mirror Server.processPendingWork: drain deferred STREAM bytes and
+        // run PTO/keepalive while the embedder recv loop is idle.
+        self.checkPto();
         self.maybeSendPlpmtuProbe();
         self.maybeAutoKeyUpdate();
         if (self.conn.phase == .initial and self.initial_pkt_len > 0 and
@@ -6857,13 +6872,9 @@ pub const Client = struct {
         data: []const u8,
         fin: bool,
     ) usize {
+        self.drainPendingStreamSends();
         if (!enqueuePendingStreamSend(&self.conn, self.allocator, stream_id, offset, data, fin)) {
-            log.warn("io: client pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; marking conn draining to force redial\n", .{
-                self.conn.pending_stream_sends.items.len, self.conn.pending_stream_send_bytes, stream_id,
-            });
-            self.conn.draining = true;
-            const pto: u64 = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);
-            self.conn.draining_deadline_ms = compat.milliTimestamp() + @as(i64, @intCast(3 * pto));
+            warnPendingStreamSendQueueFull(&self.conn, stream_id, "client");
             return 0;
         }
         return data.len;

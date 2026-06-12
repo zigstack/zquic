@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.3] - 2026-06-12
+
+### Fixed
+
+- **Pending STREAM queue backpressure without redial thrashing.** When the
+  per-connection `pending_stream_sends` cap is hit, return backpressure to
+  the embedder instead of marking the connection draining (which caused a
+  zeam→quinn redial/log storm). Deduplicate enqueue by `(stream_id, offset)`
+  so embedder retries do not multiply queue entries. Drain deferred bytes
+  before enqueue and run `Client.checkPto` from `processPendingWork` so
+  CC-blocked gossip can drain while the recv loop is idle.
+
 ## [v1.7.2] - 2026-06-11
 
 ### Fixed
