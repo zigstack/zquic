@@ -1971,15 +1971,34 @@ pub const ConnState = struct {
     /// credit check so multiple gating probes in one event-loop tick do not
     /// advance `pacing_last_ms` without elapsed time and starve refills.
     ///
-    /// Burst cap is fixed at 16 × MSS (~21 KB).  A cwnd-scaled cap was
-    /// tried (v1.7.10) but on a fast loopback it let `drainPendingStreamSends`
-    /// emit so many packets per tick that the kernel UDP buffer would drop
-    /// some, RACK declared them lost, CC slashed `cwnd`, and `cc_bif` ended
-    /// up well above the new `cwnd`.  The cascade wedged drain (`blocked_by=cc`)
-    /// and overflowed both the LD ring (`2048` packets) and
-    /// `pending_stream_sends` (`1024` entries / `8 MiB`), causing the
-    /// embedder to see silent `pending-stream-send queue full` rejections
-    /// and ~40 % goodput loss versus v1.7.9.  Keep the safety small.
+    /// Burst cap history & tuning:
+    ///
+    ///   * `16 × MSS` (~21 KB): pre-v1.7.13 default.  Caps sustained
+    ///     throughput at ~21 MB/s per conn (one full bucket per
+    ///     millisecond, refill rate clamped by the cap).  Under our
+    ///     small-devnet gossip workload (180 KB aggregations + 240 KB
+    ///     blocks every ~4 s slot, fanned out to N peers in parallel)
+    ///     this routinely fills `pending_stream_sends` to its 1024-entry
+    ///     limit and returns backpressure to the embedder for ~5 % of
+    ///     publishes, causing zeam_0 to miss enough inbound attestations
+    ///     to lag finalization (observed: zeam_0 stuck at slot 13 while
+    ///     zeam_1 and ethlambda were at 19).
+    ///
+    ///   * `cwnd / 8` (~MB-scale on loopback): v1.7.10 attempt.  Let
+    ///     `drainPendingStreamSends` emit so many packets per tick that
+    ///     the kernel UDP buffer would drop some, RACK declared them
+    ///     lost, CC slashed `cwnd`, and `cc_bif` ended up well above the
+    ///     new `cwnd`.  The cascade wedged drain (`blocked_by=cc`) and
+    ///     overflowed both the LD ring (`2048` packets) and
+    ///     `pending_stream_sends` (`1024` entries / `8 MiB`).
+    ///
+    ///   * **`64 × MSS` (~86 KB), current.**  Conservative 4× lift over
+    ///     pre-v1.7.13: gives 86 MB/s sustained per conn, easily
+    ///     absorbs one aggregation+block burst per slot, but stays well
+    ///     below the kernel UDP buffer's drop threshold under fanout.
+    ///     The v1.7.10 regression required MB-scale per-ms bursts; 86 KB
+    ///     is still small enough that the per-tick packet count stays
+    ///     within UDP buffer headroom on loopback.
     fn pacerUpdate(self: *ConnState, now_ms: i64) void {
         const srtt = @max(self.rtt.srtt_ms, 1.0);
         const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
@@ -1993,7 +2012,7 @@ pub const ConnState = struct {
         if (elapsed <= 0) return;
         self.pacing_last_ms = now_ms;
         self.pacing_tokens += rate * elapsed;
-        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
+        const burst_cap = 64.0 * @as(f64, @floatFromInt(congestion.mss));
         if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
     }
 
