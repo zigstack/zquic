@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.6] - 2026-06-12
+
+### Fixed
+
+- **Drain deferred STREAM bytes every `processPendingWork` tick** on server
+  and client (before PTO), matching quinn `poll_transmit` prioritization of
+  queued app data over keepalive probes.
+- **Rate-limited stall logging** when `pending_stream_sends` cannot drain
+  (reports CC / pacer / loss-detector block reason and queue depth).
+- **Client drain / send** no longer puts untracked STREAM packets on the wire
+  when the loss-detector ring is full — entries are re-queued instead.
+
 ## [v1.7.5] - 2026-06-12
 
 ### Fixed

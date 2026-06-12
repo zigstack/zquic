@@ -1073,11 +1073,45 @@ fn enqueuePendingStreamSendOwned(
     return true;
 }
 
+const TransmitBlock = enum {
+    cc,
+    pacer,
+    loss_detector,
+};
+
+fn connTransmitBlock(conn: *ConnState, now_ms: i64) ?TransmitBlock {
+    if (!conn.cc.canSend(congestion.mss)) return .cc;
+    if (!conn.pacerAllow(now_ms)) return .pacer;
+    if (!conn.ld.hasCapacity()) return .loss_detector;
+    return null;
+}
+
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
 fn connCanTransmitAppData(conn: *ConnState, now_ms: i64) bool {
-    return conn.cc.canSend(congestion.mss) and
-        conn.pacerAllow(now_ms) and
-        conn.ld.hasCapacity();
+    return connTransmitBlock(conn, now_ms) == null;
+}
+
+fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
+    if (conn.pending_stream_sends.items.len == 0) return;
+    const now_ms = compat.milliTimestamp();
+    if (now_ms - conn.pending_stream_stall_warn_ms < 5000) return;
+    const block = connTransmitBlock(conn, now_ms) orelse return;
+    conn.pending_stream_stall_warn_ms = now_ms;
+    log.warn(
+        "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
+        .{
+            side,
+            conn.pending_stream_sends.items.len,
+            conn.pending_stream_send_bytes,
+            @tagName(block),
+            conn.cc.getBytesInFlight(),
+            conn.cc.getCwnd(),
+            conn.ld.sent_count,
+            recovery.LossDetector.max_tracked_packets,
+            conn.fc_bytes_sent,
+            conn.fc_send_max,
+        },
+    );
 }
 
 fn freePendingStreamSends(conn: *ConnState, allocator: std.mem.Allocator) void {
@@ -1476,6 +1510,8 @@ pub const ConnState = struct {
     pending_stream_send_bytes: usize = 0,
     /// Rate-limit `pending-stream-send queue full` warnings (ms).
     pending_stream_send_queue_full_warn_ms: i64 = 0,
+    /// Rate-limit for [`maybeLogPendingStreamStall`].
+    pending_stream_stall_warn_ms: i64 = 0,
     /// Partial HTTP/0.9 requests reassembled until FIN.
     http09_req_asm: [http09_req_asm_max]Http09ReqAssembly = [_]Http09ReqAssembly{.{}} ** http09_req_asm_max,
     /// Number of currently active HTTP/3 response slots.
@@ -2410,8 +2446,19 @@ pub const Server = struct {
         self.processPacket(buf, src);
     }
 
+    /// Drain deferred STREAM bytes on every connection (quinn `poll_transmit`).
+    fn drainAllPendingStreamSends(self: *Server) void {
+        for (&self.conns) |*cslot| {
+            if (cslot.*) |*conn| {
+                if (!conn.has_app_keys or conn.draining) continue;
+                self.drainPendingStreamSendsUntilStalled(conn);
+            }
+        }
+    }
+
     /// Run loss recovery, flush pending HTTP responses, and reap idle connections — same work as an idle `run()` iteration without reading the socket.
     pub fn processPendingWork(self: *Server) void {
+        self.drainAllPendingStreamSends();
         self.checkPto();
         self.maybeSendPlpmtuProbes();
         self.maybeAutoKeyUpdates();
@@ -2617,7 +2664,10 @@ pub const Server = struct {
                 i += 1;
                 continue;
             }
-            if (!connCanTransmitAppData(conn, compat.milliTimestamp())) return;
+            if (!connCanTransmitAppData(conn, compat.milliTimestamp())) {
+                maybeLogPendingStreamStall(conn, "server");
+                return;
+            }
             const stream_id = p.stream_id;
             const offset = p.offset;
             const fin = p.fin;
@@ -6921,11 +6971,22 @@ pub const Client = struct {
         return self.tls.peer_leaf_cert_der[0..n];
     }
 
+    /// Bytes queued in `pending_stream_sends` (accepted by the stack, not yet on wire).
+    pub fn pendingStreamSendBacklog(self: *const Client) usize {
+        return self.conn.pending_stream_send_bytes;
+    }
+
+    /// Try to put all deferred STREAM bytes on the wire (quinn `poll_transmit`).
+    pub fn drainDeferredStreamSends(self: *Client) void {
+        self.drainPendingStreamSendsUntilStalled();
+    }
+
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
     pub fn processPendingWork(self: *Client, server_addr: compat.Address) void {
         const now = compat.milliTimestamp();
-        // Mirror Server.processPendingWork: drain deferred STREAM bytes and
-        // run PTO/keepalive while the embedder recv loop is idle.
+        // Mirror Server.processPendingWork: drain deferred STREAM bytes before
+        // PTO/keepalive so gossip pending queues drain like quinn SendBuffer.
+        self.drainPendingStreamSendsUntilStalled();
         self.checkPto();
         self.maybeSendPlpmtuProbe();
         self.maybeAutoKeyUpdate();
@@ -7134,6 +7195,16 @@ pub const Client = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return 0;
         };
+        if (!self.conn.ld.hasCapacity()) {
+            if (is_fresh) return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+            if (owned_buf) |buf| {
+                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
+                    self.allocator.free(buf);
+                }
+                return data.len;
+            }
+            return 0;
+        }
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {
@@ -7200,7 +7271,10 @@ pub const Client = struct {
                 i += 1;
                 continue;
             }
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) return;
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+                maybeLogPendingStreamStall(&self.conn, "client");
+                return;
+            }
             const stream_id = p.stream_id;
             const offset = p.offset;
             const fin = p.fin;
@@ -7220,6 +7294,20 @@ pub const Client = struct {
                 self.allocator.free(buf);
                 continue;
             };
+            if (!self.conn.ld.hasCapacity()) {
+                // Re-queue at the front; do not put untracked bytes on the wire.
+                self.conn.pending_stream_sends.insert(self.allocator, i, .{
+                    .stream_id = stream_id,
+                    .offset = offset,
+                    .fin = fin,
+                    .data = buf,
+                }) catch {
+                    self.allocator.free(buf);
+                };
+                self.conn.pending_stream_send_bytes +|= buf.len;
+                maybeLogPendingStreamStall(&self.conn, "client");
+                return;
+            }
             var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const pkt_len = build1RttPacketFull(
                 &send_buf,

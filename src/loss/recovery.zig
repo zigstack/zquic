@@ -131,7 +131,8 @@ pub const SentPacket = struct {
 
 /// Loss detection state for one packet number space.
 pub const LossDetector = struct {
-    const max_tracked = 2048;
+    pub const max_tracked_packets: usize = 2048;
+    const max_tracked = max_tracked_packets;
 
     sent: [max_tracked]SentPacket = undefined,
     sent_count: usize = 0,
