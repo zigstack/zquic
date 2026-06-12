@@ -1070,21 +1070,34 @@ fn enqueuePendingStreamSendOwned(
         if (last.stream_id == stream_id and last.offset +| last.data.len == offset and
             last.data.len + owned.len <= max_pending_stream_chunk and !last.fin)
         {
-            if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+            // Defence-in-depth: if `owned` and `last.data` alias the same
+            // heap buffer, realloc would invalidate `owned`'s backing
+            // storage and the subsequent @memcpy would read freed memory.
+            // This should never happen (the caller's contract is that
+            // `owned` is freshly allocated and unique), but a stale-slice
+            // bug elsewhere could otherwise corrupt jemalloc's metadata
+            // and crash the process.  Skip the coalesce path on alias and
+            // fall through to the append path, which a few lines below
+            // detects the same alias via the for-loop dedup check above
+            // (in practice we never reach that because the for-loop
+            // already returns true for any duplicate).
+            if (owned.ptr != last.data.ptr) {
+                if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+                    allocator.free(owned);
+                    return false;
+                }
+                const new_len = last.data.len + owned.len;
+                const grown = allocator.realloc(last.data, new_len) catch {
+                    allocator.free(owned);
+                    return false;
+                };
+                @memcpy(grown[last.data.len..][0..owned.len], owned);
                 allocator.free(owned);
-                return false;
+                last.data = grown;
+                if (fin) last.fin = true;
+                conn.pending_stream_send_bytes +|= owned.len;
+                return true;
             }
-            const new_len = last.data.len + owned.len;
-            const grown = allocator.realloc(last.data, new_len) catch {
-                allocator.free(owned);
-                return false;
-            };
-            @memcpy(grown[last.data.len..][0..owned.len], owned);
-            allocator.free(owned);
-            last.data = grown;
-            if (fin) last.fin = true;
-            conn.pending_stream_send_bytes +|= owned.len;
-            return true;
         }
     }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
@@ -2797,8 +2810,16 @@ pub const Server = struct {
             break :blk dup;
         };
         // Defence-in-depth: free any pre-existing data so we don't leak if
-        // some unrelated path already attached one.
-        if (last.stream_data) |old| self.allocator.free(old);
+        // some unrelated path already attached one.  Guard against the
+        // alias case where `old.ptr == buf.ptr` — without this, the retx
+        // path that passes the same slice as both `data` and `owned_buf`
+        // could free `buf` and then immediately store the same dangling
+        // pointer, corrupting jemalloc's slab metadata once the buffer's
+        // slot is reused.  Seen as a SIGSEGV deep in
+        // `edata_list_inactive_remove` on a wedged-cwnd devnet (zeam #?).
+        if (last.stream_data) |old| {
+            if (old.ptr != buf.ptr) self.allocator.free(old);
+        }
         last.has_stream_data = true;
         last.stream_id = stream_id;
         last.stream_offset = offset;
@@ -2876,7 +2897,14 @@ pub const Server = struct {
                 self.allocator.free(buf);
                 continue;
             }
-            if (last.stream_data) |old| self.allocator.free(old);
+            // Defence-in-depth: guard against the alias case where
+            // `old.ptr == buf.ptr` (see `sendRawStreamDataInner` for the
+            // full rationale).  Without this guard a wedged-cwnd retx
+            // path can free `buf` and then immediately store the same
+            // dangling pointer.
+            if (last.stream_data) |old| {
+                if (old.ptr != buf.ptr) self.allocator.free(old);
+            }
             last.has_stream_data = true;
             last.stream_id = stream_id;
             last.stream_offset = offset;
