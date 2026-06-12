@@ -1079,23 +1079,26 @@ const TransmitBlock = enum {
     loss_detector,
 };
 
-fn connTransmitBlock(conn: *ConnState, now_ms: i64) ?TransmitBlock {
+fn connTransmitBlock(conn: *ConnState, bytes: u64) ?TransmitBlock {
     if (!conn.cc.canSend(congestion.mss)) return .cc;
-    if (!conn.pacerAllow(now_ms)) return .pacer;
+    if (!conn.pacerHasCredit(bytes)) return .pacer;
     if (!conn.ld.hasCapacity()) return .loss_detector;
     return null;
 }
 
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
-fn connCanTransmitAppData(conn: *ConnState, now_ms: i64) bool {
-    return connTransmitBlock(conn, now_ms) == null;
+fn connCanTransmitAppData(conn: *ConnState, now_ms: i64, bytes: u64) bool {
+    conn.pacerUpdate(now_ms);
+    return connTransmitBlock(conn, bytes) == null;
 }
 
 fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     if (conn.pending_stream_sends.items.len == 0) return;
     const now_ms = compat.milliTimestamp();
     if (now_ms - conn.pending_stream_stall_warn_ms < 5000) return;
-    const block = connTransmitBlock(conn, now_ms) orelse return;
+    conn.pacerUpdate(now_ms);
+    const bytes: u64 = @intCast(conn.pending_stream_sends.items[0].data.len);
+    const block = connTransmitBlock(conn, bytes) orelse return;
     conn.pending_stream_stall_warn_ms = now_ms;
     log.warn(
         "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
@@ -1784,7 +1787,7 @@ pub const ConnState = struct {
     rtt: recovery.RttEstimator = .{},
     // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
     ld: recovery.LossDetector = .{},
-    // Token-bucket pacer state (see ConnState.pacerAllow).
+    // Token-bucket pacer state (see ConnState.pacerUpdate / pacerHasCredit).
     pacing_tokens: f64 = 0,
     pacing_last_ms: i64 = 0,
 
@@ -1943,31 +1946,40 @@ pub const ConnState = struct {
         return null;
     }
 
-    /// Token-bucket pacer (RFC 9002 §7.7).  Spreads data sends across the RTT
-    /// so a cwnd-sized response does not leave as one instantaneous burst.  The
-    /// NS3 interop path has a 25-packet DropTail bottleneck queue, so an unpaced
-    /// ~900-packet reply to quinn's multiplexing burst drops ~35% and collapses
-    /// the connection.  Tokens are denominated in bytes; one packet costs one
-    /// MSS so the effective rate is cwnd_packets / srtt.
-    fn pacerAllow(self: *ConnState, now_ms: i64) bool {
+    /// Refill the byte token bucket (RFC 9002 §7.7).  Separated from the
+    /// credit check so multiple gating probes in one event-loop tick do not
+    /// advance `pacing_last_ms` without elapsed time and starve refills.
+    fn pacerUpdate(self: *ConnState, now_ms: i64) void {
         const srtt = @max(self.rtt.srtt_ms, 1.0);
         const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
         const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
         if (self.pacing_last_ms == 0) {
             self.pacing_last_ms = now_ms;
             self.pacing_tokens = @floatFromInt(congestion.mss);
+            return;
         }
         const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
+        if (elapsed <= 0) return;
         self.pacing_last_ms = now_ms;
         self.pacing_tokens += rate * elapsed;
         const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
         if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
-        return self.pacing_tokens >= @as(f64, @floatFromInt(congestion.mss));
     }
 
-    /// Consume one packet's worth of pacing credit after an actual send.
-    fn pacerConsume(self: *ConnState) void {
-        self.pacing_tokens -= @floatFromInt(congestion.mss);
+    /// Read-only pacing credit check for `bytes` payload (not always MSS).
+    fn pacerHasCredit(self: *const ConnState, bytes: u64) bool {
+        return self.pacing_tokens >= @as(f64, @floatFromInt(@max(bytes, 1)));
+    }
+
+    /// Back-compat helper for call sites that gate a full MSS datagram.
+    fn pacerAllow(self: *ConnState, now_ms: i64) bool {
+        self.pacerUpdate(now_ms);
+        return self.pacerHasCredit(congestion.mss);
+    }
+
+    /// Consume pacing credit for bytes actually placed on the wire.
+    fn pacerConsume(self: *ConnState, bytes: u64) void {
+        self.pacing_tokens -= @as(f64, @floatFromInt(bytes));
         if (self.pacing_tokens < 0) self.pacing_tokens = 0;
     }
 
@@ -2570,16 +2582,17 @@ pub const Server = struct {
             }
             // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
             const now_ms = compat.milliTimestamp();
-            if (!connCanTransmitAppData(conn, now_ms)) {
+            const pace_bytes: u64 = @intCast(data.len);
+            if (!connCanTransmitAppData(conn, now_ms, pace_bytes)) {
                 self.drainPendingStreamSendsUntilStalled(conn);
-                if (!connCanTransmitAppData(conn, compat.milliTimestamp())) {
+                if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
                     self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
                     return;
                 }
             }
         } else if (owned_buf) |buf| {
             const now_ms = compat.milliTimestamp();
-            if (!connCanTransmitAppData(conn, now_ms)) {
+            if (!connCanTransmitAppData(conn, now_ms, @intCast(buf.len))) {
                 if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, buf, fin)) {
                     self.allocator.free(buf);
                 }
@@ -2637,7 +2650,7 @@ pub const Server = struct {
         last.stream_offset = offset;
         last.stream_data = buf;
         last.stream_fin = fin;
-        if (is_fresh) conn.pacerConsume();
+        if (is_fresh) conn.pacerConsume(@intCast(data.len));
     }
 
     /// Try to put queued raw STREAM bytes (`pending_stream_sends`) on the
@@ -2664,7 +2677,8 @@ pub const Server = struct {
                 i += 1;
                 continue;
             }
-            if (!connCanTransmitAppData(conn, compat.milliTimestamp())) {
+            const pace_bytes: u64 = @intCast(p.data.len);
+            if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
                 maybeLogPendingStreamStall(conn, "server");
                 return;
             }
@@ -2713,7 +2727,7 @@ pub const Server = struct {
             last.stream_offset = offset;
             last.stream_data = buf;
             last.stream_fin = fin;
-            conn.pacerConsume();
+            conn.pacerConsume(@intCast(buf.len));
             // `orderedRemove` slid the tail down by one; the next entry is at the same index.
         }
     }
@@ -4530,9 +4544,10 @@ pub const Server = struct {
                             // the window.  This paces recovery and prevents the
                             // unbounded retransmit storm that overflowed the NS3
                             // queue and the loss-detector ring.
-                            if (connCanTransmitAppData(conn, compat.milliTimestamp())) {
+                            const rtx_bytes: u64 = @intCast(buf.len);
+                            if (connCanTransmitAppData(conn, compat.milliTimestamp(), rtx_bytes)) {
                                 self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
-                                conn.pacerConsume();
+                                conn.pacerConsume(rtx_bytes);
                                 // ownership of `buf` is transferred into the new
                                 // SentPacket (or freed inside *Inner on draining /
                                 // serialize failure); we must NOT touch it again.
@@ -5051,7 +5066,7 @@ pub const Server = struct {
                         const e = conn.http09_rtx[conn.http09_rtx_count];
                         conn.http09_rtx[conn.http09_rtx_count] = .{};
                         self.sendRawStreamDataInner(conn, e.stream_id, e.offset, e.data, e.fin, e.data);
-                        conn.pacerConsume();
+                        conn.pacerConsume(@intCast(e.data.len));
                         progressed = true;
                         budget -= 1;
                     }
@@ -5067,7 +5082,7 @@ pub const Server = struct {
                                 continue;
                             }
                             self.http09SendNextChunk(conn, slot);
-                            conn.pacerConsume();
+                            conn.pacerConsume(congestion.mss);
                             progressed = true;
                             budget -= 1;
                             if (!slot.active) continue;
@@ -5080,7 +5095,7 @@ pub const Server = struct {
                             if (!conn.cc.canSend(congestion.mss)) break;
                             if (!conn.pacerAllow(compat.milliTimestamp())) break;
                             self.http09SendNextChunk(conn, slot);
-                            conn.pacerConsume();
+                            conn.pacerConsume(congestion.mss);
                             progressed = true;
                             budget -= 1;
                         }
@@ -5280,7 +5295,7 @@ pub const Server = struct {
                     budget -= 1;
                     dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
-                    conn.pacerConsume();
+                    conn.pacerConsume(@intCast(slot.fin_frame_len));
                 }
             }
         }
@@ -5637,7 +5652,6 @@ pub const Server = struct {
         const fc_before = conn.fc_bytes_sent;
         self.sendRawStreamDataInner(conn, stream_id, 0, file_buf[0..n], true, null);
         if (conn.fc_bytes_sent <= fc_before) return false;
-        conn.pacerConsume();
 
         http09MarkResponded(conn, stream_id);
         dbg("io: http09 stream_id={} immediate send n={} (quinn-style)\n", .{ stream_id, n });
@@ -5697,7 +5711,7 @@ pub const Server = struct {
             }
             if (self.openHttp09OutSlot(conn, entry.stream_id, path)) |slot_idx| {
                 self.http09SendNextChunk(conn, &conn.http09_slots[slot_idx]);
-                conn.pacerConsume();
+                conn.pacerConsume(congestion.mss);
                 conn.http09_pending_count -= 1;
                 if (i < conn.http09_pending_count) {
                     conn.http09_pending[i] = conn.http09_pending[conn.http09_pending_count];
@@ -5798,7 +5812,7 @@ pub const Server = struct {
                 // active slot is drained by the paced flush.
                 if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
                     self.http09SendNextChunk(conn, slot);
-                    conn.pacerConsume();
+                    conn.pacerConsume(congestion.mss);
                 }
                 return;
             }
@@ -7132,14 +7146,15 @@ pub const Client = struct {
             }
             // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
             const now_ms = compat.milliTimestamp();
-            if (!connCanTransmitAppData(&self.conn, now_ms)) {
+            const pace_bytes: u64 = @intCast(data.len);
+            if (!connCanTransmitAppData(&self.conn, now_ms, pace_bytes)) {
                 self.drainPendingStreamSendsUntilStalled();
-                if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+                if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
                     return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
                 }
             }
         } else if (owned_buf) |buf| {
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), @intCast(buf.len))) {
                 if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
                     self.allocator.free(buf);
                 }
@@ -7160,7 +7175,7 @@ pub const Client = struct {
         owned_buf: ?[]u8,
     ) usize {
         const is_fresh = owned_buf == null;
-        if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+        if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), @intCast(data.len))) {
             if (is_fresh) return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
             if (owned_buf) |buf| {
                 if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
@@ -7240,7 +7255,7 @@ pub const Client = struct {
         // on undelivered gossip STREAM frames.
         if (recorded) {
             self.conn.cc.onPacketSent(@intCast(pkt_len));
-            if (is_fresh) self.conn.pacerConsume();
+            if (is_fresh) self.conn.pacerConsume(@intCast(pkt_len));
         }
         if (!recorded) {
             // LD full — caller's data has already gone on the wire; we just
@@ -7271,7 +7286,8 @@ pub const Client = struct {
                 i += 1;
                 continue;
             }
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+            const pace_bytes: u64 = @intCast(p.data.len);
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
                 maybeLogPendingStreamStall(&self.conn, "client");
                 return;
             }
@@ -7340,7 +7356,7 @@ pub const Client = struct {
             });
             if (recorded) {
                 self.conn.cc.onPacketSent(@intCast(pkt_len));
-                self.conn.pacerConsume();
+                self.conn.pacerConsume(@intCast(pkt_len));
             }
             if (!recorded) self.allocator.free(buf);
             // `orderedRemove` slid the tail down by one; next entry is at the same index.
@@ -8576,9 +8592,10 @@ pub const Client = struct {
                     }
                     self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
-                        if (connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+                        const rtx_bytes: u64 = @intCast(sbuf.len);
+                        if (connCanTransmitAppData(&self.conn, compat.milliTimestamp(), rtx_bytes)) {
                             _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
-                            self.conn.pacerConsume();
+                            self.conn.pacerConsume(rtx_bytes);
                             // ownership transferred into the new SentPacket.
                         } else if (!enqueuePendingStreamSendOwned(
                             &self.conn,
