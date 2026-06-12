@@ -966,13 +966,24 @@ const PendingStreamSend = struct {
 // treat as transient backpressure (≈ quinn `Poll::Pending`) and retry on a
 // later tick rather than dropping the stream.
 //
-// `pending_stream_send_cap` was raised from 1024 → 4096 entries (zquic
-// v1.7.17) after a real-world devnet hit the entry cap repeatedly with
-// only ~1.2 MB queued (≈1024 × 1.2 KB gossipsub frames) and well under
-// the 8 MB byte cap.  4× headroom lets a sustained gossip burst ride out
-// short cwnd-collapse cycles without ever surfacing backpressure to the
-// embedder.  Memory worst case is still bounded by the byte cap below.
-const pending_stream_send_cap: usize = 4096;
+// History:
+//   * v1.7.17 raised this from 1024 → 4096 entries as a stopgap to reduce
+//     how often the embedder saw backpressure.  In practice that let the
+//     queue accumulate ~5 MB of unsent data while persistent_congestion
+//     ratcheted cwnd to `minimum_window` (2 × MSS).  In that wedged state
+//     every loss event ran the raw-application-stream retransmit path
+//     (`http09QueueRtx` → `sendRawStreamDataInner` with `owned_buf` set)
+//     dozens of times against a backed-up sender, and on a sustained
+//     devnet run zeam crashed with a SIGSEGV deep in jemalloc's slab
+//     metadata — classic heap corruption from the retx path being
+//     exercised harder than it has been before.
+//   * v1.7.18 reverted to **1024 entries**.  The real fix for gossip
+//     wedging was on the embedder side (zig-libp2p v0.1.63 now treats
+//     `accepted == 0` as transient and keeps the frame in its own outbox
+//     instead of tearing the stream down), which works fine at the lower
+//     cap.  The 4096 path is left as a follow-up once the raw-stream
+//     retx ownership / memory hygiene has been audited.
+const pending_stream_send_cap: usize = 1024;
 const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
 /// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
