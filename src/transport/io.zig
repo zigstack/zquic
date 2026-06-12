@@ -1808,9 +1808,14 @@ pub const ConnState = struct {
     rtt: recovery.RttEstimator = .{},
     // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
     ld: recovery.LossDetector = .{},
-    // Token-bucket pacer state (see ConnState.pacerUpdate / pacerHasCredit).
+    // Token-bucket pacer state (quinn-style, see ConnState.pacerUpdate /
+    // pacerHasCredit). `pacing_capacity` is derived from cwnd × srtt at the
+    // time of the last update and stays sticky across calls within the same
+    // (cwnd, mtu) tuple to avoid recomputing on every probe.
     pacing_tokens: f64 = 0,
     pacing_last_ms: i64 = 0,
+    pacing_capacity: u64 = 0,
+    pacing_last_window: u64 = 0,
 
     // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
     // Set on the client when config.v2 = true so we can decrypt a v2 Initial
@@ -1967,53 +1972,101 @@ pub const ConnState = struct {
         return null;
     }
 
-    /// Refill the byte token bucket (RFC 9002 §7.7).  Separated from the
-    /// credit check so multiple gating probes in one event-loop tick do not
-    /// advance `pacing_last_ms` without elapsed time and starve refills.
+    /// Quinn-style token-bucket pacer (RFC 9002 §7.7).  Port of
+    /// `quinn-proto::connection::pacing::Pacer`
+    /// (https://github.com/quinn-rs/quinn/blob/main/quinn-proto/src/connection/pacing.rs).
     ///
-    /// Burst cap history (multiple tried, current is the survivor):
+    /// Key differences from the prior fixed-`16 × MSS` bucket this replaces:
     ///
-    ///   * `cwnd / 8` (~MB-scale on loopback): v1.7.10 attempt.  Let
-    ///     `drainPendingStreamSends` emit so many packets per tick that
-    ///     the kernel UDP buffer would drop some, RACK declared them
-    ///     lost, CC slashed `cwnd`, and `cc_bif` ended up well above the
-    ///     new `cwnd`.  The cascade wedged drain (`blocked_by=cc`) and
-    ///     overflowed both the LD ring (`2048` packets) and
-    ///     `pending_stream_sends` (`1024` entries / `8 MiB`).
+    ///   * **Capacity scales with cwnd.**  `optimal_capacity` aims for
+    ///     `(cwnd × 2 ms) / srtt` worth of bytes per burst, clamped to
+    ///     `[10, 256] × MSS`.  Small cwnd (after loss) → small burst →
+    ///     pacer naturally backs off in lockstep with CC instead of
+    ///     keeping the same 21 KB ceiling and losing all cwnd-vs-burst
+    ///     correlation.  Large cwnd on a fast path → up to ~345 KB per
+    ///     ~2 ms = ~172 MB/s instead of our flat 21 MB/s ceiling.
     ///
-    ///   * `64 × MSS` (~86 KB): v1.7.14 attempt to lift throughput from
-    ///     21 MB/s to 86 MB/s.  Same cascade as v1.7.10 in milder form
-    ///     on a small loopback devnet: stalls flipped from
-    ///     `blocked_by=pacer` to dominantly `blocked_by=cc` with cwnd
-    ///     cycling 22 KB ↔ 127 KB (false-loss cubic backoff at 0.7×),
-    ///     finalization regressed from slot 19 to slot 6, and one conn
-    ///     finally wedged hard (`bif=2.3 MB, ld=2048/2048`).
+    ///   * **Refill is RTT-relative.**  `tokens += cwnd × 1.25 × (elapsed /
+    ///     srtt)` (the 1.25 factor is the IETF-recommended pacing rate
+    ///     headroom — see RFC 9002 §7.7).  On a fast loopback path this
+    ///     refills the whole window per ms; on a 50 ms WAN it refills
+    ///     2 % of the window per ms.  Both end up filling exactly one
+    ///     `optimal_capacity` per `TARGET_BURST_INTERVAL`.
     ///
-    ///   * **`16 × MSS` (~21 KB), current.**  Restored after v1.7.14
-    ///     regression.  Caps sustained throughput at ~21 MB/s per conn
-    ///     (one full bucket per millisecond, refill rate clamped by the
-    ///     cap).  Tight enough to keep cwnd above the cubic-backoff
-    ///     ratchet on this devnet's loopback UDP buffer, loose enough
-    ///     to make finalization progress.  Further headroom should come
-    ///     from a smarter pacer (per-packet send-time tracking, quinn
-    ///     style) or from `pending_stream_sends` raising its 1024-entry
-    ///     cap, not from blindly enlarging the bucket — the cap is
-    ///     itself a CWND-protection device on lossy paths.
+    ///   * **Capacity is recomputed only on cwnd / mtu change.**  Probes
+    ///     within the same `(cwnd, mtu)` tuple reuse the cached value
+    ///     and just refill tokens, avoiding the divide on every send.
+    ///
+    /// Previous failed attempts (kept here as a warning, see git log for
+    /// detail): `cwnd / 8` burst (v1.7.10) and `64 × MSS` flat burst
+    /// (v1.7.14) both overflowed the loopback UDP buffer under N-way
+    /// fanout and triggered false-loss → cubic-backoff cascades.
+    /// Quinn-style adaptive capacity should sidestep that by *shrinking*
+    /// the bucket as cwnd shrinks rather than holding a flat-large
+    /// bucket against a now-tiny cwnd.
+    const TARGET_BURST_INTERVAL_MS: f64 = 2.0;
+    const MAX_BURST_INTERVAL_MS: f64 = 10.0;
+    const MIN_BURST_PACKETS: u64 = 10;
+    const MAX_BURST_PACKETS: u64 = 256;
+
+    fn computePacingCapacity(cwnd: u64, srtt_ms: f64) u64 {
+        const rtt = @max(srtt_ms, 1.0);
+        const cwnd_f: f64 = @floatFromInt(cwnd);
+        const mtu = congestion.mss;
+
+        const target_capacity: u64 = @intFromFloat(cwnd_f * TARGET_BURST_INTERVAL_MS / rtt);
+        const max_capacity_raw: u64 = @intFromFloat(cwnd_f * MAX_BURST_INTERVAL_MS / rtt);
+        const max_capacity = @max(max_capacity_raw, mtu);
+        const clamped = @max(MIN_BURST_PACKETS * mtu, @min(MAX_BURST_PACKETS * mtu, target_capacity));
+        return @min(max_capacity, clamped);
+    }
+
     fn pacerUpdate(self: *ConnState, now_ms: i64) void {
         const srtt = @max(self.rtt.srtt_ms, 1.0);
-        const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
-        const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
+        const window = self.cc.getCwnd();
+
+        // First call: bootstrap capacity and tokens before the first send.
         if (self.pacing_last_ms == 0) {
+            self.pacing_capacity = computePacingCapacity(window, srtt);
+            self.pacing_last_window = window;
+            self.pacing_tokens = @floatFromInt(self.pacing_capacity);
             self.pacing_last_ms = now_ms;
-            self.pacing_tokens = @floatFromInt(congestion.mss);
             return;
         }
-        const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
-        if (elapsed <= 0) return;
-        self.pacing_last_ms = now_ms;
-        self.pacing_tokens += rate * elapsed;
-        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
-        if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
+
+        // cwnd changed → recompute capacity and clamp tokens to it.
+        // Mirrors quinn's `delay()` `window != self.last_window` branch so a
+        // post-loss cwnd shrink immediately shrinks the bucket instead of
+        // letting a stale-large bucket drain at the now-smaller refill rate
+        // (which was the failure mode of the flat-cap approach).
+        if (window != self.pacing_last_window) {
+            self.pacing_capacity = computePacingCapacity(window, srtt);
+            self.pacing_last_window = window;
+            if (self.pacing_tokens > @as(f64, @floatFromInt(self.pacing_capacity))) {
+                self.pacing_tokens = @floatFromInt(self.pacing_capacity);
+            }
+        }
+
+        const elapsed_ms: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
+        if (elapsed_ms <= 0) return;
+
+        // `elapsed_rtts` ≥ 0; on a sub-srtt poll this rounds to a tiny
+        // fractional refill rather than 0 (the prior absolute-ms refill
+        // truncated to 0 for any sub-ms call and starved the bucket).
+        const elapsed_rtts = elapsed_ms / srtt;
+        const window_f: f64 = @floatFromInt(window);
+        const new_tokens = window_f * 1.25 * elapsed_rtts;
+        self.pacing_tokens += new_tokens;
+        if (self.pacing_tokens > @as(f64, @floatFromInt(self.pacing_capacity))) {
+            self.pacing_tokens = @floatFromInt(self.pacing_capacity);
+        }
+
+        // Only advance `pacing_last_ms` when refill was non-trivial so very
+        // fast successive polls can still accumulate fractional credit
+        // (quinn's `if new_tokens > 0 { self.prev = now; }` guard).
+        if (new_tokens > 0.0) {
+            self.pacing_last_ms = now_ms;
+        }
     }
 
     /// Read-only pacing credit check for `bytes` payload (not always MSS).
