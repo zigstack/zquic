@@ -963,6 +963,15 @@ const PendingStreamSend = struct {
 };
 const pending_stream_send_cap: usize = 1024;
 const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
+/// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
+/// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
+/// Without this cap, the coalesce path used to grow a single entry to tens of KB
+/// of contiguous gossipsub chunks, which then (a) overflowed the per-packet
+/// `frame_buf: [MAX_DATAGRAM_SIZE]u8` on serialize and (b) could not be unblocked
+/// by the pacer because the byte-granular credit check never accumulated enough
+/// tokens (burst cap is 16 × MSS ≈ 21 KB).  64-byte slack covers worst-case
+/// STREAM-frame + 1-RTT packet header overhead.
+const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
@@ -988,7 +997,9 @@ fn enqueuePendingStreamSend(
     // even though total bytes stay under the 8 MiB byte cap.
     if (conn.pending_stream_sends.items.len > 0) {
         const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and last.offset +| last.data.len == offset) {
+        if (last.stream_id == stream_id and last.offset +| last.data.len == offset and
+            last.data.len + data.len <= max_pending_stream_chunk and !last.fin)
+        {
             if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
             const new_len = last.data.len + data.len;
             const grown = allocator.realloc(last.data, new_len) catch return false;
@@ -1034,7 +1045,9 @@ fn enqueuePendingStreamSendOwned(
     }
     if (conn.pending_stream_sends.items.len > 0) {
         const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and last.offset +| last.data.len == offset) {
+        if (last.stream_id == stream_id and last.offset +| last.data.len == offset and
+            last.data.len + owned.len <= max_pending_stream_chunk and !last.fin)
+        {
             if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
                 allocator.free(owned);
                 return false;
@@ -1087,9 +1100,15 @@ fn connTransmitBlock(conn: *ConnState, bytes: u64) ?TransmitBlock {
 }
 
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
+/// `bytes` is the application payload size; we cap the pacer-credit check at
+/// one MSS because each call site ultimately emits at most one MTU-sized
+/// datagram per invocation.  Without this cap, large pending entries
+/// (multi-KB coalesced gossip frames) could never accumulate enough pacing
+/// tokens (burst cap is 16 × MSS) and would wedge `drainPendingStreamSends`.
 fn connCanTransmitAppData(conn: *ConnState, now_ms: i64, bytes: u64) bool {
     conn.pacerUpdate(now_ms);
-    return connTransmitBlock(conn, bytes) == null;
+    const pace_bytes = @min(bytes, congestion.mss);
+    return connTransmitBlock(conn, pace_bytes) == null;
 }
 
 fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
@@ -1097,8 +1116,9 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     const now_ms = compat.milliTimestamp();
     if (now_ms - conn.pending_stream_stall_warn_ms < 5000) return;
     conn.pacerUpdate(now_ms);
-    const bytes: u64 = @intCast(conn.pending_stream_sends.items[0].data.len);
-    const block = connTransmitBlock(conn, bytes) orelse return;
+    const head_bytes: u64 = @intCast(conn.pending_stream_sends.items[0].data.len);
+    const pace_bytes = @min(head_bytes, congestion.mss);
+    const block = connTransmitBlock(conn, pace_bytes) orelse return;
     conn.pending_stream_stall_warn_ms = now_ms;
     log.warn(
         "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
