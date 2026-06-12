@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.4] - 2026-06-12
+
+### Fixed
+
+- **Coalesce contiguous pending STREAM bytes on enqueue.** Gossipsub's
+  sequential 1200-byte chunks on `/meshsub` no longer consume one of the
+  1024 pending-queue slots each time CC blocks — they append to the tail
+  entry instead, preventing the ~30s queue-full wedge and the follow-on
+  quinn `decryption failed` burst when the backlog drained as many tiny
+  frames at once.
+- **Drain pending STREAM bytes before fresh client sends and before
+  enqueueing on CC block**, looping until stalled so CC window openings
+  empty the backlog before new entries are added.
+
 ## [v1.7.3] - 2026-06-12
 
 ### Fixed

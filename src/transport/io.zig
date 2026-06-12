@@ -982,6 +982,23 @@ fn enqueuePendingStreamSend(
     for (conn.pending_stream_sends.items) |e| {
         if (e.stream_id == stream_id and e.offset == offset) return true;
     }
+    // Coalesce contiguous tail bytes on the same stream (gossipsub /meshsub
+    // sends sequential 1200-byte chunks).  Without this, CC-blocked gossip
+    // creates one queue entry per chunk and hits the 1024-entry cap in ~30s
+    // even though total bytes stay under the 8 MiB byte cap.
+    if (conn.pending_stream_sends.items.len > 0) {
+        const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
+        if (last.stream_id == stream_id and last.offset +| last.data.len == offset) {
+            if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
+            const new_len = last.data.len + data.len;
+            const grown = allocator.realloc(last.data, new_len) catch return false;
+            @memcpy(grown[last.data.len..][0..data.len], data);
+            last.data = grown;
+            if (fin) last.fin = true;
+            conn.pending_stream_send_bytes +|= data.len;
+            return true;
+        }
+    }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
     if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
     const dup = allocator.dupe(u8, data) catch return false;
@@ -2380,6 +2397,7 @@ pub const Server = struct {
         // already charged.
         const is_fresh = owned_buf == null;
         if (is_fresh) {
+            self.drainPendingStreamSends(conn);
             // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Compares
             // the highest end-offset on this stream against the peer's
             // advertised limit — initial §18.2 value, raised by any
@@ -6865,6 +6883,15 @@ pub const Client = struct {
 
     /// Enqueue a fresh stream send when flow-control or congestion blocks the
     /// wire path.  Returns bytes accepted (data.len) or 0 on queue overflow.
+    /// Drain the pending queue until a pass makes no progress (CC/FC blocked).
+    fn drainPendingStreamSendsUntilStalled(self: *Client) void {
+        while (true) {
+            const before = self.conn.pending_stream_sends.items.len;
+            self.drainPendingStreamSends();
+            if (self.conn.pending_stream_sends.items.len == before) break;
+        }
+    }
+
     fn clientEnqueueFreshStream(
         self: *Client,
         stream_id: u64,
@@ -6872,7 +6899,7 @@ pub const Client = struct {
         data: []const u8,
         fin: bool,
     ) usize {
-        self.drainPendingStreamSends();
+        self.drainPendingStreamSendsUntilStalled();
         if (!enqueuePendingStreamSend(&self.conn, self.allocator, stream_id, offset, data, fin)) {
             warnPendingStreamSendQueueFull(&self.conn, stream_id, "client");
             return 0;
@@ -6903,6 +6930,7 @@ pub const Client = struct {
         // the original send.
         const is_fresh = owned_buf == null;
         if (is_fresh) {
+            self.drainPendingStreamSendsUntilStalled();
             // Per-stream + connection-level send-credit gates (RFC 9000
             // §4.1, §19.9, §19.13).  Mirrors the server-side gate.  On
             // failure we enqueue the bytes instead of silently dropping
@@ -6937,13 +6965,33 @@ pub const Client = struct {
                 }
                 return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
             }
-            // Congestion + pacer gate (mirrors Server.sendRawStreamDataInner).
+            // Congestion + pacer gate: drain deferred bytes first, then retry
+            // direct send before enqueueing another pending entry.
             if (!self.conn.cc.canSend(congestion.mss) or
                 !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
             {
-                return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+                self.drainPendingStreamSendsUntilStalled();
+                if (!self.conn.cc.canSend(congestion.mss) or
+                    !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
+                {
+                    return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+                }
             }
         }
+        return self.clientSendRawStreamFrame(stream_id, offset, data, fin, owned_buf);
+    }
+
+    /// Build and send one STREAM frame on 1-RTT (shared by fresh send and
+    /// after CC drain retry).  Returns bytes accepted on success.
+    fn clientSendRawStreamFrame(
+        self: *Client,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+        owned_buf: ?[]u8,
+    ) usize {
+        const is_fresh = owned_buf == null;
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -9750,36 +9798,35 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
 }
 
-test "pending stream send: enqueue + drain restores byte ordering" {
+test "pending stream send: contiguous enqueues coalesce on same stream" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // Simulate three back-to-back enqueues from a flow-control-blocked
-    // sender; the queue must retain offset order, ownership of the
-    // duplicated heap buffers, and the running byte counter.
+    // Sequential gossipsub chunks on one stream append to the tail entry
+    // instead of consuming one slot per chunk.
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, "aaaa", false));
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 4, "bbbb", false));
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 8, "cccc", true));
-    try std.testing.expectEqual(@as(usize, 3), conn.pending_stream_sends.items.len);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_sends.items.len);
     try std.testing.expectEqual(@as(usize, 12), conn.pending_stream_send_bytes);
     try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
-    try std.testing.expectEqual(@as(u64, 4), conn.pending_stream_sends.items[1].offset);
-    try std.testing.expectEqualSlices(u8, "cccc", conn.pending_stream_sends.items[2].data);
-    try std.testing.expect(conn.pending_stream_sends.items[2].fin);
+    try std.testing.expectEqualSlices(u8, "aaaabbbbcccc", conn.pending_stream_sends.items[0].data);
+    try std.testing.expect(conn.pending_stream_sends.items[0].fin);
 }
 
 test "pending stream send: cap rejects past per-conn entry budget" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
     // Fill to the per-conn entry cap with tiny payloads so we hit the
-    // entry-count limit (not the byte limit).
+    // entry-count limit (not the byte limit).  Use gaps in offset so
+    // coalescing does not collapse the entries.
     var i: usize = 0;
     while (i < pending_stream_send_cap) : (i += 1) {
-        try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i), "x", false));
+        try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
     }
     // One more must fail; the caller is expected to mark the conn
     // draining so the embedder reconnects (silently dropping would
     // corrupt the stream offset).
-    try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i), "x", false));
+    try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
 }
 
 test "pending stream send: cap rejects past per-conn byte budget" {
