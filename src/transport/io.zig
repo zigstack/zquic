@@ -961,7 +961,18 @@ const PendingStreamSend = struct {
     fin: bool = false,
     data: []u8 = &.{},
 };
-const pending_stream_send_cap: usize = 1024;
+// Hard caps on the per-stream `pending_stream_sends` queue.  Either limit
+// triggers `enqueuePendingStreamSend` → `false`, which the embedder MUST
+// treat as transient backpressure (≈ quinn `Poll::Pending`) and retry on a
+// later tick rather than dropping the stream.
+//
+// `pending_stream_send_cap` was raised from 1024 → 4096 entries (zquic
+// v1.7.17) after a real-world devnet hit the entry cap repeatedly with
+// only ~1.2 MB queued (≈1024 × 1.2 KB gossipsub frames) and well under
+// the 8 MB byte cap.  4× headroom lets a sustained gossip burst ride out
+// short cwnd-collapse cycles without ever surfacing backpressure to the
+// embedder.  Memory worst case is still bounded by the byte cap below.
+const pending_stream_send_cap: usize = 4096;
 const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
 /// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
