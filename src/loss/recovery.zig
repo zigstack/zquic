@@ -148,6 +148,12 @@ pub const LossDetector = struct {
         self.sent_count = 0;
     }
 
+    /// True when another in-flight packet can be tracked (quinn always
+    /// records packets it puts on the wire; we gate sends the same way).
+    pub fn hasCapacity(self: *const LossDetector) bool {
+        return self.sent_count < max_tracked;
+    }
+
     /// Record a newly sent packet.
     ///
     /// If `pkt.stream_data` is non-null and we cannot record the packet

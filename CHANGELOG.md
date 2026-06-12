@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.5] - 2026-06-12
+
+### Fixed
+
+- **Align raw STREAM send scheduling with quinn `poll_transmit`.** Server
+  raw-stream sends and pending-queue drains now gate on congestion window,
+  pacer, and loss-detector capacity (previously server bypassed CC). Client
+  and server no longer put untracked packets on the wire when the loss
+  detector is full — bytes are deferred to `pending_stream_sends` instead.
+- **Client loss retransmit CC parity.** CC-blocked client retransmits enqueue
+  to `pending_stream_sends` (mirroring server `http09_rtx` pacing) instead of
+  blasting past cwnd.
+
 ## [v1.7.4] - 2026-06-12
 
 ### Fixed

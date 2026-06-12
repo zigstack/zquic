@@ -1015,6 +1015,71 @@ fn enqueuePendingStreamSend(
     return true;
 }
 
+/// Like `enqueuePendingStreamSend` but takes ownership of an already-heap
+/// `owned` buffer (loss-retransmit path).  Frees `owned` on coalesce-append
+/// or on duplicate-offset dedup.
+fn enqueuePendingStreamSendOwned(
+    conn: *ConnState,
+    allocator: std.mem.Allocator,
+    stream_id: u64,
+    offset: u64,
+    owned: []u8,
+    fin: bool,
+) bool {
+    for (conn.pending_stream_sends.items) |e| {
+        if (e.stream_id == stream_id and e.offset == offset) {
+            allocator.free(owned);
+            return true;
+        }
+    }
+    if (conn.pending_stream_sends.items.len > 0) {
+        const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
+        if (last.stream_id == stream_id and last.offset +| last.data.len == offset) {
+            if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+                allocator.free(owned);
+                return false;
+            }
+            const new_len = last.data.len + owned.len;
+            const grown = allocator.realloc(last.data, new_len) catch {
+                allocator.free(owned);
+                return false;
+            };
+            @memcpy(grown[last.data.len..][0..owned.len], owned);
+            allocator.free(owned);
+            last.data = grown;
+            if (fin) last.fin = true;
+            conn.pending_stream_send_bytes +|= owned.len;
+            return true;
+        }
+    }
+    if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
+        allocator.free(owned);
+        return false;
+    }
+    if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+        allocator.free(owned);
+        return false;
+    }
+    conn.pending_stream_sends.append(allocator, .{
+        .stream_id = stream_id,
+        .offset = offset,
+        .fin = fin,
+        .data = owned,
+    }) catch {
+        allocator.free(owned);
+        return false;
+    };
+    conn.pending_stream_send_bytes +|= owned.len;
+    return true;
+}
+
+/// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
+fn connCanTransmitAppData(conn: *ConnState, now_ms: i64) bool {
+    return conn.cc.canSend(congestion.mss) and
+        conn.pacerAllow(now_ms) and
+        conn.ld.hasCapacity();
+}
+
 fn freePendingStreamSends(conn: *ConnState, allocator: std.mem.Allocator) void {
     for (conn.pending_stream_sends.items) |*e| {
         if (e.data.len > 0) allocator.free(e.data);
@@ -2371,6 +2436,28 @@ pub const Server = struct {
         self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
     }
 
+    fn drainPendingStreamSendsUntilStalled(self: *Server, conn: *ConnState) void {
+        while (true) {
+            const before = conn.pending_stream_sends.items.len;
+            self.drainPendingStreamSends(conn);
+            if (conn.pending_stream_sends.items.len == before) break;
+        }
+    }
+
+    fn serverEnqueueFreshStream(
+        self: *Server,
+        conn: *ConnState,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) void {
+        self.drainPendingStreamSendsUntilStalled(conn);
+        if (!enqueuePendingStreamSend(conn, self.allocator, stream_id, offset, data, fin)) {
+            warnPendingStreamSendQueueFull(conn, stream_id, "server");
+        }
+    }
+
     /// Internal: optionally adopt `owned_buf` (already heap-allocated by an
     /// earlier `sendRawStreamData` call) as the retransmit buffer instead of
     /// duping `data`.  Used by the loss-recovery branch in `onAck` so we move
@@ -2397,7 +2484,7 @@ pub const Server = struct {
         // already charged.
         const is_fresh = owned_buf == null;
         if (is_fresh) {
-            self.drainPendingStreamSends(conn);
+            self.drainPendingStreamSendsUntilStalled(conn);
             // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Compares
             // the highest end-offset on this stream against the peer's
             // advertised limit — initial §18.2 value, raised by any
@@ -2431,9 +2518,23 @@ pub const Server = struct {
                 // here used to leave a permanent hole in the stream
                 // because the embedder advances its own send_offset
                 // unconditionally (see quic_raw_stream_io.zig).
-                self.drainPendingStreamSends(conn);
-                if (!enqueuePendingStreamSend(conn, self.allocator, stream_id, offset, data, fin)) {
-                    warnPendingStreamSendQueueFull(conn, stream_id, "server");
+                self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
+                return;
+            }
+            // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
+            const now_ms = compat.milliTimestamp();
+            if (!connCanTransmitAppData(conn, now_ms)) {
+                self.drainPendingStreamSendsUntilStalled(conn);
+                if (!connCanTransmitAppData(conn, compat.milliTimestamp())) {
+                    self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
+                    return;
+                }
+            }
+        } else if (owned_buf) |buf| {
+            const now_ms = compat.milliTimestamp();
+            if (!connCanTransmitAppData(conn, now_ms)) {
+                if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, buf, fin)) {
+                    self.allocator.free(buf);
                 }
                 return;
             }
@@ -2489,6 +2590,7 @@ pub const Server = struct {
         last.stream_offset = offset;
         last.stream_data = buf;
         last.stream_fin = fin;
+        if (is_fresh) conn.pacerConsume();
     }
 
     /// Try to put queued raw STREAM bytes (`pending_stream_sends`) on the
@@ -2515,6 +2617,7 @@ pub const Server = struct {
                 i += 1;
                 continue;
             }
+            if (!connCanTransmitAppData(conn, compat.milliTimestamp())) return;
             const stream_id = p.stream_id;
             const offset = p.offset;
             const fin = p.fin;
@@ -2560,6 +2663,7 @@ pub const Server = struct {
             last.stream_offset = offset;
             last.stream_data = buf;
             last.stream_fin = fin;
+            conn.pacerConsume();
             // `orderedRemove` slid the tail down by one; the next entry is at the same index.
         }
     }
@@ -4376,7 +4480,7 @@ pub const Server = struct {
                             // the window.  This paces recovery and prevents the
                             // unbounded retransmit storm that overflowed the NS3
                             // queue and the loss-detector ring.
-                            if (conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp())) {
+                            if (connCanTransmitAppData(conn, compat.milliTimestamp())) {
                                 self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, buf, lp.stream_fin, buf);
                                 conn.pacerConsume();
                                 // ownership of `buf` is transferred into the new
@@ -4996,7 +5100,7 @@ pub const Server = struct {
             // due to local recv-window advertising as our peer consumes
             // — a tick boundary catches it without waiting for the next
             // explicit credit-update frame).
-            self.drainPendingStreamSends(conn);
+            self.drainPendingStreamSendsUntilStalled(conn);
 
             // Effective idle timeout used by branches 2 and 3: the smaller of
             // our 30s local default and the peer-advertised max_idle_timeout
@@ -6965,17 +7069,20 @@ pub const Client = struct {
                 }
                 return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
             }
-            // Congestion + pacer gate: drain deferred bytes first, then retry
-            // direct send before enqueueing another pending entry.
-            if (!self.conn.cc.canSend(congestion.mss) or
-                !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
-            {
+            // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
+            const now_ms = compat.milliTimestamp();
+            if (!connCanTransmitAppData(&self.conn, now_ms)) {
                 self.drainPendingStreamSendsUntilStalled();
-                if (!self.conn.cc.canSend(congestion.mss) or
-                    !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
-                {
+                if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
                     return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
                 }
+            }
+        } else if (owned_buf) |buf| {
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
+                    self.allocator.free(buf);
+                }
+                return data.len;
             }
         }
         return self.clientSendRawStreamFrame(stream_id, offset, data, fin, owned_buf);
@@ -6992,6 +7099,16 @@ pub const Client = struct {
         owned_buf: ?[]u8,
     ) usize {
         const is_fresh = owned_buf == null;
+        if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+            if (is_fresh) return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+            if (owned_buf) |buf| {
+                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
+                    self.allocator.free(buf);
+                }
+                return data.len;
+            }
+            return 0;
+        }
         const sf = stream_frame_mod.StreamFrame{
             .stream_id = stream_id,
             .offset = offset,
@@ -7083,11 +7200,7 @@ pub const Client = struct {
                 i += 1;
                 continue;
             }
-            if (!self.conn.cc.canSend(congestion.mss) or
-                !self.conn.pacerAllow(@intCast(compat.milliTimestamp())))
-            {
-                return;
-            }
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp())) return;
             const stream_id = p.stream_id;
             const offset = p.offset;
             const fin = p.fin;
@@ -7193,7 +7306,7 @@ pub const Client = struct {
         // bytes (see Server.checkPto for the rationale).  Done before the
         // PTO branches so the drained packets count toward bytes_in_flight
         // when the loss detector evaluates them.
-        self.drainPendingStreamSends();
+        self.drainPendingStreamSendsUntilStalled();
         // Need at least one prior ACK before either branch runs so the RTT
         // estimate is meaningful and we have evidence the peer is responsive.
         if (self.conn.last_ack_ms == 0) return;
@@ -8375,8 +8488,20 @@ pub const Client = struct {
                     }
                     self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
-                        _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
-                        // ownership transferred into the new SentPacket.
+                        if (connCanTransmitAppData(&self.conn, compat.milliTimestamp())) {
+                            _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
+                            self.conn.pacerConsume();
+                            // ownership transferred into the new SentPacket.
+                        } else if (!enqueuePendingStreamSendOwned(
+                            &self.conn,
+                            self.allocator,
+                            lp.stream_id,
+                            lp.stream_offset,
+                            sbuf,
+                            lp.stream_fin,
+                        )) {
+                            self.allocator.free(sbuf);
+                        }
                     }
                 }
                 // ACK received — reset PTO backoff counter and record timestamp
