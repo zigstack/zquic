@@ -967,10 +967,10 @@ const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
 /// Without this cap, the coalesce path used to grow a single entry to tens of KB
 /// of contiguous gossipsub chunks, which then (a) overflowed the per-packet
-/// `frame_buf: [MAX_DATAGRAM_SIZE]u8` on serialize and (b) could not be unblocked
-/// by the pacer because the byte-granular credit check never accumulated enough
-/// tokens (burst cap is 16 × MSS ≈ 21 KB).  64-byte slack covers worst-case
-/// STREAM-frame + 1-RTT packet header overhead.
+/// `frame_buf: [MAX_DATAGRAM_SIZE]u8` on serialize and (b) (pre-cwnd-scaled
+/// burst) could not be unblocked by the pacer because the byte-granular
+/// credit check never accumulated enough tokens.  64-byte slack covers
+/// worst-case STREAM-frame + 1-RTT packet header overhead.
 const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
@@ -1104,7 +1104,8 @@ fn connTransmitBlock(conn: *ConnState, bytes: u64) ?TransmitBlock {
 /// one MSS because each call site ultimately emits at most one MTU-sized
 /// datagram per invocation.  Without this cap, large pending entries
 /// (multi-KB coalesced gossip frames) could never accumulate enough pacing
-/// tokens (burst cap is 16 × MSS) and would wedge `drainPendingStreamSends`.
+/// tokens and would wedge `drainPendingStreamSends`.  See `pacerUpdate` for
+/// the cwnd-scaled burst budget.
 fn connCanTransmitAppData(conn: *ConnState, now_ms: i64, bytes: u64) bool {
     conn.pacerUpdate(now_ms);
     const pace_bytes = @min(bytes, congestion.mss);
@@ -1969,20 +1970,32 @@ pub const ConnState = struct {
     /// Refill the byte token bucket (RFC 9002 §7.7).  Separated from the
     /// credit check so multiple gating probes in one event-loop tick do not
     /// advance `pacing_last_ms` without elapsed time and starve refills.
+    ///
+    /// Burst cap scales with cwnd so large in-flight budgets can ship
+    /// multi-packet payloads (gossipsub blocks / aggregations are ~150–250 KB
+    /// fragmented into 1200 B STREAM frames) without stalling the pending
+    /// drain for `ceil(payload / (16 × MSS))` milliseconds.  Mirrors quinn's
+    /// `Pacer::on_transmit` which uses `cwnd / 8` as the burst budget.  Lower
+    /// bound is still `16 × MSS` so low-cwnd connections behave as before
+    /// and there's always at least one full datagram of credit available.
     fn pacerUpdate(self: *ConnState, now_ms: i64) void {
         const srtt = @max(self.rtt.srtt_ms, 1.0);
         const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
         const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
+        const mss_f: f64 = @floatFromInt(congestion.mss);
+        const burst_cap = @max(16.0 * mss_f, cwnd_bytes / 8.0);
         if (self.pacing_last_ms == 0) {
             self.pacing_last_ms = now_ms;
-            self.pacing_tokens = @floatFromInt(congestion.mss);
+            // Prime with one full burst so the first send of a connection
+            // can ship a chunked control message (e.g. multistream-select +
+            // protocol id) in a single tick.
+            self.pacing_tokens = burst_cap;
             return;
         }
         const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
         if (elapsed <= 0) return;
         self.pacing_last_ms = now_ms;
         self.pacing_tokens += rate * elapsed;
-        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
         if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
     }
 
