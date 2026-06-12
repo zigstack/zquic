@@ -1971,31 +1971,29 @@ pub const ConnState = struct {
     /// credit check so multiple gating probes in one event-loop tick do not
     /// advance `pacing_last_ms` without elapsed time and starve refills.
     ///
-    /// Burst cap scales with cwnd so large in-flight budgets can ship
-    /// multi-packet payloads (gossipsub blocks / aggregations are ~150–250 KB
-    /// fragmented into 1200 B STREAM frames) without stalling the pending
-    /// drain for `ceil(payload / (16 × MSS))` milliseconds.  Mirrors quinn's
-    /// `Pacer::on_transmit` which uses `cwnd / 8` as the burst budget.  Lower
-    /// bound is still `16 × MSS` so low-cwnd connections behave as before
-    /// and there's always at least one full datagram of credit available.
+    /// Burst cap is fixed at 16 × MSS (~21 KB).  A cwnd-scaled cap was
+    /// tried (v1.7.10) but on a fast loopback it let `drainPendingStreamSends`
+    /// emit so many packets per tick that the kernel UDP buffer would drop
+    /// some, RACK declared them lost, CC slashed `cwnd`, and `cc_bif` ended
+    /// up well above the new `cwnd`.  The cascade wedged drain (`blocked_by=cc`)
+    /// and overflowed both the LD ring (`2048` packets) and
+    /// `pending_stream_sends` (`1024` entries / `8 MiB`), causing the
+    /// embedder to see silent `pending-stream-send queue full` rejections
+    /// and ~40 % goodput loss versus v1.7.9.  Keep the safety small.
     fn pacerUpdate(self: *ConnState, now_ms: i64) void {
         const srtt = @max(self.rtt.srtt_ms, 1.0);
         const cwnd_bytes: f64 = @floatFromInt(self.cc.getCwnd());
         const rate = 1.25 * cwnd_bytes / srtt; // bytes per ms
-        const mss_f: f64 = @floatFromInt(congestion.mss);
-        const burst_cap = @max(16.0 * mss_f, cwnd_bytes / 8.0);
         if (self.pacing_last_ms == 0) {
             self.pacing_last_ms = now_ms;
-            // Prime with one full burst so the first send of a connection
-            // can ship a chunked control message (e.g. multistream-select +
-            // protocol id) in a single tick.
-            self.pacing_tokens = burst_cap;
+            self.pacing_tokens = @floatFromInt(congestion.mss);
             return;
         }
         const elapsed: f64 = @floatFromInt(@max(now_ms - self.pacing_last_ms, 0));
         if (elapsed <= 0) return;
         self.pacing_last_ms = now_ms;
         self.pacing_tokens += rate * elapsed;
+        const burst_cap = 16.0 * @as(f64, @floatFromInt(congestion.mss));
         if (self.pacing_tokens > burst_cap) self.pacing_tokens = burst_cap;
     }
 
