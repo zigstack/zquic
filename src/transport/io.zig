@@ -5238,40 +5238,50 @@ pub const Server = struct {
                 @min(@as(u64, 30_000), conn.peer_max_idle_timeout_ms);
 
             // Branch 3 (priority): connection-lost detection (RFC 9002 §6.2;
-            // RFC 9000 §10.2). Evaluated BEFORE PTO/keepalive so a peer that
-            // silently went away — common with rust-libp2p / quinn idle-evict
-            // on the gossip dial leg, or after a `Failed to negotiate
-            // transport` cascade — gets a `draining = true` mark within
-            // `idle_ms × 2` even when the PTO branch would have otherwise
-            // `continue`-d for this conn and starved this evaluation.
+            // RFC 9000 §10.2). Evaluated BEFORE PTO/keepalive so a wedged
+            // outbound — `ld.sent_count == max_tracked_packets`, peer evicted
+            // its end of the conn silently — gets `draining = true` set
+            // promptly even when the PTO branch would have `continue`-d for
+            // this conn and starved this evaluation.
             //
-            // Why this matters: with `ld.sent_count == max_tracked_packets`
-            // (LD ring saturated), new STREAM sends become untracked.  Their
-            // ACKs do not free LD entries and `cc_bif` never drops.  Without
-            // an externally-triggered close, `pending_stream_sends` fills its
-            // 1024-entry / 8 MiB cap, the embedder sees `pending-stream-send
-            // queue full`, gossip publish stalls indefinitely (observed:
-            // 10 min frozen wedge), and zig-libp2p's
-            // `detectOutboundConnectionClose` never trips because `draining`
-            // is never flipped.  We MUST set it here once `last_ack_ms` is
-            // sufficiently stale, otherwise the only escape is process
-            // restart.
+            // Two guards before declaring loss, both required to avoid
+            // tearing down healthy-but-quiet conns (gossipsub between zeam
+            // and ethlambda goes 20–30 s without app traffic while quinn's
+            // 10 s advertised `max_idle_timeout` would otherwise make
+            // `idle_ms × 2 = 20 s` too tight a window):
+            //
+            //   1. `lost_threshold_ms = max(idle_ms × 2, 60_000)`.  The 60 s
+            //      floor is calibrated to our local 30 s idle advertisement
+            //      (`writeParamVarint(0x01, 30_000)` in quic_tls.zig) so a
+            //      peer that advertised a smaller value still gets a full
+            //      local-idle-doubled grace period before we evict.
+            //   2. `cc_bif >= 1 KiB` OR `ld.sent_count >= 512` OR
+            //      `pending_stream_sends.items.len > 0`.  Distinguishes a
+            //      real wedge (substantial data stuck unacked) from a
+            //      transient quiet period where the only outstanding bytes
+            //      are a single keepalive PING — those are still expected
+            //      to eventually ACK and tearing them down spuriously
+            //      causes the publish path to disconnect from a peer that
+            //      hasn't actually gone anywhere.
             //
             // The branch logs `log.warn` (not `dbg`) so the wedge is visible
-            // in release builds — historically this fire was only observable
+            // in release builds — previously the fire was only observable
             // with `-Dverbose=true`, which masked the bug entirely.
-            //
-            // Threshold rationale: 2× idle covers the worst legitimate
-            // silence window (peer in PTO storm + we already extended one
-            // idle period via keepalive) before declaring loss. 60s default.
             if (conn.last_ack_ms != 0) {
                 const elapsed_since_ack_lost: i64 = now_ms - conn.last_ack_ms;
-                const lost_threshold_ms: i64 = @intCast(idle_ms_u64 * 2);
-                if (elapsed_since_ack_lost >= lost_threshold_ms) {
-                    log.warn("io: server declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}); marking draining", .{
-                        elapsed_since_ack_lost,                    lost_threshold_ms,
-                        conn.cc.getBytesInFlight(),                conn.ld.sent_count,
+                const lost_threshold_ms: i64 = @intCast(@max(idle_ms_u64 * 2, @as(u64, 60_000)));
+                const has_substantial_data_stuck =
+                    conn.cc.getBytesInFlight() >= 1024 or
+                    conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
+                    conn.pending_stream_sends.items.len > 0;
+                if (elapsed_since_ack_lost >= lost_threshold_ms and has_substantial_data_stuck) {
+                    log.warn("io: server declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); marking draining", .{
+                        elapsed_since_ack_lost,
+                        lost_threshold_ms,
+                        conn.cc.getBytesInFlight(),
+                        conn.ld.sent_count,
                         recovery.LossDetector.max_tracked_packets,
+                        conn.pending_stream_sends.items.len,
                     });
                     conn.draining = true;
                     const pto: u64 = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
@@ -7506,21 +7516,33 @@ pub const Client = struct {
 
         // Branch 3 (priority): connection-lost detection (RFC 9002 §6.2;
         // RFC 9000 §10.2). See `Server.checkPto` for the full rationale —
-        // evaluated BEFORE the PTO branch so a wedged outbound (LD ring
-        // saturated, no ACKs returning) is reliably flagged within
-        // `idle_ms × 2` rather than starved by a PTO storm that returns
-        // early.  Without this priority swap, zig-libp2p's
-        // `detectOutboundConnectionClose` never sees `draining = true` and
-        // the gossip publish path stays stuck on a dead conn forever
-        // (observed: 10 min frozen `cc_bif=2.5MB, ld=2048/2048`).
+        // evaluated BEFORE the PTO branch so a wedged outbound is reliably
+        // flagged rather than starved by a PTO storm that returns early.
         //
-        // Logged as `log.warn` so the wedge is visible in release builds.
-        const lost_threshold_ms: i64 = @intCast(idle_ms_u64 * 2);
-        if (elapsed_since_ack >= lost_threshold_ms) {
-            log.warn("io: client declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}); marking draining", .{
-                elapsed_since_ack,                         lost_threshold_ms,
-                self.conn.cc.getBytesInFlight(),           self.conn.ld.sent_count,
+        // Two guards before declaring loss (must both hold) — see Server
+        // branch for full reasoning:
+        //   1. `lost_threshold_ms = max(idle_ms × 2, 60_000)`.  60 s floor
+        //      keeps us inside our own local idle advertisement (30 s) ×
+        //      2 even when peer advertised a tighter `max_idle_timeout`
+        //      (rust-libp2p / quinn default is 10 s, which would
+        //      otherwise yield a too-tight 20 s window).
+        //   2. Real outbound stuckness: `cc_bif >= 1 KiB` or
+        //      `ld.sent_count >= max/4` or `pending_stream_sends` non-empty.
+        //      Skips healthy-but-quiet conns whose only outstanding bytes
+        //      are a single keepalive PING.
+        const lost_threshold_ms: i64 = @intCast(@max(idle_ms_u64 * 2, @as(u64, 60_000)));
+        const has_substantial_data_stuck =
+            self.conn.cc.getBytesInFlight() >= 1024 or
+            self.conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
+            self.conn.pending_stream_sends.items.len > 0;
+        if (elapsed_since_ack >= lost_threshold_ms and has_substantial_data_stuck) {
+            log.warn("io: client declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); marking draining", .{
+                elapsed_since_ack,
+                lost_threshold_ms,
+                self.conn.cc.getBytesInFlight(),
+                self.conn.ld.sent_count,
                 recovery.LossDetector.max_tracked_packets,
+                self.conn.pending_stream_sends.items.len,
             });
             self.conn.draining = true;
             const pto: u64 = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);
