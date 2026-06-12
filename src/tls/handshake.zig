@@ -960,13 +960,16 @@ pub fn buildClientHelloWithPsk(
 
     ep = appendClientHelloSignatureAlgorithms(ext_buf[0..], ep);
 
+    // supported_groups: X25519 + secp256r1 (see buildClientHelloInner for rationale).
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 6);
     ep += 2;
     writeU16(ext_buf[ep..], 4);
     ep += 2;
-    writeU16(ext_buf[ep..], 2);
-    ep += 2;
     writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_SECP256R1);
     ep += 2;
 
     writeU16(ext_buf[ep..], EXT_KEY_SHARE);
@@ -1156,14 +1159,19 @@ fn buildClientHelloInner(
 
     ep = appendClientHelloPskKeyExchangeModes(ext_buf[0..], ep);
 
-    // supported_groups: X25519 only (matches key_share; rustls rejects orphan groups)
+    // supported_groups: X25519 first (matches our only key_share so the server picks it
+    // without an HRR), plus secp256r1 so servers backed by ngtcp2/BoringSSL whose
+    // libp2p TLS cert is on P-256 (e.g. c-lean-libp2p / lantern) don't silently drop
+    // the Initial. rustls/quinn accepts a supported_groups superset of key_share.
     writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
     ep += 2;
-    writeU16(ext_buf[ep..], 4); // ext data: list_len(2) + group(2)
+    writeU16(ext_buf[ep..], 6); // ext data: list_len(2) + 2 groups * 2
     ep += 2;
-    writeU16(ext_buf[ep..], 2); // list len
+    writeU16(ext_buf[ep..], 4); // list len: 2 groups * 2 bytes
     ep += 2;
     writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_SECP256R1);
     ep += 2;
 
     // key_share: X25519
