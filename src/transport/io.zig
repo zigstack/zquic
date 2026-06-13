@@ -8393,7 +8393,12 @@ pub const Client = struct {
         self: *Client,
         buf: []const u8,
     ) void {
-        const ip = packet_mod.parseInitial(buf) catch return;
+        const ip = packet_mod.parseInitial(buf) catch |e| {
+            log.warn("zquic: client parseInitial failed: {s} buf_len={d} first_byte=0x{x:0>2}", .{
+                @errorName(e), buf.len, if (buf.len > 0) buf[0] else 0,
+            });
+            return;
+        };
         // RFC 9000 §7.2: When a client receives the first Initial from the server,
         // it MUST update its DCID to the server's SCID for all subsequent packets.
         if (!self.conn.server_cid_confirmed) {
@@ -8408,7 +8413,10 @@ pub const Client = struct {
                 self.send0RttRequests(self.conn.peer) catch {};
             }
         }
-        const init_km = self.conn.init_keys orelse return;
+        const init_km = self.conn.init_keys orelse {
+            log.warn("zquic: client Initial received but init_keys=null dcid_len={d}", .{ip.dcid.len});
+            return;
+        };
 
         var plaintext: [4096]u8 = undefined;
         // Compatible version negotiation (RFC 9368): try current keys (v1 initially).
@@ -8456,6 +8464,14 @@ pub const Client = struct {
                     } else |_| {}
                 }
             }
+            log.warn("zquic: client Initial AEAD decrypt failed (v1{s}) dcid_len={d} scid_len={d} pn_start={d} payload_len={d} buf_len={d}", .{
+                if (self.conn.v2_upgrade_keys != null) "+v2" else "",
+                ip.dcid.len,
+                ip.scid.len,
+                ip.payload_offset,
+                ip.payload_len,
+                buf.len,
+            });
             return; // both v1 and v2 decryption failed
         };
         self.conn.init_ecn_ect0_recv += 1;
