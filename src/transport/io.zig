@@ -7025,6 +7025,7 @@ pub const Client = struct {
         conn.* = .{
             .local_cid = scid,
             .remote_cid = dcid,
+            .init_dcid = dcid,
             .peer = undefined,
             // Compatible version negotiation (RFC 9368): the client always starts
             // with QUIC v1 even when v2 is preferred.  use_v2 is promoted to true
@@ -7112,6 +7113,55 @@ pub const Client = struct {
         var client: Client = undefined;
         try initInPlace(allocator, config, &client);
         return client;
+    }
+
+    /// Build client state around an existing IPv4 UDP socket (e.g. shared with the libp2p listener).
+    /// Does not bind or close the socket (`owns_socket = false`).
+    pub fn initFromBoundSocketInPlace(
+        allocator: std.mem.Allocator,
+        config: ClientConfig,
+        sock: std.posix.socket_t,
+        out: *Client,
+    ) !void {
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
+
+        const dcid = ConnectionId.random(compat.random, 18);
+        const scid = ConnectionId.random(compat.random, 8);
+
+        out.* = undefined;
+        @memset(std.mem.asBytes(out), 0);
+        out.allocator = allocator;
+        out.config = config;
+        out.sock = sock;
+        out.tls = ClientHandshake.init();
+        out.active_urls = config.urls;
+        out.owns_socket = false;
+        configureNewConn(&out.conn, config, dcid, scid);
+
+        var client_cert_der: []u8 = &.{};
+        var client_cert_owned: bool = false;
+        var client_private_key: tls_vendor.config.PrivateKey = undefined;
+        const have_cert_src = config.client_cert_pem != null or config.client_cert_path.len > 0;
+        const have_key_src = config.client_key_pem != null or config.client_key_path.len > 0;
+        if (have_cert_src and have_key_src) {
+            client_cert_der = if (config.client_cert_pem) |pem|
+                try parseCertDerFromPem(allocator, pem)
+            else
+                try loadCertDer(allocator, config.client_cert_path);
+            errdefer allocator.free(client_cert_der);
+            client_private_key = if (config.client_key_pem) |pem|
+                try parsePrivateKeyFromPem(allocator, pem)
+            else
+                try loadPrivateKey(allocator, config.client_key_path);
+            client_cert_owned = true;
+        }
+        out.client_cert_der = client_cert_der;
+        out.client_cert_owned = client_cert_owned;
+        out.client_private_key = client_private_key;
     }
 
     /// Build client state around an existing IPv4 UDP socket (e.g. shared with another protocol).
@@ -8550,7 +8600,13 @@ pub const Client = struct {
 
         const lh = header_mod.parseLong(buf) catch return;
         var pos = lh.consumed;
-        const payload_len_r = varint.decode(buf[pos..]) catch return;
+        // RFC 9000 §16: the Length field is a QUIC varint and is NOT required to
+        // use the minimal encoding.  ngtcp2 (and quinn) can emit a non-minimal
+        // Length on coalesced Handshake packets; a strict (minimal-only) decode
+        // rejects it and silently drops the whole Handshake packet, wedging the
+        // client in the Initial phase.  Decode permissively, as the coalescing
+        // path in `processPacket` already does.
+        const payload_len_r = varint.decodePermissive(buf[pos..]) catch return;
         pos += payload_len_r.len;
         const payload_len: usize = @intCast(payload_len_r.value);
         const pn_start = pos;
@@ -8588,9 +8644,11 @@ pub const Client = struct {
             }
             if (plaintext[fpos] != 0x06) break;
             fpos += 1;
-            const off_r = varint.decode(plaintext[fpos..]) catch break;
+            // Non-minimal varints are legal (RFC 9000 §16); decode permissively
+            // so an ngtcp2/quinn-encoded CRYPTO offset/length isn't rejected.
+            const off_r = varint.decodePermissive(plaintext[fpos..]) catch break;
             fpos += off_r.len;
-            const dlen_r = varint.decode(plaintext[fpos..]) catch break;
+            const dlen_r = varint.decodePermissive(plaintext[fpos..]) catch break;
             fpos += dlen_r.len;
             const dlen: usize = @intCast(dlen_r.value);
             if (fpos + dlen > pt_len) break;
