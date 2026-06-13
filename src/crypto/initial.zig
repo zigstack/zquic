@@ -502,3 +502,38 @@ test "initial: encrypt/decrypt round-trip" {
     try testing.expectEqualSlices(u8, plaintext, decrypted[0..dec.pt_len]);
     try testing.expectEqual(@as(u64, 0), dec.pn);
 }
+
+test "initial: decrypt real ngtcp2 (lantern) ClientHello with 4-byte Length varint" {
+    // Captured from a c-lean-libp2p / ngtcp2 client (lantern v0.0.5) dialing a
+    // zquic server.  The Length field uses a 4-byte varint encoding (0x80 00 04 94)
+    // for value 1172, which is RFC-compliant non-minimum encoding and is what
+    // aioquic / quinn correctly decrypt.  zquic's server-side AEAD was silently
+    // rejecting these Initials, causing zeam to drop every dial attempt from
+    // lantern with `server Initial AEAD/header-protection failed:
+    // AuthenticationFailed dcid_len=8 pn_start=28 payload_len=1172`.
+    //
+    // DCID = e9b1ca4aeeb36102, version = 0x00000001, PN = 0, pn_len = 1.
+    // Expected first plaintext byte = 0x06 (CRYPTO frame).
+    const testing = std.testing;
+    const raw_hex = "cb0000000108e9b1ca4aeeb3610208b924218da9ba10b100800004944bdab836d1f16b3fdfddb89f5d30b8ddd7e008cda49ec7d9ad878744b364866b1f24f1de932e26ec22c89b81dfb8afc219dd171914c06003d043a9961f86f217a141e807265d1f1c677b715418675fb08d5d68f8abf145553b03958c400ea01173217a55dec520dbe1874096530195ef7dd6662992274fae0f92d8e2b5e850beb10611a8329fe01eed5558de50232258226724e5176920b3b75582642a8c09f275365a424553b3d0adec10a156be26ed16839df644e0fba5406159a721567305d0cfeb88e4dcaf42d22a747062738429a472c46e991d40df3523f1abc4ddf7aaf13500f210029b46237a1be2ced837d5235230d0f8e03930b1c8618cf128deb0a77a0a4a3306445ce871b57734a7864923121961e401a0b82bf5ff4668b2795780007b08052d52b54e15d9a51a289bebcb9a3c086c32949716076ab5ba075277a55ca054d5c43fc2667cdbac2460d295a05e05b31f75b7ac29a43d8beaec136892cd3f6748557c5e1232a3e03700afad842d905f58ddc17dae2b2a0a8a7b3af1cfa32e19954f90b6a8adea01174e7e6fa65e82dc2302d38734d2b5f8dbc098d1a6b51d15f9279021080cca8247f919a94abeaa992b5a37b402fae99e7f89a86b704043c503f21520495c268b80dfb103b8e46e2dc6949b7db108e9c94ad8c79ec3bb13d71b34361582e27a3dfaef8044d65c4137471a35d82b6d320b40226689ad2df0e6771e6ed1ee33897c4efc809b77ca14c78556d8047ec43743f07efe5f534a399824d418ea725ec83993bcee5230e26197e484f59d6cf424b80eccc1977357189fa0aa5688fa39f1e83fa232ca02eea6ef71e5ecdc66cd47831d4cb246921ea6ee3b876740d95bd87e3246905cbc6c3fb2d3ba5f4f61dc695b20fbc506ab07a523bfbd621018803e1f8beccddd7fbeed2448dfd16c266bdaeb1af38f91cc4b9330e477a4d8f8fc8984a3d3ef64d1123b4ed6c9a4e233f1082095f92316779a9749e3265f06ab0883f3679283de7ec930dc85e3e000d6fb18f727c165461d4d06088b39544e2f5f89499f366b304c5f3987e07db6f3033dcd4546612d3aac41287290026e44292b334b09b540e3f6e9d4f7807be9e60bf743aefeaafb93eddae488b1dadf0ccbade3b1d1034e632aae64ba59bc7338fcbe06e050d036c0562395f1648fe07abb6b3bf21b140b188df2e74f9fffcdba7b91ff9f4e0ba3a88637c01e5e37e60d89481ed6f2610750e354d6b4985f3bbe4b0b3b247c640d84a19458a1759c09af2439a38a210911dc9df1427a7c87290bfc2a06530a7883142e7ef8fb681488e8ea173306fa7370a1a3d03c8ffbc0a9a9d9e4b26d996aaf58515b983d524760494bcc8769c789864a5f8d1cb663a2ba3e6f65f2ba11e1fa8519b847da4b04ac2d17cfbc6650c65e5c8a0121590848d629b976a15708f9ea157e99756ff0c95c0b021cb26190147c75d6b9bcaa0814cd4602c19adf6e4cec26015a75447688fb51b3aa42bfccda4b91b31886b4a5231beca1a03d4a83e57d3bf63e8ba310b96a23011774e7b06c06183e0a126e1fdfb3920818a76795690a1514f960f5bff3d9be6bd96d7e8c64862b1248bd27ff3a92d7ddb70e43ea48e17b6922bd0e7104a54b13a4db2479a8adc01aff1ec0";
+    var raw: [1500]u8 = undefined;
+    var i: usize = 0;
+    while (i < raw_hex.len / 2) : (i += 1) {
+        raw[i] = try std.fmt.parseInt(u8, raw_hex[i * 2 .. i * 2 + 2], 16);
+    }
+    const pkt = raw[0 .. raw_hex.len / 2];
+
+    const dcid = "\xe9\xb1\xca\x4a\xee\xb3\x61\x02";
+    const secrets = InitialSecrets.derive(dcid);
+
+    // Header layout: flags(1)+ver(4)+dcidlen(1)+dcid(8)+scidlen(1)+scid(8)+tok_len(1)+len(4 byte varint) = 28
+    const pn_start: usize = 28;
+    const payload_len: usize = 1172;
+
+    var pt: [4096]u8 = undefined;
+    const dec = try unprotectInitialPacket(&pt, pkt, pn_start, pn_start + payload_len, &secrets.client, null);
+    try testing.expectEqual(@as(u64, 0), dec.pn);
+    try testing.expect(dec.pt_len > 0);
+    // First plaintext byte must be a CRYPTO frame (0x06).
+    try testing.expectEqual(@as(u8, 0x06), pt[0]);
+}

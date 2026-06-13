@@ -3258,16 +3258,20 @@ pub const Server = struct {
         }
 
         // Find or create connection.
-        // First check by DCID (the server's assigned CID once established).
-        // Then check by peer address — a retransmitted Initial from the same
-        // client arrives before the client knows the server's CID (RFC 9002 §6.2).
+        // 1. By local_cid (DCID the server assigned after the first round trip).
+        // 2. By client-chosen ORIGINAL DCID (`init_dcid`) — this catches every
+        //    Initial retransmit before the client has switched to the server's
+        //    assigned CID (RFC 9002 §6.2).
+        // 3. As a last resort, by peer address — but only when the existing
+        //    conn's `init_dcid` matches `ip.dcid`.  Without this guard,
+        //    implementations that retry a fresh handshake with a *new* DCID
+        //    (e.g. ngtcp2 / c-lean-libp2p after a handshake timeout) get
+        //    silently routed to a stale connection whose Initial keys were
+        //    derived from the previous DCID, which fails AEAD on every packet.
         var conn: *ConnState = blk: {
             if (self.findConn(ip.dcid)) |c| break :blk c;
 
-            if (self.findConnByPeer(src)) |existing| {
-                // Retransmitted Initial before the client learns our CID: reuse the
-                // existing connection instead of opening a second one (which would
-                // rebuild the TLS flight and trigger quinn UnsolicitedEncryptedExtension).
+            if (self.findConnByInitDcid(ip.dcid)) |existing| {
                 if (existing.phase == .waiting_finished or existing.phase == .connected) {
                     self.replayStoredServerFlight(existing, src);
                     return;
@@ -3275,7 +3279,8 @@ pub const Server = struct {
                 break :blk existing;
             }
 
-            // Truly new connection
+            // Truly new connection (new DCID from this peer = new handshake
+            // attempt).
             const c = self.newConn(ip.dcid, ip.scid, src, is_v2_conn) orelse return;
             break :blk c;
         };
