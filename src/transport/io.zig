@@ -7066,7 +7066,14 @@ pub const Client = struct {
         const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
         try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
-        const dcid = ConnectionId.random(compat.random, 8);
+        // Client's first-Initial DCID is 18 bytes (vs the 8-byte SCID we
+        // hand out for our own CIDs). Some QUIC servers — observed:
+        // c-lean-libp2p (ngtcp2 + AWS-LC) as used by `lantern` — silently
+        // drop our Initial when the DCID is 8 bytes, even though RFC 9000
+        // §7.2 only mandates ≥8. quinn (rust) defaults to 20-byte DCID and
+        // is accepted; matching their length (modulo RFC 9000 §17.2's
+        // 20-byte cap) is the safest interop default.
+        const dcid = ConnectionId.random(compat.random, 18);
         const scid = ConnectionId.random(compat.random, 8);
 
         out.* = undefined;
@@ -7123,7 +7130,9 @@ pub const Client = struct {
         const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
         try compat.bind(sock, &bind_any.any, bind_any.getOsSockLen());
 
-        const dcid = ConnectionId.random(compat.random, 8);
+        // See `initInPlace` for why the client's first-Initial DCID is 18
+        // bytes (interop with c-lean-libp2p / lantern) while the SCID stays 8.
+        const dcid = ConnectionId.random(compat.random, 18);
         const scid = ConnectionId.random(compat.random, 8);
 
         out.* = undefined;
@@ -7827,8 +7836,9 @@ pub const Client = struct {
         const bind_any = compat.Address.parseIp4("0.0.0.0", 0) catch unreachable;
         try compat.bind(self.sock, &bind_any.any, bind_any.getOsSockLen());
 
-        // New random connection IDs.
-        const dcid = ConnectionId.random(compat.random, 8);
+        // New random connection IDs. Client's first-Initial DCID is 18 bytes
+        // (see `initInPlace` for the interop reasoning); our SCID is 8.
+        const dcid = ConnectionId.random(compat.random, 18);
         const scid = ConnectionId.random(compat.random, 8);
 
         for (&self.raw_app_recv) |*slot| {
