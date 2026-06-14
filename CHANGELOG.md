@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.27] - 2026-06-14
+
+### Fixed
+
+- **Root cause of the loss-detector free crash: never create a retransmit
+  buffer for zero-length (FIN-only) STREAM frames.** Every libp2p stream close
+  sends `sendRawStreamData(.., &[_]u8{}, true)`. The client and server send
+  paths duped that empty slice into a retransmit buffer; `dupe(u8, &.{})`
+  returns the allocator's zero-length sentinel slice (`ptr=0xffff…`, `len=0`).
+  Tracking it in a `SentPacket` and freeing it on ack/loss handed jemalloc a
+  bogus pointer → `Segmentation fault at 0x0` in `arena_dalloc_large`. Confirmed
+  live: the v1.7.26 guard logged every corrupt free as exactly
+  `ptr=0xffffffffffffffff len=0`. Both `Client.clientSendRawStreamFrame` and
+  `Server.sendRawStreamDataInner` now carry empty STREAM frames with no
+  retransmit buffer (`stream_data = null`). The `freeStreamDataChecked` guard
+  from v1.7.26 is retained as defense-in-depth. This also supersedes the earlier
+  server-side `edata_list_inactive_remove` alias band-aid (same root cause: two
+  empty dupes shared the sentinel pointer).
+
 ## [v1.7.26] - 2026-06-14
 
 ### Fixed

@@ -2799,32 +2799,38 @@ pub const Server = struct {
             if (is_fresh) conn.pacerConsume(@intCast(data.len));
             return data.len;
         }
-        const buf = owned_buf orelse blk: {
+        // Zero-length STREAM frames (FIN-only stream closes) have nothing to
+        // retransmit.  `dupe(u8, &.{})` returns the allocator's zero-length
+        // sentinel slice (ptr 0xffff…, len 0); attaching and freeing it on
+        // ack/loss hands jemalloc a bogus pointer and segfaults.  (The prior
+        // `edata_list_inactive_remove` SIGSEGV referenced below was the same
+        // bug: two empty dupes share the sentinel ptr, so the alias guard
+        // skipped the free and left the sentinel attached to crash later in
+        // `onAck`.)  Carry such packets with no retransmit buffer.
+        const buf: ?[]u8 = if (owned_buf) |b| b else if (data.len == 0) null else (self.allocator.dupe(u8, data) catch {
             // First send: copy the embedder-supplied data onto the heap so we
             // own it until the carrying packet is acked (the embedder's slice
             // typically points into a transient frame buffer).
-            const dup = self.allocator.dupe(u8, data) catch {
-                if (is_fresh) conn.pacerConsume(@intCast(data.len));
-                return data.len;
-            };
-            break :blk dup;
-        };
-        // Defence-in-depth: free any pre-existing data so we don't leak if
-        // some unrelated path already attached one.  Guard against the
-        // alias case where `old.ptr == buf.ptr` — without this, the retx
-        // path that passes the same slice as both `data` and `owned_buf`
-        // could free `buf` and then immediately store the same dangling
-        // pointer, corrupting jemalloc's slab metadata once the buffer's
-        // slot is reused.  Seen as a SIGSEGV deep in
-        // `edata_list_inactive_remove` on a wedged-cwnd devnet (zeam #?).
-        if (last.stream_data) |old| {
-            if (old.ptr != buf.ptr) self.allocator.free(old);
+            if (is_fresh) conn.pacerConsume(@intCast(data.len));
+            return data.len;
+        });
+        if (buf) |b| {
+            // Defence-in-depth: free any pre-existing data so we don't leak if
+            // some unrelated path already attached one.  Guard against the
+            // alias case where `old.ptr == b.ptr` — without this, the retx
+            // path that passes the same slice as both `data` and `owned_buf`
+            // could free `b` and then immediately store the same dangling
+            // pointer, corrupting jemalloc's slab metadata once the buffer's
+            // slot is reused.
+            if (last.stream_data) |old| {
+                if (old.ptr != b.ptr) self.allocator.free(old);
+            }
+            last.has_stream_data = true;
+            last.stream_id = stream_id;
+            last.stream_offset = offset;
+            last.stream_data = b;
+            last.stream_fin = fin;
         }
-        last.has_stream_data = true;
-        last.stream_id = stream_id;
-        last.stream_offset = offset;
-        last.stream_data = buf;
-        last.stream_fin = fin;
         if (is_fresh) conn.pacerConsume(@intCast(data.len));
         return data.len;
     }
@@ -7539,10 +7545,14 @@ pub const Client = struct {
 
         // Track for retransmit.  See Server.sendRawStreamDataInner for the
         // ownership-transfer protocol; the Client mirrors it.
-        const buf = owned_buf orelse blk: {
-            const dup = self.allocator.dupe(u8, data) catch return 0;
-            break :blk dup;
-        };
+        //
+        // Zero-length STREAM frames (FIN-only — every libp2p stream close sends
+        // `sendRawStreamData(.., &[_]u8{}, true)`) have nothing to retransmit.
+        // `dupe(u8, &.{})` returns the allocator's zero-length sentinel slice
+        // (ptr 0xffff…, len 0); tracking it and freeing it on ack/loss hands
+        // jemalloc a bogus pointer and segfaults (`arena_dalloc_large`).  Carry
+        // such packets with no retransmit buffer instead.
+        const buf: ?[]u8 = if (owned_buf) |b| b else if (data.len == 0) null else (self.allocator.dupe(u8, data) catch return 0);
         self.conn.note1RttSent();
         const recorded = self.conn.ld.onPacketSent(.{
             .pn = pn,
@@ -7550,7 +7560,7 @@ pub const Client = struct {
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
-            .has_stream_data = true,
+            .has_stream_data = buf != null,
             .stream_id = stream_id,
             .stream_offset = offset,
             .stream_data = buf,
@@ -7568,7 +7578,7 @@ pub const Client = struct {
         if (!recorded) {
             // LD full — caller's data has already gone on the wire; we just
             // can't retransmit it on loss.  Free the buffer to avoid the leak.
-            self.allocator.free(buf);
+            if (buf) |b| self.allocator.free(b);
         }
         return data.len;
     }
