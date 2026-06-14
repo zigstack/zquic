@@ -7308,6 +7308,39 @@ pub const Client = struct {
     /// Send one ack-eliciting 1-RTT packet with `payload` frames.  Updates
     /// LD+CC like `Server.send1Rtt`.  Returns the packet number sent, or
     /// null if not connected or wire I/O fails.
+    /// Extend the peer's stream credit (MAX_STREAMS, RFC 9000 §19.11) for a
+    /// peer-initiated stream.  From a client's perspective the peer (server)
+    /// initiates streams with `stream_id & 3 == 1` (bidi) or `== 3` (uni).
+    /// Mirrors the server-side replenishment so a peer opening one stream per
+    /// reqresp request keeps getting credit on a long-lived connection.
+    fn clientReplenishPeerStreamCredit(self: *Client, stream_id: u64) void {
+        const t = stream_id & 3;
+        if (t != 1 and t != 3) return; // only peer- (server-) initiated streams
+        const bidi = t == 1;
+        const count = (stream_id >> 2) + 1; // RFC 9000 §2.1 stream count
+        if (bidi) {
+            if (count > self.conn.peer_bidi_stream_count) self.conn.peer_bidi_stream_count = count;
+        } else {
+            if (count > self.conn.peer_uni_stream_count) self.conn.peer_uni_stream_count = count;
+        }
+        const limit: u64 = if (bidi) self.conn.max_streams_bidi_recv else self.conn.max_streams_uni_recv;
+        const used: u64 = if (bidi) self.conn.peer_bidi_stream_count else self.conn.peer_uni_stream_count;
+        // Raise once the peer has consumed >=50% of the granted credit (matches
+        // the server path and the MAX_DATA 50% rule in RFC 9000 §4.2).
+        if (used * 2 < limit) return;
+        const new_limit = limit + 1000;
+        var buf: [16]u8 = undefined;
+        buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13);
+        const enc = varint.encode(buf[1..], new_limit) catch return;
+        _ = self.sendClient1Rtt(buf[0 .. 1 + enc.len]) orelse return;
+        if (bidi) {
+            self.conn.max_streams_bidi_recv = new_limit;
+        } else {
+            self.conn.max_streams_uni_recv = new_limit;
+        }
+        dbg("io: client sent MAX_STREAMS bidi={} new_limit={}\n", .{ bidi, new_limit });
+    }
+
     fn sendClient1Rtt(self: *Client, payload: []const u8) ?u64 {
         if (self.conn.phase != .connected or !self.conn.has_app_keys) return null;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -9130,6 +9163,12 @@ pub const Client = struct {
                     return;
                 }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
+                // Replenish MAX_STREAMS for peer- (server-) initiated streams so a
+                // peer that opens one stream per request (libp2p reqresp) doesn't
+                // starve after the initial grant.  The server path does this; the
+                // client path previously did not, so a long-lived connection's
+                // peer would eventually be blocked from opening new streams.
+                self.clientReplenishPeerStreamCredit(sf_r.frame.stream_id);
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
             }
