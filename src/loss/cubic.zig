@@ -34,8 +34,8 @@ const BETA_NUM: u64 = 7;
 const BETA_DEN: u64 = 10;
 
 pub const Cubic = struct {
-    /// Congestion window in bytes.
-    cwnd: u64 = 10 * mss,
+    /// Congestion window in bytes.  Initial window of 32·MSS (see NewReno).
+    cwnd: u64 = 32 * mss,
     /// Slow start threshold.
     ssthresh: u64 = max_cwnd,
     /// Bytes in flight.
@@ -54,6 +54,9 @@ pub const Cubic = struct {
     tcp_cwnd: u64 = 0,
     /// Bytes ACKed in current congestion avoidance epoch (for TCP-friendly estimate).
     bytes_acked_ca: u64 = 0,
+    /// Diagnostics (not used in CC math): see NewReno.
+    congestion_events: u64 = 0,
+    total_bytes_acked: u64 = 0,
 
     pub fn init() Cubic {
         return .{};
@@ -61,6 +64,7 @@ pub const Cubic = struct {
 
     /// Called when packets are acknowledged.
     pub fn onAck(self: *Cubic, bytes_acked: u64) void {
+        self.total_bytes_acked +|= bytes_acked;
         self.bytes_in_flight -|= bytes_acked;
 
         if (self.state == .recovery) {
@@ -148,6 +152,7 @@ pub const Cubic = struct {
         // Reset epoch so next congestion avoidance starts fresh.
         self.epoch_start_ms = null;
         self.bytes_acked_ca = 0;
+        self.congestion_events += 1;
     }
 
     /// Called when persistent congestion is detected (RFC 9002 §7.6.3).

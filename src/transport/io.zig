@@ -983,8 +983,8 @@ const PendingStreamSend = struct {
 //     instead of tearing the stream down), which works fine at the lower
 //     cap.  The 4096 path is left as a follow-up once the raw-stream
 //     retx ownership / memory hygiene has been audited.
-const pending_stream_send_cap: usize = 1024;
-const pending_stream_send_bytes_cap: usize = 8 * 1024 * 1024;
+const pending_stream_send_cap: usize = 4096;
+const pending_stream_send_bytes_cap: usize = 32 * 1024 * 1024;
 /// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
 /// Without this cap, the coalesce path used to grow a single entry to tens of KB
@@ -1181,6 +1181,27 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
             recovery.LossDetector.max_tracked_packets,
             conn.fc_bytes_sent,
             conn.fc_send_max,
+        },
+    );
+    // Backpressure CC trace (visible at info): distinguishes a cwnd pinned by
+    // repeated losses (`cong_events` climbing) from ACK-clock starvation
+    // (`acked` flat / few ACKs).  `state` shows whether we are stuck in
+    // congestion-avoidance; RTT (ms) shows whether the path RTT is being
+    // measured at all on a sub-ms localhost link.
+    log.info(
+        "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={}",
+        .{
+            side,
+            @tagName(block),
+            conn.cc.getCwnd(),
+            conn.cc.getSsthresh(),
+            @tagName(conn.cc.getState()),
+            conn.cc.getBytesInFlight(),
+            conn.cc.getCongestionEvents(),
+            conn.cc.getTotalBytesAcked(),
+            conn.rtt.srtt_ms,
+            conn.rtt.min_rtt_ms,
+            conn.rtt.latest_rtt_ms,
         },
     );
 }
@@ -4649,15 +4670,24 @@ pub const Server = struct {
                         if (ec.ect1 > conn.peer_ecn_ect1) conn.peer_ecn_ect1 = ec.ect1;
                     }
                 }
-                // Persistent congestion (RFC 9002 §7.6): collapse cwnd to the
-                // minimum window when the loss detector reports a long-enough
-                // unbroken span of lost ack-eliciting packets.
+                // Congestion response to loss: react ONCE per ACK using the
+                // largest lost PN (RFC 9002 §7.3.2 — one reduction per loss
+                // event).  `onLoss` is gated by `end_of_recovery`, but
+                // `lost_buf` PNs are in arbitrary (swap-removed) order, so
+                // calling it per lost packet halved cwnd once per ascending PN —
+                // collapsing cwnd to cwnd/2ⁿ on any multi-packet loss.  Call it
+                // once here instead.
+                if (ld_result.largest_lost_pn) |llpn| conn.cc.onLoss(llpn);
+                // Persistent congestion (RFC 9002 §7.6) overrides the above:
+                // collapse cwnd to the minimum window when the loss detector
+                // reports a long-enough unbroken span of lost ack-eliciting
+                // packets.
                 if (ld_result.persistent_congestion) {
                     dbg("io: persistent congestion detected — resetting cwnd\n", .{});
                     conn.cc.onPersistentCongestion();
                 }
-                // Signal loss events to CC and rewind any affected HTTP/0.9
-                // stream slots so lost data is retransmitted (RFC 9000 §3.3).
+                // Rewind any affected HTTP/0.9 / raw-app stream slots so lost
+                // data is retransmitted (RFC 9000 §3.3).
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
                     const lp = lost_buf[li];
@@ -4667,7 +4697,6 @@ pub const Server = struct {
                             conn.syncPathMtuFields();
                         }
                     }
-                    conn.cc.onLoss(lp.pn);
                     // Retransmit: if the lost packet carried stream data, rewind
                     // the corresponding slot so the data is re-sent.
                     if (lp.has_stream_data) {
@@ -8957,7 +8986,16 @@ pub const Client = struct {
                         if (ec.ect1 > self.conn.peer_ecn_ect1) self.conn.peer_ecn_ect1 = ec.ect1;
                     }
                 }
-                // Persistent congestion (RFC 9002 §7.6).
+                // Congestion response to loss: react ONCE per ACK using the
+                // largest lost PN (RFC 9002 §7.3.2 — one reduction per loss
+                // event / recovery period).  `onLoss` is gated by
+                // `end_of_recovery`, but `lost_buf` PNs are in arbitrary
+                // (swap-removed) order, so calling it per lost packet inside the
+                // loop below halved cwnd once per ascending PN — collapsing
+                // cwnd to cwnd/2ⁿ on any multi-packet loss and pinning the
+                // window tiny under gossip load.  Call it once here instead.
+                if (ld_result.largest_lost_pn) |llpn| self.conn.cc.onLoss(llpn);
+                // Persistent congestion (RFC 9002 §7.6) overrides the above.
                 if (ld_result.persistent_congestion) {
                     dbg("io: persistent congestion detected — resetting cwnd\n", .{});
                     self.conn.cc.onPersistentCongestion();
@@ -8973,7 +9011,6 @@ pub const Client = struct {
                             self.conn.syncPathMtuFields();
                         }
                     }
-                    self.conn.cc.onLoss(lp.pn);
                     if (lp.stream_data) |sbuf| {
                         const rtx_bytes: u64 = @intCast(sbuf.len);
                         if (connCanTransmitAppData(&self.conn, compat.milliTimestamp(), rtx_bytes)) {

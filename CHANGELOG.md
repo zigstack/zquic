@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.30] - 2026-06-15
+
+### Fixed
+
+- **Congestion window collapse on multi-packet loss.** Both the client and
+  server loss arms called `cc.onLoss(lp.pn)` **once per lost packet** inside the
+  `lost_buf` loop. `onLoss` halves cwnd whenever `pn > end_of_recovery`, and
+  `lost_buf` PNs arrive in arbitrary (swap-removed) order — so a single
+  multi-packet loss event halved cwnd repeatedly (cwnd → cwnd/2ⁿ), pinning the
+  window tiny (~15 MSS observed) and starving the persistent `/meshsub` gossip
+  stream into permanent backpressure (queue-full + sync lag on zeam↔lantern).
+  Now `cc.onLoss` is called **once per ACK** with `OnAckResult.largest_lost_pn`,
+  as RFC 9002 §7.3.2 intends (one reduction per loss event).
+
+### Changed
+
+- **Initial congestion window raised 10 → 32 MSS** (NewReno + Cubic; RFC 9002
+  §7.2 permits a larger IW), giving bursty single-stream gossip headroom before
+  ACK-clocking dominates.
+- **Per-stream pending-send caps raised** to 4096 entries / 32 MiB (from 1024 /
+  8 MiB) to absorb transient bursts without cratering into backpressure.
+
+### Added
+
+- **Backpressure CC trace** (`info`): on a drain stall, log
+  `cwnd / ssthresh / state / bif / cong_events / acked / srtt / min_rtt /
+  latest_rtt` so a cwnd pinned by losses (`cong_events` climbing) is
+  distinguishable from ACK-clock starvation (`acked` flat).
+
 ## [v1.7.29] - 2026-06-15
 
 ### Fixed

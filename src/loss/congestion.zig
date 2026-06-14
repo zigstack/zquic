@@ -25,8 +25,10 @@ pub const CcState = enum {
 
 /// New Reno congestion controller.
 pub const NewReno = struct {
-    /// Congestion window in bytes.
-    cwnd: u64 = 10 * mss,
+    /// Congestion window in bytes.  Initial window of 32·MSS (RFC 9002 §7.2
+    /// permits a larger IW on paths known to tolerate it; raised from 10·MSS so
+    /// bursty single-stream gossip has headroom before ACK-clocking dominates).
+    cwnd: u64 = 32 * mss,
     /// Slow start threshold.
     ssthresh: u64 = max_cwnd,
     /// Bytes in flight.
@@ -37,6 +39,10 @@ pub const NewReno = struct {
     bytes_acked_ca: u64 = 0,
     /// Largest ACKed packet number in the current recovery period.
     end_of_recovery: ?u64 = null,
+    /// Diagnostics (not used in CC math): total congestion-reduction events and
+    /// cumulative bytes ACKed, for the backpressure CC trace.
+    congestion_events: u64 = 0,
+    total_bytes_acked: u64 = 0,
 
     pub fn init() NewReno {
         return .{};
@@ -44,6 +50,7 @@ pub const NewReno = struct {
 
     /// Called when packets are acknowledged.
     pub fn onAck(self: *NewReno, bytes_acked: u64) void {
+        self.total_bytes_acked +|= bytes_acked;
         self.bytes_in_flight -|= bytes_acked;
 
         if (self.state == .recovery) {
@@ -79,6 +86,7 @@ pub const NewReno = struct {
         self.cwnd = self.ssthresh;
         self.bytes_acked_ca = 0;
         self.state = .recovery;
+        self.congestion_events += 1;
     }
 
     /// Called when persistent congestion is detected (RFC 9002 §7.6.3).
@@ -182,6 +190,33 @@ pub const CongestionController = union(enum) {
     pub fn getCwnd(self: *const CongestionController) u64 {
         switch (self.*) {
             inline else => |cc| return cc.cwnd,
+        }
+    }
+
+    /// Diagnostics accessors (backpressure CC trace).
+    pub fn getSsthresh(self: *const CongestionController) u64 {
+        switch (self.*) {
+            inline else => |cc| return cc.ssthresh,
+        }
+    }
+
+    pub fn getState(self: *const CongestionController) CcState {
+        switch (self.*) {
+            inline else => |cc| return cc.state,
+        }
+    }
+
+    pub fn getCongestionEvents(self: *const CongestionController) u64 {
+        switch (self.*) {
+            .new_reno => |cc| return cc.congestion_events,
+            .cubic => |cc| return cc.congestion_events,
+        }
+    }
+
+    pub fn getTotalBytesAcked(self: *const CongestionController) u64 {
+        switch (self.*) {
+            .new_reno => |cc| return cc.total_bytes_acked,
+            .cubic => |cc| return cc.total_bytes_acked,
         }
     }
 
