@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.28] - 2026-06-14
+
+### Fixed
+
+- **Retransmit lost FIN-only STREAM frames.** v1.7.27 stopped tracking a
+  retransmit buffer for empty (FIN-only) frames to avoid the zero-length
+  sentinel free — but that also dropped FIN retransmission entirely: a lost
+  stream-close FIN was never re-sent, leaving the peer's stream half-open and
+  hanging req/resp until timeout (observed as sync lag on zeam↔lantern). The
+  client and server loss arms now re-send a bare FIN (empty STREAM frame, no
+  buffer) when a FIN-only packet is declared lost, and the server send path
+  marks FIN-only packets so the loss arm surfaces them.
+
+### Changed
+
+- **Demote the `refusing to free corrupt stream_data` guard log from `warn` to
+  `debug`.** With the v1.7.27 root-cause fix in place the guard should never
+  fire in normal operation; keep it quiet as pure defense-in-depth.
+
 ## [v1.7.27] - 2026-06-14
 
 ### Fixed

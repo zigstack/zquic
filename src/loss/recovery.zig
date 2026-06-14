@@ -36,7 +36,7 @@ fn streamDataLooksFreeable(sd: []const u8) bool {
 /// the whole node.  Returns true when the buffer was actually freed.
 fn freeStreamDataChecked(allocator: std.mem.Allocator, sd: []u8, pn: u64, stream_id: u64) bool {
     if (!streamDataLooksFreeable(sd)) {
-        log.warn(
+        log.debug(
             "recovery: refusing to free corrupt stream_data: pn={} stream_id={} ptr=0x{x} len={} — skipping (suspected SentPacket corruption)",
             .{ pn, stream_id, @intFromPtr(sd.ptr), sd.len },
         );

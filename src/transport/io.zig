@@ -2830,6 +2830,15 @@ pub const Server = struct {
             last.stream_offset = offset;
             last.stream_data = b;
             last.stream_fin = fin;
+        } else if (fin) {
+            // FIN-only frame (empty data): no retransmit buffer, but mark the
+            // packet so the loss arm re-sends the bare FIN if it is lost (the
+            // raw-app retransmit loop gates on `has_stream_data`).
+            last.has_stream_data = true;
+            last.stream_id = stream_id;
+            last.stream_offset = offset;
+            last.stream_data = null;
+            last.stream_fin = true;
         }
         if (is_fresh) conn.pacerConsume(@intCast(data.len));
         return data.len;
@@ -4748,6 +4757,14 @@ pub const Server = struct {
                             } else if (!http09QueueRtx(conn, lp.stream_id, lp.stream_offset, lp.stream_fin, buf)) {
                                 self.allocator.free(buf);
                             }
+                        } else if (lp.stream_fin) {
+                            // FIN-only STREAM frame (empty data — stream close)
+                            // was lost.  No retransmit buffer is tracked for
+                            // empty frames (that would dup the allocator's
+                            // zero-length sentinel), so re-send the bare FIN
+                            // directly.  Dropping it would leave the peer's
+                            // stream half-open and hang req/resp until timeout.
+                            _ = self.sendRawStreamDataInner(conn, lp.stream_id, lp.stream_offset, &[_]u8{}, true, null);
                         }
                     }
                 }
@@ -8961,6 +8978,14 @@ pub const Client = struct {
                         )) {
                             self.allocator.free(sbuf);
                         }
+                    } else if (lp.stream_fin) {
+                        // FIN-only STREAM frame (empty data — a libp2p stream
+                        // close) was lost.  No retransmit buffer is tracked for
+                        // empty frames (that would dup the allocator's
+                        // zero-length sentinel), so re-send the bare FIN
+                        // directly.  Dropping it would leave the peer's stream
+                        // half-open and hang req/resp until timeout.
+                        _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, &[_]u8{}, true, null);
                     }
                 }
                 // ACK received — reset PTO backoff counter and record timestamp
