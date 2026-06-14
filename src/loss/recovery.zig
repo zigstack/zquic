@@ -7,6 +7,45 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.zquic);
+
+/// Upper bound on a sane `stream_data` retransmit buffer length.  No legitimate
+/// QUIC STREAM-frame retransmit buffer approaches this: fresh sends carry at
+/// most one application chunk (gossip blocks are a few MiB at the extreme) and
+/// coalesced pending sends are capped well under one datagram.  A length above
+/// this means the `SentPacket` we are about to free was read from memory that
+/// is not a valid tracked packet (e.g. an uninitialized slot surfaced by a
+/// `sent_count` that drifted out of range) — freeing its `stream_data` would
+/// hand jemalloc a garbage pointer and segfault.  See `freeStreamDataChecked`.
+const max_sane_stream_data_len: usize = 64 * 1024 * 1024;
+
+/// Pure predicate: does `sd` look like a real, freeable retransmit buffer?  A
+/// zero or absurd length is the signature of a corrupted/uninitialized
+/// `SentPacket` (e.g. a slot surfaced by a `sent_count` that drifted out of
+/// range).  Kept free of side effects so it is unit-testable without emitting
+/// the warning that the wrapper does.
+fn streamDataLooksFreeable(sd: []const u8) bool {
+    return sd.len != 0 and sd.len <= max_sane_stream_data_len;
+}
+
+/// Free a `SentPacket.stream_data` retransmit buffer, but first sanity-check the
+/// slice via `streamDataLooksFreeable`.  Rather than hand jemalloc a garbage
+/// pointer and segfault, a failed check logs the offending descriptor (so the
+/// corruption is diagnosable on the next occurrence) and skips the free.
+/// Skipping leaks at most one small buffer — vastly preferable to taking down
+/// the whole node.  Returns true when the buffer was actually freed.
+fn freeStreamDataChecked(allocator: std.mem.Allocator, sd: []u8, pn: u64, stream_id: u64) bool {
+    if (!streamDataLooksFreeable(sd)) {
+        log.warn(
+            "recovery: refusing to free corrupt stream_data: pn={} stream_id={} ptr=0x{x} len={} — skipping (suspected SentPacket corruption)",
+            .{ pn, stream_id, @intFromPtr(sd.ptr), sd.len },
+        );
+        return false;
+    }
+    allocator.free(sd);
+    return true;
+}
+
 /// Initial RTT estimate (333ms per RFC 9002 §6.2.2)
 pub const initial_rtt_ms: u64 = 333;
 
@@ -143,7 +182,7 @@ pub const LossDetector = struct {
     /// Caller passes the same allocator used when populating `stream_data`.
     pub fn deinit(self: *LossDetector, allocator: std.mem.Allocator) void {
         for (self.sent[0..self.sent_count]) |*p| {
-            if (p.stream_data) |sd| allocator.free(sd);
+            if (p.stream_data) |sd| _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
             p.stream_data = null;
         }
         self.sent_count = 0;
@@ -278,7 +317,7 @@ pub const LossDetector = struct {
                     } else earliest_acked_eliciting_send_time = p.send_time_ms;
                 }
                 if (self.sent[i].stream_data) |sd| {
-                    allocator.free(sd);
+                    _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
                     self.sent[i].stream_data = null;
                 }
                 self.sent[i] = self.sent[self.sent_count - 1];
@@ -314,7 +353,7 @@ pub const LossDetector = struct {
                     lost_count += 1;
                 } else {
                     if (self.sent[i].stream_data) |sd| {
-                        allocator.free(sd);
+                        _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
                         self.sent[i].stream_data = null;
                     }
                 }
@@ -590,4 +629,120 @@ test "loss: stream_data is freed on ack and transferred on loss" {
         }
     }
     try testing.expect(saw_transfer);
+}
+
+test "loss: streamDataLooksFreeable rejects corrupt lengths, accepts sane ones" {
+    const testing = std.testing;
+    // Garbage lengths (uninitialized SentPacket) are rejected — predicate is
+    // pure, so this asserts the skip decision without emitting the wrapper's
+    // warning (which would trip the test runner's no-log policy).
+    var stack_byte: u8 = 0;
+    const huge: []const u8 = @as([*]const u8, @ptrCast(&stack_byte))[0 .. max_sane_stream_data_len + 1];
+    try testing.expect(!streamDataLooksFreeable(huge));
+    const empty: []const u8 = @as([*]const u8, @ptrCast(&stack_byte))[0..0];
+    try testing.expect(!streamDataLooksFreeable(empty));
+
+    // A sane-length slice passes, and freeStreamDataChecked frees it cleanly
+    // (testing.allocator would flag a leak if the guard wrongly skipped it).
+    const a = testing.allocator;
+    const real = try a.dupe(u8, "retransmit");
+    try testing.expect(streamDataLooksFreeable(real));
+    try testing.expect(freeStreamDataChecked(a, real, 9, 1));
+}
+
+test "loss: stream_data ownership survives adversarial send/ack/retransmit churn at cap" {
+    // Reproduces the io.zig client retransmit ownership protocol under heavy
+    // load near the 2048-packet cap:
+    //   - onPacketSent with a heap-owned stream_data slice (dup'd here, like
+    //     clientSendRawStreamFrame's `dupe`).  On `false` (LD full) the caller
+    //     owns the slice and must free it (io.zig:7571).
+    //   - onAck frees acked stream_data internally and TRANSFERS lost
+    //     stream_data into lost_buf (ownership moves to caller), capping at
+    //     lost_buf.len and freeing the overflow internally.
+    //   - For each returned lost descriptor with stream_data, re-send it under
+    //     a FRESH pn transferring ownership back into the LD (io.zig:8941).
+    // testing.allocator flags any double-free / use-after-free / leak.
+    const testing = std.testing;
+    const a = testing.allocator;
+    var ld = LossDetector{};
+    defer ld.deinit(a);
+    var rtt = RttEstimator{};
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+
+    var next_pn: u64 = 0;
+    var now: u64 = 1000;
+    var lost_buf: [32]SentPacket = undefined;
+
+    // Helper: emit one fresh STREAM packet with a heap stream_data slice,
+    // honoring the caller-frees-on-false contract.
+    const Helper = struct {
+        fn send(d: *LossDetector, alloc: std.mem.Allocator, pn: u64, t: u64, sd: []u8) void {
+            const recorded = d.onPacketSent(.{
+                .pn = pn,
+                .send_time_ms = @intCast(t),
+                .size = sd.len + 30,
+                .ack_eliciting = true,
+                .in_flight = true,
+                .has_stream_data = true,
+                .stream_id = 4,
+                .stream_offset = pn,
+                .stream_data = sd,
+            });
+            if (!recorded) alloc.free(sd); // io.zig:7571 contract
+        }
+    };
+
+    var iter: usize = 0;
+    while (iter < 200_000) : (iter += 1) {
+        now += 1 + rand.uintLessThan(u64, 5);
+
+        // Burst of fresh sends to push toward the cap.
+        const burst = 1 + rand.uintLessThan(usize, 6);
+        var b: usize = 0;
+        while (b < burst) : (b += 1) {
+            const len = 1 + rand.uintLessThan(usize, 1200);
+            const sd = a.alloc(u8, len) catch return error.OutOfMemory;
+            Helper.send(&ld, a, next_pn, now, sd);
+            next_pn += 1;
+        }
+
+        if (ld.sent_count == 0) continue;
+
+        // Ack near the tail, sometimes with a gap so older PNs are declared
+        // lost by the packet/time threshold.
+        const top = next_pn - 1;
+        const range: u64 = rand.uintLessThan(u64, 8);
+        const largest = top -| rand.uintLessThan(u64, 3);
+        const first_range = @min(range, largest);
+
+        const r = ld.onAck(largest, first_range, 0, now, &rtt, &lost_buf, a) catch {
+            continue;
+        };
+
+        // Retransmit every lost descriptor that carried stream_data, under a
+        // fresh pn — ownership transfers back into the LD (or is freed on the
+        // caller-frees contract when the LD is full).
+        var li: usize = 0;
+        while (li < r.lost_count) : (li += 1) {
+            if (lost_buf[li].stream_data) |sbuf| {
+                Helper.send(&ld, a, next_pn, now, sbuf);
+                next_pn += 1;
+            }
+        }
+
+        // Occasionally advance time far enough to flush the whole window via
+        // the time-threshold loss path, exercising large single-ACK losses.
+        if (iter % 4096 == 0 and ld.sent_count > 0) {
+            now += 10_000;
+            const flush = ld.onAck(next_pn -| 1, 0, 0, now, &rtt, &lost_buf, a) catch continue;
+            var fi: usize = 0;
+            while (fi < flush.lost_count) : (fi += 1) {
+                if (lost_buf[fi].stream_data) |sbuf| a.free(sbuf);
+            }
+        }
+    }
+    // ld.deinit frees any stream_data still tracked — testing.allocator will
+    // flag a leak if the ownership accounting dropped a buffer.
 }

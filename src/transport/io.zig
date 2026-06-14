@@ -1156,7 +1156,7 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     const pace_bytes = @min(head_bytes, congestion.mss);
     const block = connTransmitBlock(conn, pace_bytes) orelse return;
     conn.pending_stream_stall_warn_ms = now_ms;
-    log.warn(
+    log.debug(
         "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
         .{
             side,

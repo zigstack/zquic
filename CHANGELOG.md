@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.26] - 2026-06-14
+
+### Fixed
+
+- **Loss detector: guard `stream_data` retransmit-buffer frees against corrupt
+  descriptors.** Under heavy gossip send load a `SentPacket` could reach
+  `onAck`'s free path with a garbage `stream_data` slice (zero / absurd
+  length), segfaulting deep in jemalloc (`arena_dalloc_large`, address `0x0`)
+  and taking down the embedding node (seen on zeam↔lantern devnets). The loss
+  detector's own ownership logic is proven correct (200k-iteration adversarial
+  fuzz of the `onPacketSent → onAck → lost_buf transfer → retransmit` protocol
+  under the testing allocator), so the corruption arrives from outside it.
+  `freeStreamDataChecked` now validates the slice length before freeing: a
+  suspect descriptor is logged with `pn / stream_id / ptr / len` and the free is
+  skipped (leaks ≤ one small buffer) rather than crashing the process. This is a
+  survivable mitigation + diagnostic, not a root-cause fix.
+
+### Changed
+
+- **Demote the `pending-stream-send drain stalled` log from `warn` to `debug`**
+  — it is expected backpressure under flow-control / congestion limits and was
+  noisy on busy connections.
+
 ## [v1.7.6] - 2026-06-12
 
 ### Fixed
