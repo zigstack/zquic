@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.29] - 2026-06-15
+
+### Fixed
+
+- **Never queue a zero-length (FIN-only) frame in `pending_stream_sends`.** The
+  v1.7.28 FIN-only retransmit, when the re-send was congestion-blocked (exactly
+  the heavy-backpressure case), routed empty data through
+  `enqueuePendingStreamSend` → `dupe(u8, &.{})`, storing the allocator's
+  zero-length sentinel slice (`ptr=0xffff…`) in the pending queue. The drain
+  path later freed that sentinel **directly** (`allocator.free`, bypassing the
+  v1.7.26 onAck guard), corrupting the drive thread's jemalloc tcache — which
+  surfaced as a `Segmentation fault at 0x0` in an unrelated later allocation
+  (observed in zig-libp2p `drainGossipsubOutbox` on zeam↔lantern under gossip
+  backpressure). Both `enqueuePendingStreamSend` and
+  `enqueuePendingStreamSendOwned` now reject zero-length frames at the source.
+
 ## [v1.7.28] - 2026-06-14
 
 ### Fixed

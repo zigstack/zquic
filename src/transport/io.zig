@@ -1008,6 +1008,13 @@ fn enqueuePendingStreamSend(
     data: []const u8,
     fin: bool,
 ) bool {
+    // Empty (FIN-only) frames carry no retransmittable data and must never be
+    // queued: `dupe(u8, &.{})` returns the allocator's zero-length sentinel
+    // slice (ptr 0xffff…, len 0), which the drain path would later hand to
+    // `allocator.free` and corrupt jemalloc's per-thread cache — surfacing as a
+    // SIGSEGV in an unrelated later allocation (e.g. drainGossipsubOutbox).  The
+    // FIN bit itself is replayed directly by the loss arm, not via this queue.
+    if (data.len == 0) return true;
     // Embedder may retry the same offset after a backpressure 0; treat as
     // already accepted so we do not fill the queue with duplicate copies.
     for (conn.pending_stream_sends.items) |e| {
@@ -1059,6 +1066,11 @@ fn enqueuePendingStreamSendOwned(
     owned: []u8,
     fin: bool,
 ) bool {
+    // Empty (FIN-only) frames carry no retransmittable data; never queue them.
+    // Do NOT free `owned` — a zero-length slice is the allocator's sentinel,
+    // not a real allocation, and freeing it corrupts the heap.  (Post-v1.7.27
+    // the retransmit path never tracks empty stream_data, so this is defensive.)
+    if (owned.len == 0) return true;
     for (conn.pending_stream_sends.items) |e| {
         if (e.stream_id == stream_id and e.offset == offset) {
             allocator.free(owned);
