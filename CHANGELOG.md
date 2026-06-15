@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.32] - 2026-06-15
+
+### Changed
+
+- **Complete the backpressure diagnostic line.** The `queue full` warning now
+  also carries `fc_sent / fc_max / stream_lim`, so one log line distinguishes
+  congestion-blocked (`cwnd` small / `cong_events` climbing) from
+  connection-flow-control-blocked (`fc_sent` ≈ `fc_max`) from
+  per-stream-flow-control-blocked (`fc_sent` ≈ `stream_lim`) from a send-logic
+  stall (cwnd large, fc open). Supersedes v1.7.31.
+
 ## [v1.7.31] - 2026-06-15
 
 ### Changed
