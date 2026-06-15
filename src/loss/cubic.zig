@@ -146,7 +146,7 @@ pub const Cubic = struct {
         // Save W_max before reducing (in MSS units).
         self.w_max = self.cwnd / mss;
         // Multiplicative decrease: cwnd = cwnd × β.
-        self.ssthresh = @max(self.cwnd * BETA_NUM / BETA_DEN, 2 * mss);
+        self.ssthresh = @max(self.cwnd * BETA_NUM / BETA_DEN, nr.minimum_window);
         self.cwnd = self.ssthresh;
         self.state = .recovery;
         // Reset epoch so next congestion avoidance starts fresh.

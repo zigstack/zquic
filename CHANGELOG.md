@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.33] - 2026-06-15
+
+### Fixed
+
+- **Raise the minimum congestion window 2 → 10 MSS to stop spurious-loss cwnd
+  collapse.** Live zeam↔zeam diagnosis (the v1.7.32 CC line) showed cwnd pinned
+  at exactly 2·MSS with `cong_events=10` while flow control was wide open
+  (`fc_sent` ≪ `fc_max`) — i.e. a burst of spurious time-threshold/reordering
+  losses on a sub-millisecond localhost path (`min_rtt_ms=0`) halved cwnd down
+  to the 2·MSS floor and pinned it there, throttling the single persistent
+  /meshsub gossip stream into permanent backpressure → outbox cap →
+  `markPersistentGossipBroken` closes the connection → peers drop → node
+  isolates. A 10·MSS floor (NewReno + Cubic) keeps cwnd usable through
+  reordering noise without increasing bursting (sends remain bounded by the live
+  cwnd). The v1.7.30 once-per-ACK `onLoss` fix stands; this addresses the
+  residual collapse from genuinely-distinct (mostly spurious) loss events.
+
 ## [v1.7.32] - 2026-06-15
 
 ### Changed

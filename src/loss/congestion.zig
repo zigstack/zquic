@@ -14,8 +14,16 @@ const std = @import("std");
 pub const mss: u64 = 1350;
 /// Maximum congestion window (bytes).
 const max_cwnd: u64 = 64 * 1024 * 1024; // 64 MB
-/// Minimum congestion window after persistent congestion (RFC 9002 §7.6.3).
-pub const minimum_window: u64 = 2 * mss;
+/// Minimum congestion window (floor for loss-driven reductions and the
+/// persistent-congestion collapse, RFC 9002 §7.6.3).  RFC's floor is 2·MSS, but
+/// on low-RTT paths a burst of *spurious* time-threshold/reordering losses can
+/// halve cwnd down to 2·MSS and pin it there, throttling a single high-volume
+/// stream (e.g. the persistent /meshsub gossip stream) into permanent
+/// backpressure even though the path is not actually congested (flow control
+/// wide open, losses are reordering noise).  A 10·MSS floor keeps cwnd usable
+/// through that noise; it does not increase bursting (sends are still bounded by
+/// the live cwnd), only the post-loss floor.
+pub const minimum_window: u64 = 10 * mss;
 
 pub const CcState = enum {
     slow_start,
@@ -82,7 +90,7 @@ pub const NewReno = struct {
         }
 
         self.end_of_recovery = largest_lost_pn;
-        self.ssthresh = @max(self.cwnd / 2, 2 * mss);
+        self.ssthresh = @max(self.cwnd / 2, minimum_window);
         self.cwnd = self.ssthresh;
         self.bytes_acked_ca = 0;
         self.state = .recovery;
@@ -248,13 +256,26 @@ test "new_reno: slow start growth" {
 test "new_reno: loss triggers recovery" {
     const testing = std.testing;
     var cc = NewReno.init();
-    cc.cwnd = 10 * mss; // artificial cwnd
-    cc.bytes_in_flight = 5 * mss;
+    cc.cwnd = 40 * mss; // well above the minimum-window floor so halving is visible
+    cc.bytes_in_flight = 20 * mss;
 
     cc.onLoss(5);
     try testing.expectEqual(CcState.recovery, cc.state);
-    try testing.expectEqual(@as(u64, 5 * mss), cc.ssthresh);
-    try testing.expectEqual(@as(u64, 5 * mss), cc.cwnd);
+    try testing.expectEqual(@as(u64, 20 * mss), cc.ssthresh);
+    try testing.expectEqual(@as(u64, 20 * mss), cc.cwnd);
+}
+
+test "new_reno: loss does not collapse below minimum window" {
+    const testing = std.testing;
+    var cc = NewReno.init();
+    cc.cwnd = 12 * mss;
+    // Several back-to-back loss events (distinct, increasing PNs) must not pin
+    // cwnd below the floor — this is the spurious-loss collapse that wedged the
+    // gossip stream.
+    var pn: u64 = 1;
+    while (pn < 8) : (pn += 1) cc.onLoss(pn);
+    try testing.expectEqual(minimum_window, cc.cwnd);
+    try testing.expect(cc.cwnd >= 10 * mss);
 }
 
 test "new_reno: congestion avoidance" {
