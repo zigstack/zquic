@@ -6968,6 +6968,13 @@ pub fn releaseRawAppStream(conn: *ConnState, stream_id: u64, allocator: std.mem.
     for (&conn.raw_app_streams) |*slot| {
         if (slot.active and slot.stream_id == stream_id) {
             slot.deinit(allocator);
+            // Mark the slot free so a second release for the same stream_id is a
+            // no-op.  Without this, `deinit` frees the slot's buffers but leaves
+            // `active = true`, so a double-release (e.g. the embedder dropping a
+            // stream via both a conn-close sweep and the FIN path) re-frees the
+            // now-dangling buffer pointers — a deterministic
+            // `Segmentation fault at 0xaa…` deep in the allocator.
+            slot.active = false;
             return true;
         }
     }
@@ -7906,6 +7913,9 @@ pub const Client = struct {
         for (&self.raw_app_recv) |*slot| {
             if (slot.active and slot.stream_id == stream_id) {
                 slot.deinit(self.allocator);
+                // Idempotent: mark free so a second release is a no-op (see the
+                // connection-level `releaseRawAppStream` for the double-free).
+                slot.active = false;
                 return true;
             }
         }
