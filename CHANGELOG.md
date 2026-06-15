@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.31] - 2026-06-15
+
+### Changed
+
+- **Surface congestion state on the `queue full` backpressure warning** (and
+  promote the CC trace to `warn`). Embedders (zeam) filter zquic `info` logs, so
+  the v1.7.30 CC trace was invisible. The visible `pending-stream-send queue
+  full` warning now carries `cwnd / ssthresh / state / bif / cong_events /
+  acked / srtt / min_rtt / latest_rtt`, so a still-wedged stream's congestion
+  state is diagnosable without enabling debug logging.
+
 ## [v1.7.30] - 2026-06-15
 
 ### Fixed

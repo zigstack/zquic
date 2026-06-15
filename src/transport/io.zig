@@ -1188,7 +1188,7 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     // (`acked` flat / few ACKs).  `state` shows whether we are stuck in
     // congestion-avoidance; RTT (ms) shows whether the path RTT is being
     // measured at all on a sub-ms localhost link.
-    log.info(
+    log.warn(
         "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={}",
         .{
             side,
@@ -1219,8 +1219,11 @@ fn warnPendingStreamSendQueueFull(conn: *ConnState, stream_id: u64, side: []cons
     const now = compat.milliTimestamp();
     if (now - conn.pending_stream_send_queue_full_warn_ms < 5000) return;
     conn.pending_stream_send_queue_full_warn_ms = now;
-    log.warn("io: {s} pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; returning backpressure to embedder\n", .{
-        side, conn.pending_stream_sends.items.len, conn.pending_stream_send_bytes, stream_id,
+    log.warn("io: {s} pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; backpressure. CC: cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={}\n", .{
+        side,                          conn.pending_stream_sends.items.len, conn.pending_stream_send_bytes, stream_id,
+        conn.cc.getCwnd(),             conn.cc.getSsthresh(),               @tagName(conn.cc.getState()),   conn.cc.getBytesInFlight(),
+        conn.cc.getCongestionEvents(), conn.cc.getTotalBytesAcked(),        conn.rtt.srtt_ms,               conn.rtt.min_rtt_ms,
+        conn.rtt.latest_rtt_ms,
     });
 }
 
