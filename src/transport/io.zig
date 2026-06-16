@@ -1453,6 +1453,30 @@ pub const PeerStreamSendMaxEntry = struct {
     in_use: bool = false,
 };
 
+/// One slot in the per-stream *receive* flow-control table (RFC 9000 §4.1).
+/// `recv_off` is the highest end offset (offset+len) we have received on the
+/// stream; `recv_max` is the per-stream limit we have most recently advertised
+/// to the peer (initially the local `initial_max_stream_data`, then raised via
+/// MAX_STREAM_DATA). We extend `recv_max` before the peer exhausts it so a
+/// long-lived stream never stalls — the missing piece that wedged libp2p's
+/// persistent /meshsub gossip stream (zquic#172).
+pub const StreamRecvEntry = struct {
+    stream_id: u64 = 0,
+    recv_off: u64 = 0,
+    recv_max: u64 = 0,
+    in_use: bool = false,
+};
+
+/// Outcome of recording received stream bytes (see `ConnState.noteStreamRecv`).
+pub const StreamRecvAction = struct {
+    /// Peer sent past the per-stream limit we advertised — caller MUST close
+    /// the connection with FLOW_CONTROL_ERROR (0x03).
+    violation: bool = false,
+    /// When non-null, the new per-stream limit to advertise in a
+    /// MAX_STREAM_DATA (0x11) frame.
+    send_max: ?u64 = null,
+};
+
 /// Cached UDP payload for server flight retransmit (same PN/ciphertext).
 const StoredDatagram = struct {
     len: u16 = 0,
@@ -1760,6 +1784,25 @@ pub const ConnState = struct {
     fc_recv_max: u64 = 64 * 1024 * 1024,
     fc_bytes_sent: u64 = 0,
     fc_bytes_recv: u64 = 0,
+
+    // ── Receive-side windows we advertise (RFC 9000 §4, §18.2) ────────────────
+    // These mirror the local transport-params we send the peer: they are the
+    // limits the PEER believes apply to its sends *to us*. We must raise them
+    // (MAX_DATA / MAX_STREAM_DATA) before the peer exhausts them or its send
+    // stalls. Seeded from the preset in `seedLocalRecvWindows`; defaults match
+    // the `.default` preset (64 MiB conn / 16 MiB stream) so an unseeded conn
+    // still behaves sanely. `fc_recv_max` above is the connection-level mirror
+    // and is reset to `local_initial_max_data` by the same seed.
+    local_initial_max_data: u64 = 64 * 1024 * 1024,
+    local_initial_max_stream_data_bidi_local: u64 = 16 * 1024 * 1024,
+    local_initial_max_stream_data_bidi_remote: u64 = 16 * 1024 * 1024,
+    local_initial_max_stream_data_uni: u64 = 16 * 1024 * 1024,
+    /// Per-stream receive accounting (RFC 9000 §4.1). Bounded; a slot is freed
+    /// on FIN / RESET_STREAM (peer is done sending) so it tracks only
+    /// concurrently-open inbound streams. When full, untracked streams fall
+    /// back to connection-level flow control only (strictly safe — we never
+    /// over-advertise, we just may under-extend a rarely-used stream).
+    per_stream_recv: [256]StreamRecvEntry = [_]StreamRecvEntry{.{}} ** 256,
 
     // ── Per-stream initial limits the peer advertised (RFC 9000 §18.2) ────────
     // The §18.2 initial values seed `peerStreamSendLimit`; mid-connection
@@ -2339,6 +2382,106 @@ pub const ConnState = struct {
     /// pure dead weight. Safe to call on a stream that was never tracked.
     pub fn clearPeerStreamSendMax(self: *ConnState, stream_id: u64) void {
         for (&self.per_stream_send_max) |*e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                e.* = .{};
+                return;
+            }
+        }
+    }
+
+    /// Seed the receive-side flow-control windows (and `fc_recv_max`) from the
+    /// local transport-params preset. Call this exactly when we commit to a
+    /// preset by encoding our own transport parameters — these are the limits
+    /// the peer will read and obey, so our extension thresholds must match them
+    /// or the peer stalls on a window we advertised but never raised.
+    pub fn seedLocalRecvWindows(self: *ConnState, preset: quic_tls_mod.TransportParamsPreset) void {
+        const opts = quic_tls_mod.transportParamsForPreset(preset, "", 0);
+        self.local_initial_max_data = opts.initial_max_data;
+        self.local_initial_max_stream_data_bidi_local = opts.initial_max_stream_data_bidi_local;
+        self.local_initial_max_stream_data_bidi_remote = opts.initial_max_stream_data_bidi_remote;
+        self.local_initial_max_stream_data_uni = opts.initial_max_stream_data_uni;
+        self.fc_recv_max = opts.initial_max_data;
+    }
+
+    /// The §18.2 per-stream receive limit *we* advertised for `stream_id`
+    /// (mirror of `peerStreamSendLimitInitial` but for our own windows). This
+    /// is the window the peer is allowed to fill before it needs a
+    /// MAX_STREAM_DATA from us, and the increment we extend by each time.
+    fn localStreamRecvInitial(self: *const ConnState, stream_id: u64, we_are_server: bool) u64 {
+        const t = stream_id & 0x3;
+        const is_uni = (t & 0x02) != 0;
+        const we_initiated = (we_are_server and (t == 0x01 or t == 0x03)) or
+            (!we_are_server and (t == 0x00 or t == 0x02));
+        if (is_uni) return self.local_initial_max_stream_data_uni;
+        return if (we_initiated)
+            self.local_initial_max_stream_data_bidi_local
+        else
+            self.local_initial_max_stream_data_bidi_remote;
+    }
+
+    /// Record `end_off` (offset+len of a received STREAM frame) on `stream_id`
+    /// and decide whether to extend the peer's per-stream send window (RFC 9000
+    /// §4.1, §19.10). Mirrors the connection-level MAX_DATA 50% rule: when the
+    /// peer has consumed ≥50% of the window we advertised, advertise one more
+    /// window so it never blocks. Returns `.violation=true` if the peer
+    /// exceeded the limit we advertised (caller MUST close).
+    pub fn noteStreamRecv(self: *ConnState, stream_id: u64, end_off: u64, we_are_server: bool) StreamRecvAction {
+        const window = self.localStreamRecvInitial(stream_id, we_are_server);
+        var slot: ?*StreamRecvEntry = null;
+        for (&self.per_stream_recv) |*e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                slot = e;
+                break;
+            }
+        }
+        if (slot == null) {
+            for (&self.per_stream_recv) |*e| {
+                if (!e.in_use) {
+                    e.* = .{ .stream_id = stream_id, .recv_off = 0, .recv_max = window, .in_use = true };
+                    slot = e;
+                    break;
+                }
+            }
+        }
+        // Table full: this stream is untracked. Don't flag a violation (we have
+        // no per-stream limit to compare against) and skip the per-stream
+        // extension — connection-level flow control still bounds total receive.
+        const e = slot orelse return .{};
+        if (end_off > e.recv_off) e.recv_off = end_off;
+        if (e.recv_off > e.recv_max) return .{ .violation = true };
+        if (e.recv_off * 2 >= e.recv_max) {
+            e.recv_max = e.recv_off + window;
+            return .{ .send_max = e.recv_max };
+        }
+        return .{};
+    }
+
+    /// Force-extend the per-stream receive window for `stream_id` (used to
+    /// answer a STREAM_DATA_BLOCKED frame). Ensures a slot exists, raises the
+    /// advertised limit by one window above what we have received, and returns
+    /// the new limit to put on the wire.
+    pub fn bumpStreamRecvWindow(self: *ConnState, stream_id: u64, we_are_server: bool) u64 {
+        const window = self.localStreamRecvInitial(stream_id, we_are_server);
+        for (&self.per_stream_recv) |*e| {
+            if (e.in_use and e.stream_id == stream_id) {
+                e.recv_max = e.recv_off + window;
+                return e.recv_max;
+            }
+        }
+        for (&self.per_stream_recv) |*e| {
+            if (!e.in_use) {
+                e.* = .{ .stream_id = stream_id, .recv_off = 0, .recv_max = window, .in_use = true };
+                return window;
+            }
+        }
+        return window; // table full — best-effort grant of one window
+    }
+
+    /// Drop the per-stream receive slot for `stream_id`. Called on FIN (peer
+    /// has finished sending) and RESET_STREAM — the peer will send no more on
+    /// this id (RFC 9000 §2.1) so the slot is free to reuse.
+    pub fn clearStreamRecv(self: *ConnState, stream_id: u64) void {
+        for (&self.per_stream_recv) |*e| {
             if (e.in_use and e.stream_id == stream_id) {
                 e.* = .{};
                 return;
@@ -3869,6 +4012,9 @@ pub const Server = struct {
         tp_opts.original_destination_cid = odcid;
         tp_opts.stateless_reset_token = conn.stateless_reset_token;
         tp_opts.preferred_address = self.config.preferred_address;
+        // Mirror the windows we are about to advertise so our MAX_DATA /
+        // MAX_STREAM_DATA extension thresholds match what the peer will obey.
+        conn.seedLocalRecvWindows(self.config.transport_params_preset);
         const tp_len = quic_tls_mod.buildTransportParams(&tp_buf, tp_opts) catch |err| {
             dbg("io: transport params encode failed: {}\n", .{err});
             return;
@@ -4932,7 +5078,8 @@ pub const Server = struct {
                 // STREAM_DATA_BLOCKED — peer ran out of stream-level send credit.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                self.sendMaxStreamData(conn, r.frame.stream_id, src);
+                const nm = conn.bumpStreamRecvWindow(r.frame.stream_id, true);
+                self.sendMaxStreamData(conn, r.frame.stream_id, nm, src);
                 continue;
             }
             if (ft == 0x04) {
@@ -4967,8 +5114,9 @@ pub const Server = struct {
                     }
                 }
                 // Stream IDs are not reused (RFC 9000 §2.1); the per-stream
-                // send-window slot is dead weight once the peer has reset.
+                // send- and receive-window slots are dead weight once reset.
                 conn.clearPeerStreamSendMax(r.frame.stream_id);
+                conn.clearStreamRecv(r.frame.stream_id);
                 continue;
             }
             if (ft == 0x05) {
@@ -5141,7 +5289,19 @@ pub const Server = struct {
                 }
                 // Advertise more window when 50% consumed (RFC 9000 §4.2).
                 if (conn.fc_bytes_recv * 2 >= conn.fc_recv_max) self.sendMaxData(conn, src);
+                // Per-stream receive flow control (RFC 9000 §4.1, §19.10):
+                // extend this stream's window before the peer exhausts it.
+                // Without this a long-lived stream (libp2p persistent /meshsub
+                // gossip) stalls at the initial per-stream limit — zquic#172.
+                const sra = conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, true);
+                if (sra.violation) {
+                    self.sendConnectionClose(conn, 0x03, "stream flow control violation", src);
+                    return;
+                }
+                if (sra.send_max) |nm| self.sendMaxStreamData(conn, sf_r.frame.stream_id, nm, src);
                 self.handleStreamData(conn, &sf_r.frame, src);
+                // FIN: peer is done sending on this stream id; free the slot.
+                if (sf_r.frame.fin) conn.clearStreamRecv(sf_r.frame.stream_id);
                 continue;
             }
             if (ft == 0x07) {
@@ -5686,9 +5846,11 @@ pub const Server = struct {
         dbg("io: sent MAX_DATA new_max={}\n", .{conn.fc_recv_max});
     }
 
-    /// Send a MAX_STREAM_DATA frame to extend the peer's send window on one stream.
-    fn sendMaxStreamData(self: *Server, conn: *ConnState, stream_id: u64, dst: compat.Address) void {
-        const new_max: u64 = conn.fc_bytes_recv + 64 * 1024 * 1024;
+    /// Send a MAX_STREAM_DATA frame to extend the peer's send window on one
+    /// stream to `new_max` (RFC 9000 §19.10). `new_max` is the per-stream limit
+    /// computed by `noteStreamRecv` / `bumpStreamRecvWindow` — it must reflect
+    /// what we have received on *this* stream, not the connection-level total.
+    fn sendMaxStreamData(self: *Server, conn: *ConnState, stream_id: u64, new_max: u64, dst: compat.Address) void {
         var buf: [32]u8 = undefined;
         buf[0] = 0x11; // MAX_STREAM_DATA frame type
         var pos: usize = 1;
@@ -7525,6 +7687,34 @@ pub const Client = struct {
         return pn;
     }
 
+    /// Send a MAX_DATA (0x10) frame extending the server's connection-level send
+    /// window (RFC 9000 §19.9). Mirror of `Server.sendMaxData` for the client —
+    /// the client previously did no receive-side connection flow control, so a
+    /// server streaming past our advertised `initial_max_data` would stall.
+    fn sendMaxData(self: *Client) void {
+        self.conn.fc_recv_max = self.conn.fc_bytes_recv + 64 * 1024 * 1024;
+        var buf: [16]u8 = undefined;
+        buf[0] = 0x10;
+        const enc = varint.encode(buf[1..], self.conn.fc_recv_max) catch return;
+        _ = self.sendClient1Rtt(buf[0 .. 1 + enc.len]) orelse return;
+        dbg("io: client sent MAX_DATA new_max={}\n", .{self.conn.fc_recv_max});
+    }
+
+    /// Send a MAX_STREAM_DATA (0x11) frame extending the server's send window on
+    /// `stream_id` to `new_max` (RFC 9000 §19.10). Mirror of
+    /// `Server.sendMaxStreamData`.
+    fn sendMaxStreamData(self: *Client, stream_id: u64, new_max: u64) void {
+        var buf: [32]u8 = undefined;
+        buf[0] = 0x11;
+        var pos: usize = 1;
+        const sid_enc = varint.encode(buf[pos..], stream_id) catch return;
+        pos += sid_enc.len;
+        const max_enc = varint.encode(buf[pos..], new_max) catch return;
+        pos += max_enc.len;
+        _ = self.sendClient1Rtt(buf[0..pos]) orelse return;
+        dbg("io: client sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
+    }
+
     /// Enqueue a fresh stream send when flow-control or congestion blocks the
     /// wire path.  Returns bytes accepted (data.len) or 0 on queue overflow.
     /// Drain the pending queue until a pass makes no progress (CC/FC blocked).
@@ -8353,6 +8543,9 @@ pub const Client = struct {
                 0,
                 self.config.transport_params_preset,
             );
+            // Mirror the windows we advertise so our receive-side MAX_DATA /
+            // MAX_STREAM_DATA extension thresholds match the peer's view.
+            self.conn.seedLocalRecvWindows(self.config.transport_params_preset);
 
             // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(compat.milliTimestamp());
@@ -9219,14 +9412,21 @@ pub const Client = struct {
                 dbg("io: client MAX_STREAMS {} maximum_streams={}\n", .{ ft, v.value });
                 continue;
             }
-            if (ft == 0x14 or ft == 0x15) {
-                // DATA_BLOCKED / STREAM_DATA_BLOCKED — server is stalled; skip.
+            if (ft == 0x14) {
+                // DATA_BLOCKED — server ran out of connection-level send credit;
+                // grant more so it can resume (RFC 9000 §19.12).
                 const v = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
-                if (ft == 0x15) { // STREAM_DATA_BLOCKED also has stream_id
-                    const v2 = varint.decode(plaintext[pos..pt_len]) catch return;
-                    pos += v2.len;
-                }
+                self.sendMaxData();
+                continue;
+            }
+            if (ft == 0x15) {
+                // STREAM_DATA_BLOCKED — server ran out of stream-level send
+                // credit; grant more on that stream (RFC 9000 §19.13).
+                const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
+                pos += r.consumed;
+                const nm = self.conn.bumpStreamRecvWindow(r.frame.stream_id, false);
+                self.sendMaxStreamData(r.frame.stream_id, nm);
                 continue;
             }
             if (ft == 0x04) {
@@ -9237,8 +9437,9 @@ pub const Client = struct {
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
                 // Stream IDs are not reused (RFC 9000 §2.1); drop the
-                // per-stream send-window slot for this id.
+                // per-stream send- and receive-window slots for this id.
                 self.conn.clearPeerStreamSendMax(r.frame.stream_id);
+                self.conn.clearStreamRecv(r.frame.stream_id);
                 continue;
             }
             if (ft == 0x05) {
@@ -9343,6 +9544,24 @@ pub const Client = struct {
                     return;
                 }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
+                // Receive-side flow control (RFC 9000 §4) — the client path
+                // previously did none, so a server streaming past the windows we
+                // advertised (libp2p persistent /meshsub gossip) would stall.
+                // zquic#172.
+                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
+                if (recv_end > self.conn.fc_bytes_recv) self.conn.fc_bytes_recv = recv_end;
+                if (self.conn.fc_bytes_recv > self.conn.fc_recv_max) {
+                    self.sendConnectionClose(0x03, "flow control violation");
+                    return;
+                }
+                if (self.conn.fc_bytes_recv * 2 >= self.conn.fc_recv_max) self.sendMaxData();
+                const sra = self.conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, false);
+                if (sra.violation) {
+                    self.sendConnectionClose(0x03, "stream flow control violation");
+                    return;
+                }
+                if (sra.send_max) |nm| self.sendMaxStreamData(sf_r.frame.stream_id, nm);
+                if (sf_r.frame.fin) self.conn.clearStreamRecv(sf_r.frame.stream_id);
                 // Replenish MAX_STREAMS for peer- (server-) initiated streams so a
                 // peer that opens one stream per request (libp2p reqresp) doesn't
                 // starve after the initial grant.  The server path does this; the
@@ -10556,6 +10775,69 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
     const new_sid: u64 = @as(u64, conn.per_stream_send_max.len) * 4;
     try std.testing.expect(!conn.applyPeerMaxStreamData(new_sid, 9_999));
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
+}
+
+test "per-stream recv: no MAX_STREAM_DATA until 50% of window consumed" {
+    var conn = makeConnForStreamTest();
+    conn.seedLocalRecvWindows(.libp2p); // 10 MB per-stream window
+    const sid: u64 = 0; // client-initiated bidi; server view: peer-initiated
+    // Below 50% — no extension.
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 4_000_000, true).send_max);
+    // Cross 50% (5 MB) — extend to recv_off + one window.
+    const a = conn.noteStreamRecv(sid, 5_000_000, true);
+    try std.testing.expect(!a.violation);
+    try std.testing.expectEqual(@as(?u64, 15_000_000), a.send_max);
+    // After extension the next small advance does not re-trigger.
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 5_100_000, true).send_max);
+}
+
+test "per-stream recv: exceeding the advertised window is a violation" {
+    var conn = makeConnForStreamTest();
+    conn.seedLocalRecvWindows(.libp2p);
+    const sid: u64 = 0;
+    // Jump past the 10 MB advertised limit before any MAX_STREAM_DATA.
+    try std.testing.expect(conn.noteStreamRecv(sid, 10_000_001, true).violation);
+}
+
+test "per-stream recv: window tracks each stream independently" {
+    var conn = makeConnForStreamTest();
+    conn.seedLocalRecvWindows(.libp2p);
+    // Stream 0 crosses 50%, stream 4 stays low — only 0 extends.
+    try std.testing.expectEqual(@as(?u64, 16_000_000), conn.noteStreamRecv(0, 6_000_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(4, 1_000, true).send_max);
+}
+
+test "per-stream recv: FIN/RESET clears the slot for reuse" {
+    var conn = makeConnForStreamTest();
+    conn.seedLocalRecvWindows(.libp2p);
+    _ = conn.noteStreamRecv(0, 6_000_000, true);
+    conn.clearStreamRecv(0);
+    // Slot freed: the same id starts fresh at the initial window again.
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(0, 1_000, true).send_max);
+}
+
+test "per-stream recv: bumpStreamRecvWindow answers STREAM_DATA_BLOCKED" {
+    var conn = makeConnForStreamTest();
+    conn.seedLocalRecvWindows(.libp2p);
+    // Peer is blocked at the initial 10 MB; we received up to there.
+    _ = conn.noteStreamRecv(0, 9_999_999, true);
+    // bump grants one window above what we have received.
+    const nm = conn.bumpStreamRecvWindow(0, true);
+    try std.testing.expectEqual(@as(u64, 9_999_999 + 10_000_000), nm);
+}
+
+test "seedLocalRecvWindows: default preset" {
+    var d = makeConnForStreamTest();
+    d.seedLocalRecvWindows(.default);
+    try std.testing.expectEqual(@as(u64, 16_777_216), d.local_initial_max_stream_data_bidi_local);
+    try std.testing.expectEqual(@as(u64, 67_108_864), d.fc_recv_max);
+}
+
+test "seedLocalRecvWindows: libp2p preset" {
+    var l = makeConnForStreamTest();
+    l.seedLocalRecvWindows(.libp2p);
+    try std.testing.expectEqual(@as(u64, 10_000_000), l.local_initial_max_stream_data_bidi_remote);
+    try std.testing.expectEqual(@as(u64, 15_000_000), l.fc_recv_max);
 }
 
 test "pending stream send: contiguous enqueues coalesce on same stream" {
