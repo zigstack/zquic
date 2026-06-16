@@ -1183,12 +1183,12 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
             conn.fc_send_max,
         },
     );
-    // Backpressure CC trace (visible at info): distinguishes a cwnd pinned by
+    // Backpressure CC trace (visible at debug): distinguishes a cwnd pinned by
     // repeated losses (`cong_events` climbing) from ACK-clock starvation
     // (`acked` flat / few ACKs).  `state` shows whether we are stuck in
     // congestion-avoidance; RTT (ms) shows whether the path RTT is being
     // measured at all on a sub-ms localhost link.
-    log.warn(
+    log.debug(
         "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={} local_send_drops={}",
         .{
             side,
