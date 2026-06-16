@@ -2983,18 +2983,30 @@ pub const Server = struct {
     }
 
     /// Free connection slots that have completed their draining period (RFC 9000 §10.2.2).
+    /// True while any raw-app stream slot on `conn` is still held by an
+    /// embedder (e.g. a libp2p InboundStream).  The embedder caches a
+    /// `*ConnState` into that stream, so reaping the conn out from under an
+    /// active slot dangles that pointer — the embedder then deref's freed
+    /// memory in its inbound-stream advance/teardown (observed as a
+    /// `Segmentation fault`, or as a bogus "integer overflow" once the freed
+    /// bytes flow into an allocation size).  Reaping is therefore deferred
+    /// until the embedder releases the slot, which it does on the next drive
+    /// tick once it sees the conn `draining`/`closed`.
+    fn connHasActiveRawAppStreams(conn: *const ConnState) bool {
+        for (&conn.raw_app_streams) |*slot| {
+            if (slot.active) return true;
+        }
+        return false;
+    }
+
     fn reapDrainedConnections(self: *Server) void {
         const now = compat.milliTimestamp();
         const local_idle_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
-                // Draining period expired.
-                if (conn.draining and conn.draining_deadline_ms > 0 and now >= conn.draining_deadline_ms) {
-                    dbg("io: reaping drained connection (deadline passed)\n", .{});
-                    freeConnStateRawAppBuffers(conn, self.allocator);
-                    slot.* = null;
-                    continue;
-                }
+                const draining_expired = conn.draining and conn.draining_deadline_ms > 0 and
+                    now >= conn.draining_deadline_ms;
+
                 // Effective idle timeout is min(local, peer) per RFC 9000 §10.1.
                 // peer_max_idle_timeout_ms == 0 means the peer omitted the
                 // param, so only our local value applies.
@@ -3002,13 +3014,32 @@ pub const Server = struct {
                     local_idle_ms
                 else
                     @min(local_idle_ms, @as(i64, @intCast(conn.peer_max_idle_timeout_ms)));
-                if (conn.phase == .connected and conn.last_recv_ms > 0 and
-                    now - conn.last_recv_ms > idle_timeout_ms)
-                {
-                    dbg("io: idle timeout — closing connection\n", .{});
-                    freeConnStateRawAppBuffers(conn, self.allocator);
-                    slot.* = null;
+                const idle_expired = conn.phase == .connected and conn.last_recv_ms > 0 and
+                    now - conn.last_recv_ms > idle_timeout_ms;
+
+                if (!draining_expired and !idle_expired) continue;
+
+                // UAF guard: pin the conn alive while an embedder raw-app stream
+                // still references it (see connHasActiveRawAppStreams). Mark it
+                // draining-and-reap-ready so the embedder's inbound prune fires
+                // next tick, releases the slot, and we reap on a later pass.
+                // The embedder polls every drive tick, so this converges in ~1
+                // tick — no leak in practice.
+                if (connHasActiveRawAppStreams(conn)) {
+                    if (!conn.draining) {
+                        conn.draining = true;
+                        conn.draining_deadline_ms = now;
+                    }
+                    continue;
                 }
+
+                if (draining_expired) {
+                    dbg("io: reaping drained connection (deadline passed)\n", .{});
+                } else {
+                    dbg("io: idle timeout — closing connection\n", .{});
+                }
+                freeConnStateRawAppBuffers(conn, self.allocator);
+                slot.* = null;
             }
         }
     }
