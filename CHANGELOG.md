@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v1.7.37] - 2026-06-16
+
+### Added
+
+- **Server-initiated raw-app bidirectional streams** (`Server.openRawAppStream`).
+  The server can now open a fresh bidi stream to the client and have it
+  delivered to the embedder as a raw-app stream, instead of only being able to
+  write on an already client-opened stream. `openRawAppStream` allocates the
+  next server-initiated bidi id (RFC 9000 §2.1 parity `% 4 == 1`, honoring the
+  peer's `MAX_STREAMS` limit), registers a raw-app receive slot so the stream
+  participates in the existing reap-pin UAF guard and so the client's reply
+  bytes reassemble into it, and returns the stream id. The embedder drives it
+  with the existing `sendRawStreamData` (pending-send queueing, flow control,
+  and loss retransmit are all stream-id-agnostic and reused unchanged). The
+  client already accepts inbound server-initiated bidi STREAM frames as raw-app
+  streams (`raw_app_recv` slots keyed by stream id). Prerequisite for
+  zig-libp2p#214 (publish gossipsub `/meshsub` frames over the inbound
+  connection). Covered by two loopback end-to-end tests: in-order multi-frame
+  delivery + clean FIN/teardown, and a dropped-packet retransmit.
+
 ## [v1.7.33] - 2026-06-15
 
 ### Fixed

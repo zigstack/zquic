@@ -2680,6 +2680,28 @@ pub const Server = struct {
         return self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
     }
 
+    /// Open a **server-initiated** bidirectional raw-app stream (RFC 9000 §2.1:
+    /// stream id with `% 4 == 1`).  Allocates the next server bidi id — honoring
+    /// the peer's MAX_STREAMS limit (`peer_max_bidi_streams`) — and registers a
+    /// raw-app receive slot so (a) the client's reply bytes on this stream
+    /// reassemble into it and (b) the stream participates in the reap-pin
+    /// UAF guard (`connHasActiveRawAppStreams`).  Drive the send side with the
+    /// existing `sendRawStreamData` (pending-send queueing, flow control, and
+    /// loss retransmit are all stream-id-agnostic); after FIN, free the slot
+    /// with `releaseRawAppStream`.  Mirrors the client-initiated open the
+    /// embedder performs via `rawAllocateNextLocalBidiStream` + `sendRawStreamData`.
+    pub fn openRawAppStream(self: *Server, conn: *ConnState) OpenRawAppStreamError!u64 {
+        _ = self;
+        const stream_id = try rawAllocateNextLocalBidiStream(conn);
+        if (!registerRawAppRecvSlot(conn, stream_id)) {
+            // No free slot — roll back the id so the next call retries the same
+            // id instead of leaving a permanent hole in the §2.1 id space.
+            conn.next_local_bidi_stream_id -= 4;
+            return error.RawAppStreamSlotsFull;
+        }
+        return stream_id;
+    }
+
     fn drainPendingStreamSendsUntilStalled(self: *Server, conn: *ConnState) void {
         while (true) {
             const before = conn.pending_stream_sends.items.len;
@@ -6956,6 +6978,30 @@ pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) OpenLocalStreamError!u64
     return id;
 }
 
+/// Returned by `Server.openRawAppStream`: either the peer's stream limit is
+/// exhausted (`StreamLimitExceeded`) or the connection's 64-slot raw-app table
+/// is full (`RawAppStreamSlotsFull`).
+pub const OpenRawAppStreamError = OpenLocalStreamError || error{RawAppStreamSlotsFull};
+
+/// Register (or find) the raw-app receive slot for `stream_id` on `conn`,
+/// activating a free slot when none yet holds it.  Returns false when all 64
+/// slots are in use.  Used by `Server.openRawAppStream` so a server-initiated
+/// bidi stream pre-registers its slot (the peer's reply bytes then reassemble
+/// into it); mirrors the inline slot activation on the inbound STREAM-frame
+/// path (`handleRawApplicationStreamServer`), which needs the slot pointer.
+pub fn registerRawAppRecvSlot(conn: *ConnState, stream_id: u64) bool {
+    for (&conn.raw_app_streams) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) return true;
+    }
+    for (&conn.raw_app_streams) |*slot| {
+        if (!slot.active) {
+            slot.* = .{ .active = true, .stream_id = stream_id, .next_offset = 0, .buf = .empty };
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Count of locally initiated bidirectional streams already opened (next ID not yet consumed).
 fn localBidiStreamsOpened(conn: *const ConnState) u64 {
     const n = conn.next_local_bidi_stream_id;
@@ -10715,4 +10761,269 @@ test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
     const ld_result = try conn.ld.onAck(pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
     if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked);
     try std.testing.expectEqual(@as(u64, 0), conn.cc.getBytesInFlight());
+}
+
+// ── Server-initiated raw-app bidi streams (issue #171) ────────────────────────
+//
+// A self-signed P-256 cert/key pair (generated with `openssl ecparam -name
+// prime256v1 -genkey` + `req -x509`, matching the interop harness in
+// test-local.sh) so the loopback handshake below runs without touching disk.
+const raw_app_test_cert =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBlDCCATugAwIBAgIUVQcs4ukEwzyEPHOkJozYtzcLgc0wCgYIKoZIzj0EAwIw
+    \\FTETMBEGA1UEAwwKenF1aWMtdGVzdDAeFw0yNjA2MTYxMzU4MDVaFw0zNjA2MTMx
+    \\MzU4MDVaMBUxEzARBgNVBAMMCnpxdWljLXRlc3QwWTATBgcqhkjOPQIBBggqhkjO
+    \\PQMBBwNCAASi2BRPaS1eDrI3Nz0SiTm/WyiFXZOvdnotNM7dVpwyxERnoMvjN3rg
+    \\orxvtr+Ims0UQAubd1auIxOF2m5rSK+no2kwZzAdBgNVHQ4EFgQUp2j49kW3eDQH
+    \\X1Zz5lCWTPqzs28wHwYDVR0jBBgwFoAUp2j49kW3eDQHX1Zz5lCWTPqzs28wDwYD
+    \\VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    \\RwAwRAIgTiMFC6CRDktT0L8cyOz6HqqwpsjZqXLl5P+VY9M/X44CIBnZN6TjJnHd
+    \\DMj4Q3a0LOr2IbQ4MteOsig/Mkp+nUgL
+    \\-----END CERTIFICATE-----
+    \\
+;
+const raw_app_test_key =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIP92J5gFLRPtrWADUWgpuRcoogwCKh50Cgh6XYTQ5wr7oAoGCCqGSM49
+    \\AwEHoUQDQgAEotgUT2ktXg6yNzc9Eok5v1sohV2Tr3Z6LTTO3VacMsREZ6DL4zd6
+    \\4KK8b7a/iJrNFEALm3dWriMThdpua0ivpw==
+    \\-----END EC PRIVATE KEY-----
+    \\
+;
+
+/// Copy a `sockaddr.storage` into a `compat.Address` (byte copy avoids the
+/// alignment pitfalls of casting the storage pointer directly).
+fn rawAddrFromStorage(sa: *const std.posix.sockaddr.storage) compat.Address {
+    var a: compat.Address = undefined;
+    @memcpy(std.mem.asBytes(&a)[0..@sizeOf(compat.Address)], std.mem.asBytes(sa)[0..@sizeOf(compat.Address)]);
+    return a;
+}
+
+fn rawSockReadable(fd: std.posix.socket_t) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const r = std.posix.poll(&fds, 0) catch return false;
+    return r > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+const RawDrop = struct {
+    /// Number of server→client datagrams still to be dropped.
+    remaining: usize = 0,
+    /// Only drop datagrams at least this large, so we target a STREAM-bearing
+    /// data packet rather than a bare ACK.
+    min_len: usize = 0,
+};
+
+/// Drive one pump iteration of the in-process loopback: wait briefly for I/O,
+/// move all queued datagrams client↔server (dropping per `drop`), and run each
+/// side's deferred work (PTO/loss retransmit, pending-send drain, ACK flush).
+fn rawPumpOnce(server: *Server, client: *Client, server_addr: compat.Address, drop: *RawDrop) void {
+    var pfds = [_]std.posix.pollfd{
+        .{ .fd = server.sock, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = client.sock, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    _ = std.posix.poll(&pfds, 10) catch 0;
+
+    var buf: [2048]u8 = undefined;
+    while (rawSockReadable(server.sock)) {
+        var sa: std.posix.sockaddr.storage = undefined;
+        var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
+        const n = compat.recvfrom(server.sock, &buf, 0, @ptrCast(&sa), &sl) catch break;
+        server.feedPacket(buf[0..n], rawAddrFromStorage(&sa));
+    }
+    server.processPendingWork();
+
+    while (rawSockReadable(client.sock)) {
+        const n = compat.recvfrom(client.sock, &buf, 0, null, null) catch break;
+        if (drop.remaining > 0 and n >= drop.min_len) {
+            drop.remaining -= 1;
+            continue;
+        }
+        client.feedPacket(buf[0..n]);
+    }
+    client.processPendingWork(server_addr);
+    client.flushDeferredAck();
+}
+
+fn rawServerConnectedConn(server: *Server) ?*ConnState {
+    for (&server.conns) |*slot| {
+        if (slot.*) |*c| {
+            if (c.phase == .connected) return c;
+        }
+    }
+    return null;
+}
+
+/// Bind a server + connect a client over loopback and pump until both report
+/// `.connected`.  Returns the bound server address (peer for the client).
+const RawLoopback = struct {
+    server: *Server,
+    client: *Client,
+    server_addr: compat.Address,
+};
+
+fn rawSetupLoopback(allocator: std.mem.Allocator, out_client: *Client) !RawLoopback {
+    const server_sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    const bind_addr = try compat.Address.parseIp4("127.0.0.1", 0);
+    compat.bind(server_sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
+        compat.close(server_sock);
+        return e;
+    };
+    var sa: std.posix.sockaddr.storage = undefined;
+    var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
+    if (std.posix.errno(std.posix.system.getsockname(server_sock, @ptrCast(&sa), &sl)) != .SUCCESS) {
+        compat.close(server_sock);
+        return error.GetSockNameFailed;
+    }
+    const server_port = rawAddrFromStorage(&sa).getPort();
+    const server_addr = try compat.Address.parseIp4("127.0.0.1", server_port);
+
+    const server = Server.initFromSocket(allocator, .{
+        .cert_pem = raw_app_test_cert,
+        .key_pem = raw_app_test_key,
+        .raw_application_streams = true,
+        .alpn = "raw-app-test",
+    }, server_sock, true) catch |e| {
+        compat.close(server_sock);
+        return e;
+    };
+    errdefer server.deinit();
+
+    try Client.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = server_port,
+        .raw_application_streams = true,
+        .alpn = "raw-app-test",
+        .urls = &.{},
+    }, out_client);
+    errdefer out_client.deinit();
+
+    out_client.conn.peer = server_addr;
+    try out_client.sendClientHello(server_addr);
+
+    var drop = RawDrop{};
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (compat.milliTimestamp() < deadline) {
+        rawPumpOnce(server, out_client, server_addr, &drop);
+        if (out_client.conn.phase == .connected and rawServerConnectedConn(server) != null) {
+            return .{ .server = server, .client = out_client, .server_addr = server_addr };
+        }
+    }
+    return error.HandshakeTimeout;
+}
+
+test "raw-app server-initiated bidi: client receives multi-frame payload in order + clean FIN" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    // Server opens a fresh bidi stream — RFC 9000 §2.1 server-initiated bidi
+    // parity (%4 == 1), so the very first id is 1.
+    const sid = try lb.server.openRawAppStream(conn);
+    try std.testing.expectEqual(@as(u64, 1), sid);
+    try std.testing.expectEqual(@as(u64, 1), sid % 4);
+
+    // A multi-frame payload (each ~1 KB chunk is one STREAM frame / datagram).
+    var payload: [6000]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    // Drive one chunk per pump iteration so the server's pacer always has
+    // credit (sending the whole payload at once would queue behind the pacer).
+    var sent: u64 = 0;
+    const chunk: u64 = 1000;
+    var drop = RawDrop{};
+    var done = false;
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (compat.milliTimestamp() < deadline) {
+        if (sent < payload.len) {
+            // Only offer a chunk when the pacer has credit so the bytes go
+            // straight on the wire instead of queueing (which would log a
+            // benign backpressure warning).  The send path is exercised
+            // identically either way.
+            conn.pacerUpdate(compat.milliTimestamp());
+            if (conn.pacerHasCredit(chunk)) {
+                const end = @min(sent + chunk, payload.len);
+                const is_fin = end == payload.len;
+                const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[@intCast(sent)..@intCast(end)], is_fin);
+                if (acc > 0) sent = end;
+            }
+        }
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppRecvBuffer(sid)) |got| {
+            if (got.len == payload.len and lb.client.rawAppStreamFinReceived(sid)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(done);
+
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqual(@as(usize, payload.len), got.len);
+    try std.testing.expectEqualSlices(u8, &payload, got);
+    try std.testing.expect(lb.client.rawAppStreamFinReceived(sid));
+
+    // Clean teardown: both ends release the slot (idempotent), server slot frees.
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+    try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "raw-app server-initiated bidi: retransmit after dropped packet still delivers in order" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    var payload: [7200]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast((i * 7) % 251);
+
+    // Drop the first STREAM-bearing datagram (>=200 B rules out bare ACKs).
+    // The client buffers the later frames out-of-order; the server's loss
+    // detector declares the missing packet lost once later packets are acked
+    // and replays it via the raw-app retransmit path, filling the gap.
+    var sent: u64 = 0;
+    const chunk: u64 = 900;
+    var drop = RawDrop{ .remaining = 1, .min_len = 200 };
+    var done = false;
+    const deadline = compat.milliTimestamp() + 8_000;
+    while (compat.milliTimestamp() < deadline) {
+        if (sent < payload.len) {
+            conn.pacerUpdate(compat.milliTimestamp());
+            if (conn.pacerHasCredit(chunk)) {
+                const end = @min(sent + chunk, payload.len);
+                const is_fin = end == payload.len;
+                const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[@intCast(sent)..@intCast(end)], is_fin);
+                if (acc > 0) sent = end;
+            }
+        }
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppRecvBuffer(sid)) |got| {
+            if (got.len == payload.len and lb.client.rawAppStreamFinReceived(sid)) {
+                done = true;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(done);
+    try std.testing.expectEqual(@as(usize, 0), drop.remaining); // a packet was actually dropped
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqual(@as(usize, payload.len), got.len);
+    try std.testing.expectEqualSlices(u8, &payload, got);
+    try std.testing.expect(lb.client.rawAppStreamFinReceived(sid));
+
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
 }
