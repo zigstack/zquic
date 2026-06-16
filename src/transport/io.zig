@@ -1189,7 +1189,7 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     // congestion-avoidance; RTT (ms) shows whether the path RTT is being
     // measured at all on a sub-ms localhost link.
     log.warn(
-        "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={}",
+        "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={} local_send_drops={}",
         .{
             side,
             @tagName(block),
@@ -1202,6 +1202,11 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
             conn.rtt.srtt_ms,
             conn.rtt.min_rtt_ms,
             conn.rtt.latest_rtt_ms,
+            // Local kernel send drops (EWOULDBLOCK/ENOBUFS after bounded retry):
+            // if this climbs alongside cong_events on loopback, the cwnd
+            // collapse is from spurious loss on locally-dropped packets, not
+            // real network congestion. See batch_io.local_send_drops.
+            batch_io.local_send_drops.load(.monotonic),
         },
     );
 }

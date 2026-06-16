@@ -72,7 +72,7 @@ pub const SendBatch = struct {
             flushLinux(sock, self.entries[0..cnt]);
         } else {
             for (self.entries[0..cnt]) |*e| {
-                _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                sendOne(sock, e);
             }
         }
     }
@@ -81,6 +81,32 @@ pub const SendBatch = struct {
         return self.count;
     }
 };
+
+/// Process-wide count of datagrams the local kernel refused on send and that
+/// this layer could not place on the wire (EWOULDBLOCK/ENOBUFS = SNDBUF full /
+/// loopback virtual-link saturated under a bulk catch-up burst, or a hard
+/// error). Surfaced in the CC trace: a *local* drop is NOT network congestion —
+/// the packet never reached the wire, so the peer never ACKs it and the loss
+/// detector reports a spurious loss that needlessly collapses cwnd. Attributing
+/// a cwnd collapse to this counter vs real loss is the whole point.
+pub var local_send_drops = std.atomic.Value(u64).init(0);
+
+/// `sendto` with a bounded retry. On loopback the SNDBUF drains in microseconds,
+/// so a few spins usually clears a transient EWOULDBLOCK and gets the datagram
+/// out instead of dropping it (which would later surface as spurious loss and
+/// collapse cwnd to the floor without recovering). Counts a drop only if every
+/// attempt fails.
+fn sendOne(sock: std.posix.socket_t, e: *const SendEntry) void {
+    var attempt: u8 = 0;
+    while (attempt < 8) : (attempt += 1) {
+        if (compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen())) |_| {
+            return; // on the wire
+        } else |_| {
+            std.atomic.spinLoopHint();
+        }
+    }
+    _ = local_send_drops.fetchAdd(1, .monotonic);
+}
 
 fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
     const linux = std.os.linux;
@@ -132,13 +158,13 @@ fn flushLinux(sock: std.posix.socket_t, entries: []SendEntry) void {
         const rc_i: isize = @bitCast(rc);
         if (rc_i <= 0) {
             for (batch) |*e| {
-                _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                sendOne(sock, e);
             }
         } else {
             const n: usize = @intCast(rc_i);
             if (n < batch.len) {
                 for (batch[n..]) |*e| {
-                    _ = compat.sendto(sock, e.buf[0..e.len], 0, &e.addr.any, e.addr.getOsSockLen()) catch {};
+                    sendOne(sock, e);
                 }
             }
         }
