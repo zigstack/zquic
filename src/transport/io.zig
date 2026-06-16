@@ -4850,7 +4850,7 @@ pub const Server = struct {
                 // bytes_acked is the sum of real packet sizes from the loss
                 // detector, keeping bytes_in_flight accurate.
                 if (ld_result.bytes_acked > 0) {
-                    conn.cc.onAck(ld_result.bytes_acked);
+                    conn.cc.onAck(ld_result.bytes_acked, largest_ack);
                 }
                 if (conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
@@ -9256,7 +9256,7 @@ pub const Client = struct {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
-                if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked);
+                if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked, largest_ack);
                 if (self.conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
                         self.conn.plpmtu.onProbeAcked(probe_pn);
@@ -11041,7 +11041,7 @@ test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
 
     var lost_buf: [8]recovery.SentPacket = undefined;
     const ld_result = try conn.ld.onAck(pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
-    if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked);
+    if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked, pn);
     try std.testing.expectEqual(@as(u64, 0), conn.cc.getBytesInFlight());
 }
 

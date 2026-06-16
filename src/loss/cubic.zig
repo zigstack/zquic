@@ -62,12 +62,24 @@ pub const Cubic = struct {
         return .{};
     }
 
-    /// Called when packets are acknowledged.
-    pub fn onAck(self: *Cubic, bytes_acked: u64) void {
+    /// Called when packets are acknowledged. `largest_acked_pn` is the largest
+    /// packet number newly acknowledged by this ACK; it gates recovery exit.
+    pub fn onAck(self: *Cubic, bytes_acked: u64, largest_acked_pn: u64) void {
         self.total_bytes_acked +|= bytes_acked;
         self.bytes_in_flight -|= bytes_acked;
 
         if (self.state == .recovery) {
+            // RFC 9002 §7.3.2: remain in recovery — and keep reacting to loss
+            // only once per round trip — until an ACK arrives for a packet sent
+            // *after* the recovery period began. Exiting on the first ACK and
+            // clearing `end_of_recovery` (as this code previously did) destroys
+            // the once-per-flight loss gate in `onLoss`: the next loss detected
+            // from the same flight re-enters recovery and cuts cwnd again, so a
+            // single congestion episode collapses cwnd to the floor over many
+            // ACKs (congestion_events climbing into the thousands).
+            if (self.end_of_recovery) |eor| {
+                if (largest_acked_pn <= eor) return; // pre-recovery ack: no growth, stay in recovery
+            }
             self.state = .congestion_avoidance;
             self.end_of_recovery = null;
         }
@@ -218,7 +230,7 @@ test "cubic: slow start growth" {
     const initial_cwnd = cc.cwnd;
 
     cc.onPacketSent(mss);
-    cc.onAck(mss);
+    cc.onAck(mss, 1);
     try testing.expectEqual(initial_cwnd + mss, cc.cwnd);
 }
 
@@ -237,6 +249,42 @@ test "cubic: loss triggers recovery with β=0.7" {
     try testing.expectEqual(@as(u64, 100), cc.w_max);
 }
 
+test "cubic: one congestion episode cuts cwnd once across many ACKs" {
+    const testing = std.testing;
+    var cc = Cubic.init();
+    cc.state = .congestion_avoidance;
+    cc.cwnd = 100 * mss;
+    cc.bytes_in_flight = 100 * mss;
+
+    // A flight (PNs 0..40) suffers loss. Loss is detected on PN 30 first, then
+    // the loss detector dribbles out more losses (PNs 20, 25) on later ACKs of
+    // the SAME flight — exactly what packet/time-threshold detection does.
+    // ACKs and losses interleave, as in the real recv loop (onAck then onLoss).
+    cc.onLoss(30); // recovery starts; end_of_recovery = 30
+    try testing.expectEqual(nr.CcState.recovery, cc.state);
+    const after_first = cc.cwnd; // 70 * mss
+    try testing.expectEqual(@as(u64, 1), cc.congestion_events);
+
+    // ACK of a pre-recovery packet (PN 10 <= 30): must NOT exit recovery and
+    // must NOT let the next loss re-trigger a cut.
+    cc.onAck(mss, 10);
+    try testing.expectEqual(nr.CcState.recovery, cc.state);
+    cc.onLoss(25); // same flight, <= end_of_recovery → gated, no second cut
+    cc.onAck(mss, 12);
+    cc.onLoss(20); // still gated
+    try testing.expectEqual(@as(u64, 1), cc.congestion_events);
+    try testing.expectEqual(after_first, cc.cwnd); // cwnd unchanged — no cascade
+
+    // An ACK for a packet sent AFTER recovery began (PN 41 > 30) ends recovery.
+    cc.onAck(mss, 41);
+    try testing.expectEqual(nr.CcState.congestion_avoidance, cc.state);
+
+    // A genuinely new congestion episode (PN past end_of_recovery) cuts again.
+    cc.onLoss(50);
+    try testing.expectEqual(@as(u64, 2), cc.congestion_events);
+    try testing.expectEqual(nr.CcState.recovery, cc.state);
+}
+
 test "cubic: integer cube root" {
     const testing = std.testing;
     try testing.expectEqual(@as(u64, 0), intCbrt(0));
@@ -253,6 +301,6 @@ test "cubic: can_send check" {
     cc.cwnd = 2 * mss;
     cc.bytes_in_flight = 2 * mss;
     try testing.expect(!cc.canSend(1));
-    cc.onAck(mss);
+    cc.onAck(mss, 1);
     try testing.expect(cc.canSend(mss));
 }

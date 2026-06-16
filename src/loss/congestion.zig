@@ -57,12 +57,19 @@ pub const NewReno = struct {
     }
 
     /// Called when packets are acknowledged.
-    pub fn onAck(self: *NewReno, bytes_acked: u64) void {
+    pub fn onAck(self: *NewReno, bytes_acked: u64, largest_acked_pn: u64) void {
         self.total_bytes_acked +|= bytes_acked;
         self.bytes_in_flight -|= bytes_acked;
 
         if (self.state == .recovery) {
-            // Exit recovery once the end-of-recovery packet is acked.
+            // RFC 9002 §7.3.2: exit recovery only when an ACK covers a packet
+            // sent *after* the recovery period began. Exiting on the first ACK
+            // (and clearing `end_of_recovery`) defeats the once-per-flight loss
+            // gate in `onLoss`, letting one congestion episode cut cwnd many
+            // times to the floor. See Cubic.onAck for the full rationale.
+            if (self.end_of_recovery) |eor| {
+                if (largest_acked_pn <= eor) return; // pre-recovery ack: no growth, stay in recovery
+            }
             self.state = .congestion_avoidance;
             self.end_of_recovery = null;
         }
@@ -146,9 +153,9 @@ pub const CongestionController = union(enum) {
         };
     }
 
-    pub fn onAck(self: *CongestionController, bytes_acked: u64) void {
+    pub fn onAck(self: *CongestionController, bytes_acked: u64, largest_acked_pn: u64) void {
         switch (self.*) {
-            inline else => |*cc| cc.onAck(bytes_acked),
+            inline else => |*cc| cc.onAck(bytes_acked, largest_acked_pn),
         }
     }
 
@@ -248,7 +255,7 @@ test "new_reno: slow start growth" {
     const initial_cwnd = cc.cwnd;
 
     cc.onPacketSent(mss);
-    cc.onAck(mss);
+    cc.onAck(mss, 1);
     // In slow start, cwnd should grow by bytes_acked
     try testing.expectEqual(initial_cwnd + mss, cc.cwnd);
 }
@@ -287,7 +294,7 @@ test "new_reno: congestion avoidance" {
 
     const initial_cwnd = cc.cwnd;
     // ACK a full cwnd worth of bytes → cwnd increases by 1 MSS
-    cc.onAck(cc.cwnd);
+    cc.onAck(cc.cwnd, 1);
     try testing.expectEqual(initial_cwnd + mss, cc.cwnd);
 }
 
@@ -298,7 +305,7 @@ test "new_reno: can_send check" {
     cc.bytes_in_flight = 2 * mss;
 
     try testing.expect(!cc.canSend(1));
-    cc.onAck(mss);
+    cc.onAck(mss, 1);
     try testing.expect(cc.canSend(mss));
 }
 
@@ -338,7 +345,7 @@ test "congestion_controller: tagged union dispatches correctly" {
     nr.onPacketSent(mss);
     try testing.expectEqual(@as(u64, mss), nr.getBytesInFlight());
     try testing.expect(nr.canSend(mss));
-    nr.onAck(mss);
+    nr.onAck(mss, 1);
     try testing.expectEqual(@as(u64, 0), nr.getBytesInFlight());
 
     // CUBIC variant
