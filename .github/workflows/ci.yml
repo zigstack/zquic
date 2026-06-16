@@ -237,9 +237,9 @@ jobs:
 
       # PR interop is split for runtime:
       #   1) zquic↔zquic — full suite (regression signal on every push/PR)
-      #   2) zquic↔quinn — P0 cross-impl subset (handshake + transfer +
-      #      multiplexing, both directions).  Full matrix runs nightly in
-      #      .github/workflows/interop-cross-impl.yml.
+      #   2) zquic↔quinn — P0 cross-impl subset (handshake + transfer in both
+      #      directions, plus multiplexing in zquic→quinn only).  Full matrix
+      #      runs nightly in .github/workflows/interop-cross-impl.yml.
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
@@ -256,19 +256,23 @@ jobs:
             --log-dir ../interop-results/logs-zquic \
             --json ../interop-results/results-zquic.json \
             --debug || zquic_failed=1
-          # P0 cross-impl: libp2p-relevant cases in both directions (quinn↔zquic).
-          CROSS_P0="handshake,transfer,multiplexing"
+          # P0 cross-impl: libp2p-relevant cases.
+          # quinn→zquic drops `multiplexing`: known gap (#169 — quinn-driven
+          # multiplexing against zquic-as-server is not yet implemented).  The
+          # nightly cross-impl matrix still runs it via EXPECTED_UNSUPPORTED.
+          CROSS_P0_QUINN_CLIENT="handshake,transfer"
+          CROSS_P0_ZQUIC_CLIENT="handshake,transfer,multiplexing"
           python3 run.py \
             --client quinn \
             --server zquic \
-            --test "$CROSS_P0" \
+            --test "$CROSS_P0_QUINN_CLIENT" \
             --log-dir ../interop-results/logs-cross-quinn-zquic \
             --json ../interop-results/results-cross-quinn-zquic.json \
             --debug || cross_failed=1
           python3 run.py \
             --client zquic \
             --server quinn \
-            --test "$CROSS_P0" \
+            --test "$CROSS_P0_ZQUIC_CLIENT" \
             --log-dir ../interop-results/logs-cross-zquic-quinn \
             --json ../interop-results/results-cross-zquic-quinn.json \
             --debug || cross_failed=1
