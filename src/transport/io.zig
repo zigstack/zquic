@@ -4591,7 +4591,11 @@ pub const Server = struct {
             if (slot.*) |*conn| {
                 if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
                 if (!conn.has_app_keys) continue;
-                const cid_len = conn.local_cid.len;
+                // `local_cid.len` is a u5, which would propagate through
+                // `pn_start`/`min_end` into the candidate-sweep loop below and
+                // make `end` a u5 — overflowing (panic) the moment `end`
+                // reaches 32 on any datagram past the first sweep iterations.
+                const cid_len: usize = conn.local_cid.len;
                 if (buf.len < 1 + cid_len) continue;
                 const candidate = ConnectionId.fromSlice(buf[1 .. 1 + cid_len]) catch continue;
                 const cid_match = ConnectionId.eql(conn.local_cid, candidate) or
@@ -11254,6 +11258,37 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "server 1-RTT recv: candidate sweep past wire offset 31 does not overflow (u5 regression)" {
+    // Regression for the `integer overflow` panic at processOneServer1RttPacket's
+    // candidate-sweep `end += 1`: `conn.local_cid.len` is a u5, and that type
+    // propagated through `pn_start`/`min_end` into the loop variable `end`, so
+    // `end += 1` trapped the instant `end` reached 32 — on any undecryptable
+    // datagram longer than ~31 bytes that reached the sweep.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    // Short-header 1-RTT datagram addressed to the server's live local CID but
+    // with an all-zero (undecryptable) payload, long enough (100 > 31) that the
+    // sweep iterates `end` past 32.
+    const cid_len = conn.local_cid.len;
+    var buf: [100]u8 = undefined;
+    @memset(&buf, 0);
+    buf[0] = 0x40; // short header (high bit clear), fixed bit set
+    @memcpy(buf[1 .. 1 + @as(usize, cid_len)], conn.local_cid.bytes[0..cid_len]);
+
+    // Must not panic; the garbage packet is undecryptable, so the sweep runs to
+    // completion and the function reports "no packet consumed" (null).
+    const step = lb.server.processOneServer1RttPacket(&buf, conn.peer);
+    try std.testing.expectEqual(@as(?usize, null), step);
 }
 
 test "raw-app server-initiated bidi: retransmit after dropped packet still delivers in order" {
