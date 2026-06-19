@@ -24,8 +24,23 @@ pub const RawAppStreamSlot = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     /// STREAM frames that arrived ahead of `next_offset` (UDP reordering).
     out_of_order: std.ArrayListUnmanaged(RawAppPendingFrame) = .empty,
-    /// True once a STREAM frame with FIN=true has been merged into `buf`.
+    /// True once a STREAM frame with FIN=true has been seen on this stream.
+    /// NOTE: the FIN bit can arrive (on a small trailing frame) before the
+    /// earlier bulk data has been reassembled, so `fin_received` alone does
+    /// NOT mean the stream is complete — use `fullyReceived`.
     fin_received: bool = false,
+    /// Final stream size, recorded from the FIN frame (`offset + len`). Only
+    /// meaningful once `fin_received` is true.
+    fin_offset: u64 = 0,
+
+    /// True only when the peer has FIN'd **and** all bytes up to the final
+    /// size have been contiguously reassembled into `buf`. This is the signal
+    /// embedders must use to decide "the response is complete" — `fin_received`
+    /// races ahead of the data because a trailing 0-byte FIN frame (the libp2p
+    /// reqresp half-close) can be processed before the cwnd-queued payload.
+    pub fn fullyReceived(self: *const RawAppStreamSlot) bool {
+        return self.fin_received and self.next_offset >= self.fin_offset;
+    }
 
     pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
         for (self.out_of_order.items) |*p| {
@@ -111,6 +126,36 @@ test "receiveFrame: out-of-order gap fill (libp2p reordering)" {
     try receiveFrame(allocator, &slot, 7, "hij");
     try std.testing.expectEqualStrings("abcdefghij", slot.buf.items);
     try std.testing.expectEqual(@as(u64, 10), slot.next_offset);
+}
+
+test "fullyReceived: FIN ahead of data is not complete until the gap fills" {
+    const allocator = std.testing.allocator;
+    var slot: RawAppStreamSlot = .{ .active = true, .stream_id = 4 };
+    defer slot.deinit(allocator);
+
+    // Trailing FIN frame (offset 6, 0 bytes) arrives before the bulk payload —
+    // the libp2p reqresp half-close racing ahead of cwnd-queued data. The
+    // caller records fin_received + fin_offset (as io.zig does on the FIN bit).
+    slot.fin_received = true;
+    slot.fin_offset = 6;
+    try std.testing.expect(!slot.fullyReceived()); // no data yet (next_offset=0)
+
+    try receiveFrame(allocator, &slot, 0, "abc");
+    try std.testing.expect(!slot.fullyReceived()); // 3/6 bytes contiguous
+
+    try receiveFrame(allocator, &slot, 3, "def");
+    try std.testing.expect(slot.fullyReceived()); // 6/6 — complete
+}
+
+test "fullyReceived: empty (0-byte) FIN is immediately complete" {
+    const allocator = std.testing.allocator;
+    var slot: RawAppStreamSlot = .{ .active = true, .stream_id = 4 };
+    defer slot.deinit(allocator);
+
+    // Empty reqresp response: a 0-byte FIN at offset 0 (peer has no data).
+    slot.fin_received = true;
+    slot.fin_offset = 0;
+    try std.testing.expect(slot.fullyReceived());
 }
 
 test "receiveFrame: duplicate out-of-order chunk is ignored" {
