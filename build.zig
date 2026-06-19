@@ -90,8 +90,10 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(client);
 
     // Unit tests
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name matches a filter") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = zquic_mod,
+        .filters = test_filters,
     });
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

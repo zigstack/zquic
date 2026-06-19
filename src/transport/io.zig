@@ -1015,6 +1015,25 @@ fn enqueuePendingStreamSend(
     // SIGSEGV in an unrelated later allocation (e.g. drainGossipsubOutbox).  The
     // FIN bit itself is replayed directly by the loss arm, not via this queue.
     if (data.len == 0) return true;
+    // Split writes larger than one 1-RTT packet into per-packet entries.
+    // `drainPendingStreamSends` serializes one entry into one datagram and
+    // CANNOT fragment — an oversized entry fails `StreamFrame.serialize` and is
+    // dropped on the floor (the data is silently lost). So a single
+    // `sendRawStreamData` of, say, a 200 KB block (libp2p reqresp
+    // `blocks_by_range`) must be fanned out into ≤ `max_pending_stream_chunk`
+    // slices here, each of which serializes into exactly one packet on drain.
+    if (data.len > max_pending_stream_chunk) {
+        var rel: usize = 0;
+        while (rel < data.len) {
+            const take = @min(data.len - rel, max_pending_stream_chunk);
+            const is_last = rel + take == data.len;
+            if (!enqueuePendingStreamSend(conn, allocator, stream_id, offset +| rel, data[rel..][0..take], fin and is_last)) {
+                return false;
+            }
+            rel += take;
+        }
+        return true;
+    }
     // Embedder may retry the same offset after a backpressure 0; treat as
     // already accepted so we do not fill the queue with duplicate copies.
     for (conn.pending_stream_sends.items) |e| {
@@ -10875,16 +10894,26 @@ test "pending stream send: cap rejects past per-conn entry budget" {
     try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
 }
 
-test "pending stream send: cap rejects past per-conn byte budget" {
+test "pending stream send: oversized write fans out into per-packet entries" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // One ~8MB payload fills the byte cap; the second of any size must
-    // be rejected.
-    const big = try std.testing.allocator.alloc(u8, pending_stream_send_bytes_cap);
+    // A write larger than one 1-RTT packet must be split into
+    // `max_pending_stream_chunk`-sized entries (each serializes into exactly
+    // one datagram on drain) — never stored as a single oversized entry, which
+    // the drain path cannot fragment and would silently drop.
+    const big = try std.testing.allocator.alloc(u8, max_pending_stream_chunk * 4 + 100);
     defer std.testing.allocator.free(big);
     @memset(big, 0xaa);
-    try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, big, false));
-    try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(big.len), "y", false));
+    try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, big, true));
+    // 4 full-packet slices + 1 remainder = 5 entries, each ≤ one packet.
+    try std.testing.expectEqual(@as(usize, 5), conn.pending_stream_sends.items.len);
+    for (conn.pending_stream_sends.items) |e| {
+        try std.testing.expect(e.data.len <= max_pending_stream_chunk);
+    }
+    // Offsets are contiguous and only the final slice carries FIN.
+    try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
+    try std.testing.expect(conn.pending_stream_sends.items[4].fin);
+    try std.testing.expect(!conn.pending_stream_sends.items[0].fin);
 }
 
 test "build1RttPacketFull: cipher param actually selects the AEAD (regression for AES-128 fallthrough)" {
@@ -11258,6 +11287,61 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "raw-app server-initiated bidi: bulk multi-MB transfer drains across cwnd/ACK cycles" {
+    // Regression for the zeam delayed-node sync stall: a responder that writes a
+    // large (multi-MB) reqresp response all at once (e.g. blocks_by_range) must
+    // drain across many congestion-window / ACK cycles. The whole payload is
+    // offered up front (queued into pending_stream_sends), then the loopback is
+    // pumped; the client must receive every byte. Earlier the transfer stalled
+    // with the sender's loss detector saturated and no ACK progress.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    const total: usize = 2_500_000;
+    const payload = try allocator.alloc(u8, total);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    // Faithful to zeam's responder: write the response in large (~200 KB)
+    // chunks — each far bigger than one QUIC packet — and let the stack
+    // fragment + drain them across congestion-window / ACK cycles. Before the
+    // per-packet split fix, an oversized pending entry failed to serialize on
+    // drain and was silently dropped, so the client received zero bytes.
+    var sent: u64 = 0;
+    var done = false;
+    const chunk: u64 = 200 * 1024;
+    const deadline = compat.milliTimestamp() + 30_000;
+    while (compat.milliTimestamp() < deadline) {
+        if (sent < payload.len) {
+            const end = @min(sent + chunk, payload.len);
+            const is_fin = end == payload.len;
+            const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[@intCast(sent)..@intCast(end)], is_fin);
+            if (acc > 0) sent += acc; // 0 = backpressure; retry same offset next pump
+        }
+        var drop = RawDrop{};
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppRecvBuffer(sid)) |got| {
+            if (got.len == payload.len and lb.client.rawAppStreamFinReceived(sid)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(done);
+
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqual(total, got.len);
+    try std.testing.expectEqualSlices(u8, payload, got);
 }
 
 test "server 1-RTT recv: candidate sweep past wire offset 31 does not overflow (u5 regression)" {
