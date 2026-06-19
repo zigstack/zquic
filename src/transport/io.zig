@@ -6101,12 +6101,17 @@ pub const Server = struct {
 
         raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
         // RFC 9000 §3.2: STREAM frame with FIN signals the peer is done
-        // sending on this stream.  Record it so the embedder knows it can
-        // release the slot once it has consumed the payload (see
-        // releaseRawAppStream).  Without this, libp2p's per-message-stream
-        // gossipsub pattern exhausts the 64 slots within ~30s and all
-        // subsequent inbound streams are silently dropped.
-        if (sf.fin) slot.fin_received = true;
+        // sending on this stream.  Record it (plus the final size) so the
+        // embedder knows it can release the slot once it has consumed the
+        // payload (see releaseRawAppStream) and can distinguish "stream
+        // complete" from "FIN seen but data still arriving" via `fullyReceived`.
+        // Without the FIN flag, libp2p's per-message-stream gossipsub pattern
+        // exhausts the 64 slots within ~30s and all subsequent inbound streams
+        // are silently dropped.
+        if (sf.fin) {
+            slot.fin_received = true;
+            slot.fin_offset = sf.offset + @as(u64, @intCast(sf.data.len));
+        }
     }
 
     fn openHttp09OutSlot(_: *Server, conn: *ConnState, stream_id: u64, fs_path: []const u8) ?u16 {
@@ -7225,6 +7230,19 @@ pub fn rawAppStreamFinReceived(conn: *ConnState, stream_id: u64) bool {
     return false;
 }
 
+/// True only when the peer has FIN'd **and** every byte up to the final size
+/// has been contiguously reassembled — i.e. the response is genuinely complete
+/// (covers the empty-response case: a 0-byte FIN at offset 0 is fully received).
+/// Prefer this over `rawAppStreamFinReceived` for "is the response done?"
+/// decisions: a trailing 0-byte FIN frame can be processed before the
+/// cwnd-queued payload, so `fin_received` alone races ahead of the data.
+pub fn rawAppStreamFullyReceived(conn: *ConnState, stream_id: u64) bool {
+    for (&conn.raw_app_streams) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) return slot.fullyReceived();
+    }
+    return false;
+}
+
 /// Free the raw-app slot holding `stream_id` so the connection's 64-slot
 /// table can absorb the next inbound stream.  Returns true if a matching
 /// slot was found.  Calling this on a slot whose FIN has not yet been
@@ -8199,6 +8217,15 @@ pub const Client = struct {
     pub fn rawAppStreamFinReceived(self: *const Client, stream_id: u64) bool {
         for (&self.raw_app_recv) |*slot| {
             if (slot.active and slot.stream_id == stream_id) return slot.fin_received;
+        }
+        return false;
+    }
+
+    /// Mirror of the connection-level `rawAppStreamFullyReceived`: FIN seen
+    /// **and** all bytes up to the final size contiguously reassembled.
+    pub fn rawAppStreamFullyReceived(self: *const Client, stream_id: u64) bool {
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.stream_id == stream_id) return slot.fullyReceived();
         }
         return false;
     }
@@ -9826,9 +9853,13 @@ pub const Client = struct {
         };
 
         raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
-        // Mirror of the server side: track FIN so embedders can release the
-        // slot once they have read the payload.
-        if (sf.fin) slot.fin_received = true;
+        // Mirror of the server side: track FIN + final size so embedders can
+        // release the slot once they have read the payload, and distinguish
+        // "complete" from "FIN seen but data still arriving" via `fullyReceived`.
+        if (sf.fin) {
+            slot.fin_received = true;
+            slot.fin_offset = sf.offset + @as(u64, @intCast(sf.data.len));
+        }
     }
 
     fn http09DeliverStreamBytes(s: *StreamDownload, reorder: *quic_tls_mod.CryptoReorderBuf, offset: u64, data: []const u8) void {
