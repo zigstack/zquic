@@ -2690,6 +2690,22 @@ pub fn serverTlsAlpn(cfg: *const ServerConfig) ?[]const u8 {
     return null;
 }
 
+/// RFC 9000 §10.3.3: do not emit a stateless reset for triggers shorter than this.
+const stateless_reset_min_trigger_len: usize = 41;
+
+/// RFC 9000 §10.3.2 sliding window for reset-rate accounting.
+const stateless_reset_rate_window_ms: i64 = 1000;
+
+/// RFC 9000 §10.3.2: allow another outbound reset while strictly below half of inbound.
+fn statelessResetRateLimitAllows(inbound: u64, sent: u64) bool {
+    if (inbound == 0) return false;
+    return sent * 2 < inbound;
+}
+
+fn statelessResetTriggerEligible(trigger_len: usize) bool {
+    return trigger_len >= stateless_reset_min_trigger_len;
+}
+
 // ── QUIC Server ───────────────────────────────────────────────────────────────
 
 pub const Server = struct {
@@ -2727,6 +2743,11 @@ pub const Server = struct {
     /// 0-RTT anti-replay nonce cache (RFC 9001 §8.1).
     /// Keyed by the first 8 bytes of the PSK identity from each ClientHello.
     nonce_cache: session_mod.NonceCache = .{},
+    /// RFC 9000 §10.3.2: inbound non-reset packets in the current rate window.
+    stateless_reset_inbound: u64 = 0,
+    /// RFC 9000 §10.3.2: stateless resets sent in the current rate window.
+    stateless_reset_sent: u64 = 0,
+    stateless_reset_window_start_ms: i64 = 0,
     /// When false, `deinit` does not `close(self.sock)` (caller owns the UDP fd).
     owns_socket: bool = true,
     /// Initialize server: load cert/key and create UDP socket.
@@ -3476,6 +3497,7 @@ pub const Server = struct {
                 log.warn("zquic: server long-header parseLong failed: {s} buf_len={d} first={x:0>2}", .{ @errorName(err), buf.len, buf[0] });
                 return;
             };
+            self.noteInboundNonStatelessReset();
             // RFC 9000 §6.1: respond with Version Negotiation for unsupported
             // versions (e.g. "WAIT" probes from the interop network simulator).
             // Accept both QUIC v1 and QUIC v2.
@@ -4769,6 +4791,7 @@ pub const Server = struct {
                             return buf.len;
                         }
                     }
+                    self.noteInboundNonStatelessReset();
                     dbg(
                         "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
                         .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
@@ -4776,6 +4799,7 @@ pub const Server = struct {
                     continue;
                 };
 
+                self.noteInboundNonStatelessReset();
                 const srv_decrypted_pn = decrypted.pn;
                 const pt_len = decrypted.pt_len;
                 if (srv_decrypted_pn > (conn.app_recv_pn orelse 0)) {
@@ -4793,10 +4817,29 @@ pub const Server = struct {
                 return decrypted.wire_len;
             }
         }
-        if (buf.len >= 1 + 8 and buf[0] & 0x80 == 0) {
-            self.emitStatelessReset(buf[1..9], src);
+        if (statelessResetTriggerEligible(buf.len) and buf[0] & 0x80 == 0 and buf.len >= 1 + 8) {
+            self.noteInboundNonStatelessReset();
+            self.tryEmitStatelessReset(buf[1..9], src);
         }
         return null;
+    }
+
+    fn rollStatelessResetWindow(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
+        if (self.stateless_reset_window_start_ms == 0) {
+            self.stateless_reset_window_start_ms = now_ms;
+            return;
+        }
+        if (now_ms - self.stateless_reset_window_start_ms >= stateless_reset_rate_window_ms) {
+            self.stateless_reset_window_start_ms = now_ms;
+            self.stateless_reset_inbound = 0;
+            self.stateless_reset_sent = 0;
+        }
+    }
+
+    fn noteInboundNonStatelessReset(self: *Server) void {
+        self.rollStatelessResetWindow();
+        self.stateless_reset_inbound += 1;
     }
 
     fn deriveStatelessResetToken(secret: *const [32]u8, dcid: []const u8) [16]u8 {
@@ -4810,14 +4853,17 @@ pub const Server = struct {
         return token;
     }
 
-    fn emitStatelessReset(self: *Server, dcid: []const u8, dst: compat.Address) void {
+    fn tryEmitStatelessReset(self: *Server, dcid: []const u8, dst: compat.Address) void {
         if (dcid.len == 0 or dcid.len > types.max_cid_len) return;
+        self.rollStatelessResetWindow();
+        if (!statelessResetRateLimitAllows(self.stateless_reset_inbound, self.stateless_reset_sent)) return;
         var pkt: [32]u8 = undefined;
         compat.random.bytes(pkt[0 .. pkt.len - 16]);
         pkt[0] = (pkt[0] & 0x3f) | 0x40;
         const token = deriveStatelessResetToken(&self.retry_secret, dcid);
         @memcpy(pkt[pkt.len - 16 ..], &token);
         _ = compat.sendto(self.sock, &pkt, 0, &dst.any, dst.getOsSockLen()) catch {};
+        self.stateless_reset_sent += 1;
     }
 
     fn maybeSendStreamsBlocked(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
@@ -11895,4 +11941,36 @@ test "build1RttPacketFull: greased QUIC bit randomizes fixed bit on wire" {
     }
     try std.testing.expect(saw_fixed_set);
     try std.testing.expect(saw_fixed_clear);
+}
+
+test "stateless reset RFC 9000 §10.3.3 min trigger size" {
+    try std.testing.expect(statelessResetTriggerEligible(41));
+    try std.testing.expect(!statelessResetTriggerEligible(40));
+}
+
+test "stateless reset RFC 9000 §10.3.2 rate limit math" {
+    try std.testing.expect(statelessResetRateLimitAllows(10, 4));
+    try std.testing.expect(!statelessResetRateLimitAllows(10, 5));
+    try std.testing.expect(statelessResetRateLimitAllows(2, 0));
+    try std.testing.expect(!statelessResetRateLimitAllows(2, 1));
+    try std.testing.expect(!statelessResetRateLimitAllows(0, 0));
+}
+
+test "stateless reset: short unknown-DCID probe below 41 bytes does not bump sent counter" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    var buf: [40]u8 = undefined;
+    @memset(&buf, 0xaa);
+    buf[0] = 0x40;
+    @memset(buf[1..9], 0xbb);
+
+    const sent_before = lb.server.stateless_reset_sent;
+    _ = lb.server.processOneServer1RttPacket(&buf, lb.client.conn.peer);
+    try std.testing.expectEqual(sent_before, lb.server.stateless_reset_sent);
 }
