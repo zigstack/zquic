@@ -9129,6 +9129,10 @@ pub const Client = struct {
             if (pos + dlen > pt_len) break;
             const cdata = plaintext[pos .. pos + dlen];
             if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
+                // Quinn retransmits ServerHello in Initial when the client
+                // stalls; re-running TLS state derivation corrupts the
+                // transcript and wedges Handshake decryption.
+                if (self.conn.has_hs_keys) continue;
                 self.tls.processServerHello(cdata) catch |err| {
                     dbg("io: processServerHello failed: {}\n", .{err});
                     return;

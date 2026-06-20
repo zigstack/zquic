@@ -167,8 +167,10 @@ pub const TransportParamsOpts = struct {
     /// `initial_max_streams_uni` (0x09).
     initial_max_streams_uni: u64 = 1000,
     /// RFC 9287 `grease_quic_bit` (0x2ab2): advertise tolerance for greased
-    /// short-header QUIC bits from the peer.
-    grease_quic_bit: bool = true,
+    /// short-header QUIC bits from the peer.  Off by default so legacy quinn
+    /// interop images that mishandle 0x2ab2 still complete handshakes; opt in
+    /// explicitly when the peer is known to support RFC 9287.
+    grease_quic_bit: bool = false,
 };
 
 /// Preset transport-parameter profiles for common embedders.
@@ -519,6 +521,18 @@ test "transport params: disable_active_migration is a length-0 flag" {
     const bytes = [_]u8{ 0x0c, 0x00 };
     const parsed = try parseTransportParams(&bytes);
     try testing.expect(parsed.disable_active_migration);
+}
+
+test "transport params: grease_quic_bit round-trip when enabled" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const n = try buildTransportParams(&buf, .{
+        .initial_source_cid = &cid,
+        .grease_quic_bit = true,
+    });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expect(parsed.grease_quic_bit);
 }
 
 test "transport params: ack_delay_exponent above 20 is clamped to default" {
