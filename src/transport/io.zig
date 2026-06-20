@@ -1213,6 +1213,30 @@ fn connTransmitBlock(conn: *ConnState, bytes: u64) ?TransmitBlock {
     return null;
 }
 
+fn noteConnAckInSpace(conn: *ConnState, space: recovery.PacketNumberSpace, now_ms: i64) void {
+    const idx = @intFromEnum(space);
+    conn.last_ack_ms_by_space[idx] = now_ms;
+    if (now_ms > conn.last_ack_ms) conn.last_ack_ms = now_ms;
+    conn.pto_count[idx] = 0;
+}
+
+fn recordAckElicitingSent(
+    conn: *ConnState,
+    space: recovery.PacketNumberSpace,
+    pn: u64,
+    pkt_len: usize,
+    now_ms: u64,
+) void {
+    _ = conn.ld.onPacketSent(.{
+        .pn = pn,
+        .send_time_ms = now_ms,
+        .size = pkt_len,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .space = space,
+    });
+}
+
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
 /// `bytes` is the application payload size; we cap the pacer-credit check at
 /// one MSS because each call site ultimately emits at most one MTU-sized
@@ -1922,13 +1946,13 @@ pub const ConnState = struct {
     draining_deadline_ms: i64 = 0,
     // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
     last_recv_ms: i64 = 0,
-    // PTO (Probe Timeout) state (RFC 9002 §6.2).
-    // last_ack_ms: wall-clock time of the most recent ACK frame we processed.
-    // pto_count:   exponential-backoff multiplier (doubles each consecutive probe).
-    // last_pto_ms: wall-clock time we last sent a PTO probe packet.
+    // PTO (Probe Timeout) state per packet-number space (RFC 9002 §6.2.3).
+    // last_ack_ms: wall-clock time of the most recent ACK in any space (idle timeout).
+    // last_ack_ms_by_space / pto_count / last_pto_ms: per-space PTO accounting.
     last_ack_ms: i64 = 0,
-    pto_count: u32 = 0,
-    last_pto_ms: i64 = 0,
+    last_ack_ms_by_space: [recovery.pn_space_count]i64 = .{0} ** recovery.pn_space_count,
+    pto_count: [recovery.pn_space_count]u32 = .{0} ** recovery.pn_space_count,
+    last_pto_ms: [recovery.pn_space_count]i64 = .{0} ** recovery.pn_space_count,
     /// Wall-clock time we last sent a keepalive PING (independent from
     /// `last_pto_ms` so a keepalive does not poison PTO backoff math).
     /// Drives [`Server.checkPto`] / [`Client.checkPto`] keepalive emission
@@ -4234,6 +4258,7 @@ pub const Server = struct {
             const init_pn_sent = conn.init_pn;
             conn.init_pn += 1;
             conn.migration.anti_amp.onSent(pkt_len);
+            recordAckElicitingSent(conn, .initial, init_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
             coalesced_len = pkt_len;
             conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
         }
@@ -4275,6 +4300,7 @@ pub const Server = struct {
                 conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
                 conn.hs_pn += 1;
                 conn.migration.anti_amp.onSent(pkt_len);
+                recordAckElicitingSent(conn, .handshake, hs_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
                 coalesced_len += pkt_len;
                 offset += chunk_len;
             }
@@ -4361,6 +4387,7 @@ pub const Server = struct {
         const init_pn_sent = conn.init_pn;
         conn.init_pn += 1;
         conn.migration.anti_amp.onSent(pkt_len);
+        recordAckElicitingSent(conn, .initial, init_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
         conn.qlog.packetSent(.initial, init_pn_sent, pkt_len);
 
         conn.init_resend.store(send_buf[0..pkt_len]);
@@ -4419,6 +4446,7 @@ pub const Server = struct {
 
             conn.hs_pn += 1;
             conn.migration.anti_amp.onSent(pkt_len);
+            recordAckElicitingSent(conn, .handshake, hs_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
             conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             if (conn.hs_resend_count < max_server_flight_resend_datagrams) {
@@ -4525,8 +4553,40 @@ pub const Server = struct {
                 fpos += dlen;
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
-                fpos += 1;
-                if (fpos > pt_len) break;
+                var ack_pos: usize = fpos + 1;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch break;
+                ack_pos += lar_r.len;
+                const largest_ack = lar_r.value;
+                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += del_r.len;
+                const ack_delay = del_r.value;
+                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += cnt_r.len;
+                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                const first_ack_range = fst_r.value;
+                var lost_buf: [32]recovery.SentPacket = undefined;
+                const now_ms: i64 = compat.milliTimestamp();
+                if (conn.ld.onAck(
+                    .handshake,
+                    largest_ack,
+                    first_ack_range,
+                    ack_delay,
+                    @intCast(now_ms),
+                    &conn.rtt,
+                    &lost_buf,
+                    self.allocator,
+                )) |_| {
+                    noteConnAckInSpace(conn, .handshake, now_ms);
+                } else |_| {}
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                 continue;
             } else {
@@ -5032,6 +5092,7 @@ pub const Server = struct {
                 // distinguish acked packets from those in gaps.
                 var lost_buf: [32]recovery.SentPacket = undefined;
                 const ld_result = conn.ld.onAck(
+                    .application,
                     largest_ack,
                     first_ack_range,
                     ack_delay,
@@ -5219,8 +5280,7 @@ pub const Server = struct {
                 }
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
-                conn.last_ack_ms = compat.milliTimestamp();
-                conn.pto_count = 0;
+                noteConnAckInSpace(conn, .application, compat.milliTimestamp());
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
@@ -5590,6 +5650,7 @@ pub const Server = struct {
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
+            .space = .application,
         });
         // Congestion control: only count the packet toward bytes_in_flight when
         // the loss detector is tracking it.  An untracked packet can never be
@@ -5831,19 +5892,69 @@ pub const Server = struct {
     ///   2. bytes_in_flight is corrected, unblocking subsequent data sends.
     ///
     /// The pto_count field provides exponential back-off (PTO doubles each probe).
+    fn sendPtoProbeInSpace(self: *Server, conn: *ConnState, space: recovery.PacketNumberSpace, dst: compat.Address) bool {
+        return switch (space) {
+            .application => blk: {
+                if (!conn.has_app_keys) break :blk false;
+                const ping_frame = [_]u8{0x01};
+                self.send1Rtt(conn, &ping_frame, dst);
+                break :blk true;
+            },
+            .handshake => self.sendHandshakePtoProbe(conn, dst),
+            .initial => self.sendInitialPtoProbe(conn, dst),
+        };
+    }
+
+    fn sendHandshakePtoProbe(self: *Server, conn: *ConnState, dst: compat.Address) bool {
+        if (!conn.has_hs_keys) return false;
+        var send_buf: [256]u8 = undefined;
+        const ping = [_]u8{0x01};
+        const hs_pn_sent = conn.hs_pn;
+        const pkt_len = buildHandshakePacket(
+            &send_buf,
+            conn.remote_cid,
+            conn.local_cid,
+            &ping,
+            hs_pn_sent,
+            &conn.hs_server_km,
+            conn.quicVersion(),
+            conn.packet_cipher,
+        ) catch return false;
+        conn.hs_pn += 1;
+        recordAckElicitingSent(conn, .handshake, hs_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch return false;
+        return true;
+    }
+
+    fn sendInitialPtoProbe(self: *Server, conn: *ConnState, dst: compat.Address) bool {
+        const init_km = conn.init_keys orelse return false;
+        var send_buf: [256]u8 = undefined;
+        const ping = [_]u8{0x01};
+        const init_pn_sent = conn.init_pn;
+        const pkt_len = buildInitialPacket(
+            &send_buf,
+            conn.remote_cid,
+            conn.local_cid,
+            &.{},
+            &ping,
+            init_pn_sent,
+            &init_km.server,
+            conn.quicVersion(),
+        ) catch return false;
+        conn.init_pn += 1;
+        recordAckElicitingSent(conn, .initial, init_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch return false;
+        return true;
+    }
+
     fn checkPto(self: *Server) void {
         const now_ms = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
             const conn = if (cslot.*) |c| c else continue;
-            if (!conn.has_app_keys) continue;
             if (conn.draining) continue;
-            // Safety net: drain any flow-control-deferred application
-            // STREAM bytes whose MAX_DATA / MAX_STREAM_DATA arrived while
-            // we were not in `process1RttPacket` (e.g. the credit grew
-            // due to local recv-window advertising as our peer consumes
-            // — a tick boundary catches it without waiting for the next
-            // explicit credit-update frame).
-            self.drainPendingStreamSendsUntilStalled(conn);
+            if (conn.has_app_keys) {
+                self.drainPendingStreamSendsUntilStalled(conn);
+            }
 
             // Effective idle timeout used by branches 2 and 3: the smaller of
             // our 30s local default and the peer-advertised max_idle_timeout
@@ -5907,26 +6018,30 @@ pub const Server = struct {
                 }
             }
 
-            // Branch 1: PTO probe (RFC 9002 §6.2). Only when we have unACKed
-            // packets in flight and the smoothed-RTT-derived PTO deadline
-            // has passed since the last ACK we processed.
-            pto_block: {
-                if (conn.cc.getBytesInFlight() == 0) break :pto_block;
-                if (conn.last_ack_ms == 0) break :pto_block;
-                const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count));
-                const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
-                const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
+            // Branch 1: per-space PTO probes (RFC 9002 §6.2.3).
+            var pto_fired = false;
+            const pto_spaces = [_]recovery.PacketNumberSpace{ .initial, .handshake, .application };
+            for (pto_spaces) |space| {
+                const idx = @intFromEnum(space);
+                if (!conn.ld.inflightInSpace(space)) continue;
+                const ack_ms = conn.last_ack_ms_by_space[idx];
+                if (ack_ms == 0) continue;
+                const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count[idx]));
+                const elapsed_since_ack: i64 = now_ms - ack_ms;
+                const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms[idx];
                 if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
-                    const ping_frame = [_]u8{0x01};
-                    self.send1Rtt(conn, &ping_frame, conn.peer);
-                    conn.last_pto_ms = now_ms;
-                    conn.pto_count +|= 1;
-                    dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
-                        conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.getBytesInFlight(),
-                    });
-                    continue;
+                    if (self.sendPtoProbeInSpace(conn, space, conn.peer)) {
+                        conn.last_pto_ms[idx] = now_ms;
+                        conn.pto_count[idx] +|= 1;
+                        dbg("io: PTO probe sent space={s} pto_count={} pto_delay={}ms bif={}\n", .{
+                            @tagName(space), conn.pto_count[idx], pto_delay, conn.cc.getBytesInFlight(),
+                        });
+                        pto_fired = true;
+                        break;
+                    }
                 }
             }
+            if (pto_fired) continue;
 
             // Branch 2: keepalive PING (RFC 9000 §10.1.2). When we have nothing
             // in flight to drive PTO but the peer is also quiet, we must elicit
@@ -5938,6 +6053,7 @@ pub const Server = struct {
             // effective idle timeout (min of local and peer) and triggers at
             // half that, leaving a full PTO worth of slack for the ACK to
             // arrive before the peer would timeout.
+            if (!conn.has_app_keys) continue;
             if (conn.last_ack_ms == 0) {
                 // No ACK ever seen — branch 2 requires one as a sanity baseline
                 // so it does not trip mid-handshake.
@@ -7938,6 +8054,7 @@ pub const Client = struct {
             .size = pkt_len,
             .ack_eliciting = true,
             .in_flight = true,
+            .space = .application,
         });
         if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
         return pn;
@@ -8200,6 +8317,7 @@ pub const Client = struct {
             .stream_offset = offset,
             .stream_data = buf,
             .stream_fin = fin,
+            .space = .application,
         });
         // Mirror Server.send1Rtt: only count toward bytes_in_flight when the
         // loss detector is tracking the packet.  Without this, checkPto
@@ -8300,6 +8418,7 @@ pub const Client = struct {
                 .stream_offset = offset,
                 .stream_data = rtx_buf,
                 .stream_fin = fin,
+                .space = .application,
             });
             if (recorded) {
                 self.conn.cc.onPacketSent(@intCast(pkt_len));
@@ -8360,14 +8479,61 @@ pub const Client = struct {
     /// quiet has no way to recover any tail packet that was dropped — the
     /// k_packet_threshold loss detector requires a *later* ACK to fire, and
     /// none arrives in an idle conversation.
+    fn sendClientPtoProbeInSpace(self: *Client, space: recovery.PacketNumberSpace) bool {
+        return switch (space) {
+            .application => self.sendOnePingFrame(),
+            .handshake => self.sendClientHandshakePtoProbe(),
+            .initial => self.sendClientInitialPtoProbe(),
+        };
+    }
+
+    fn sendClientHandshakePtoProbe(self: *Client) bool {
+        if (!self.conn.has_hs_keys) return false;
+        var send_buf: [256]u8 = undefined;
+        const ping = [_]u8{0x01};
+        const hs_pn_sent = self.conn.hs_pn;
+        const pkt_len = buildHandshakePacket(
+            &send_buf,
+            self.conn.remote_cid,
+            self.conn.local_cid,
+            &ping,
+            hs_pn_sent,
+            &self.conn.hs_client_km,
+            self.conn.quicVersion(),
+            self.conn.packet_cipher,
+        ) catch return false;
+        self.conn.hs_pn += 1;
+        recordAckElicitingSent(&self.conn, .handshake, hs_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return false;
+        return true;
+    }
+
+    fn sendClientInitialPtoProbe(self: *Client) bool {
+        const init_km = self.conn.init_keys orelse return false;
+        var send_buf: [256]u8 = undefined;
+        const ping = [_]u8{0x01};
+        const init_pn_sent = self.conn.init_pn;
+        const pkt_len = buildInitialPacket(
+            &send_buf,
+            self.conn.remote_cid,
+            self.conn.local_cid,
+            &.{},
+            &ping,
+            init_pn_sent,
+            &init_km.client,
+            self.conn.quicVersion(),
+        ) catch return false;
+        self.conn.init_pn += 1;
+        recordAckElicitingSent(&self.conn, .initial, init_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
+        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return false;
+        return true;
+    }
+
     fn checkPto(self: *Client) void {
-        if (self.conn.phase != .connected) return;
         if (self.conn.draining) return;
-        // Safety net: drain any flow-control-deferred application STREAM
-        // bytes (see Server.checkPto for the rationale).  Done before the
-        // PTO branches so the drained packets count toward bytes_in_flight
-        // when the loss detector evaluates them.
-        self.drainPendingStreamSendsUntilStalled();
+        if (self.conn.phase == .connected) {
+            self.drainPendingStreamSendsUntilStalled();
+        }
         // Need at least one prior ACK before either branch runs so the RTT
         // estimate is meaningful and we have evidence the peer is responsive.
         if (self.conn.last_ack_ms == 0) return;
@@ -8418,22 +8584,28 @@ pub const Client = struct {
             return;
         }
 
-        // Branch 1: PTO probe (RFC 9002 §6.2). Only when we have unACKed
-        // bytes in flight; otherwise there is nothing to recover.
-        if (self.conn.cc.getBytesInFlight() > 0) {
-            const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count));
-            const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms;
-            if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
-                if (self.sendOnePingFrame()) {
-                    self.conn.last_pto_ms = now_ms;
-                    self.conn.pto_count +|= 1;
-                    dbg("io: client PTO probe sent pto_count={} pto_delay={}ms bif={}\n", .{
-                        self.conn.pto_count, pto_delay, self.conn.cc.getBytesInFlight(),
+        const pto_spaces = [_]recovery.PacketNumberSpace{ .initial, .handshake, .application };
+        for (pto_spaces) |space| {
+            const idx = @intFromEnum(space);
+            if (!self.conn.ld.inflightInSpace(space)) continue;
+            const ack_ms = self.conn.last_ack_ms_by_space[idx];
+            if (ack_ms == 0) continue;
+            const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count[idx]));
+            const elapsed_since_space_ack: i64 = now_ms - ack_ms;
+            const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms[idx];
+            if (elapsed_since_space_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+                if (self.sendClientPtoProbeInSpace(space)) {
+                    self.conn.last_pto_ms[idx] = now_ms;
+                    self.conn.pto_count[idx] +|= 1;
+                    dbg("io: client PTO probe sent space={s} pto_count={} pto_delay={}ms bif={}\n", .{
+                        @tagName(space), self.conn.pto_count[idx], pto_delay, self.conn.cc.getBytesInFlight(),
                     });
+                    return;
                 }
-                return;
             }
         }
+
+        if (self.conn.phase != .connected) return;
 
         // Branch 2: keepalive PING (RFC 9000 §10.1.2). Even when nothing is
         // in flight, send a PING every `max_idle_timeout / 2` so the peer's
@@ -8964,7 +9136,9 @@ pub const Client = struct {
             buildPaddingFrames(frame_buf[payload_len .. payload_len + add], add);
             payload_len += add;
         }
+        const init_pn_sent = self.conn.init_pn;
         self.conn.init_pn += 1;
+        recordAckElicitingSent(&self.conn, .initial, init_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
         self.initial_pkt_len = pkt_len;
 
         _ = try compat.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
@@ -9339,8 +9513,40 @@ pub const Client = struct {
             }
             if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
-                fpos += 1;
-                if (fpos > pt_len) break;
+                var ack_pos: usize = fpos + 1;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch break;
+                ack_pos += lar_r.len;
+                const largest_ack = lar_r.value;
+                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += del_r.len;
+                const ack_delay = del_r.value;
+                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += cnt_r.len;
+                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
+                const first_ack_range = fst_r.value;
+                var lost_buf: [32]recovery.SentPacket = undefined;
+                const now_ms: i64 = compat.milliTimestamp();
+                if (self.conn.ld.onAck(
+                    .handshake,
+                    largest_ack,
+                    first_ack_range,
+                    ack_delay,
+                    @intCast(now_ms),
+                    &self.conn.rtt,
+                    &lost_buf,
+                    self.allocator,
+                )) |_| {
+                    noteConnAckInSpace(&self.conn, .handshake, now_ms);
+                } else |_| {}
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                 continue;
             }
@@ -9428,6 +9634,7 @@ pub const Client = struct {
                 self.conn.packet_cipher,
             ) catch return;
             self.conn.hs_pn += 1;
+            recordAckElicitingSent(&self.conn, .handshake, hs_pn_sent, pkt_len, @intCast(compat.milliTimestamp()));
             self.conn.qlog.packetSent(.handshake, hs_pn_sent, pkt_len);
 
             _ = compat.sendto(
@@ -9575,6 +9782,7 @@ pub const Client = struct {
 
                 var lost_buf: [32]recovery.SentPacket = undefined;
                 const ld_result = self.conn.ld.onAck(
+                    .application,
                     largest_ack,
                     first_ack_range,
                     ack_delay,
@@ -9659,8 +9867,7 @@ pub const Client = struct {
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
                 // Mirrors the server-side bookkeeping at the matching ACK arm.
-                self.conn.last_ack_ms = compat.milliTimestamp();
-                self.conn.pto_count = 0;
+                noteConnAckInSpace(&self.conn, .application, compat.milliTimestamp());
                 pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                 continue;
             }
@@ -11470,13 +11677,14 @@ test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
         .size = pkt_len,
         .ack_eliciting = true,
         .in_flight = true,
+        .space = .application,
     });
     if (recorded) conn.cc.onPacketSent(@intCast(pkt_len));
     try std.testing.expect(recorded);
     try std.testing.expectEqual(@as(u64, @intCast(pkt_len)), conn.cc.getBytesInFlight());
 
     var lost_buf: [8]recovery.SentPacket = undefined;
-    const ld_result = try conn.ld.onAck(pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
+    const ld_result = try conn.ld.onAck(.application, pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
     if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked, pn);
     try std.testing.expectEqual(@as(u64, 0), conn.cc.getBytesInFlight());
 }
