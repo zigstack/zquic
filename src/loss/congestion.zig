@@ -14,16 +14,28 @@ const std = @import("std");
 pub const mss: u64 = 1350;
 /// Maximum congestion window (bytes).
 const max_cwnd: u64 = 64 * 1024 * 1024; // 64 MB
-/// Minimum congestion window (floor for loss-driven reductions and the
-/// persistent-congestion collapse, RFC 9002 §7.6.3).  RFC's floor is 2·MSS, but
-/// on low-RTT paths a burst of *spurious* time-threshold/reordering losses can
-/// halve cwnd down to 2·MSS and pin it there, throttling a single high-volume
-/// stream (e.g. the persistent /meshsub gossip stream) into permanent
-/// backpressure even though the path is not actually congested (flow control
-/// wide open, losses are reordering noise).  A 10·MSS floor keeps cwnd usable
-/// through that noise; it does not increase bursting (sends are still bounded by
-/// the live cwnd), only the post-loss floor.
-pub const minimum_window: u64 = 10 * mss;
+/// RFC 9002 §7.2 initial congestion window (10 × max_datagram_size, capped at 14,720).
+pub const rfc_initial_window: u64 = 14_720;
+/// RFC 9002 §7.6.3 minimum congestion window (2 × MSS).
+pub const rfc_minimum_window: u64 = 2 * mss;
+/// Libp2p/gossip-tuned initial window for bursty single-stream workloads.
+pub const aggressive_initial_window: u64 = 32 * mss;
+/// Raised post-loss floor for low-RTT spurious-reorder paths.
+pub const aggressive_minimum_window: u64 = 10 * mss;
+/// Default minimum window (RFC-compliant).
+pub const minimum_window: u64 = rfc_minimum_window;
+
+/// Tunable congestion-control limits. Embedders opt into aggressive values
+/// explicitly (e.g. libp2p gossip workloads on uncongested paths).
+pub const CcOptions = struct {
+    initial_window: u64 = rfc_initial_window,
+    minimum_window: u64 = rfc_minimum_window,
+
+    pub const aggressive: CcOptions = .{
+        .initial_window = aggressive_initial_window,
+        .minimum_window = aggressive_minimum_window,
+    };
+};
 
 pub const CcState = enum {
     slow_start,
@@ -33,10 +45,10 @@ pub const CcState = enum {
 
 /// New Reno congestion controller.
 pub const NewReno = struct {
-    /// Congestion window in bytes.  Initial window of 32·MSS (RFC 9002 §7.2
-    /// permits a larger IW on paths known to tolerate it; raised from 10·MSS so
-    /// bursty single-stream gossip has headroom before ACK-clocking dominates).
-    cwnd: u64 = 32 * mss,
+    /// Congestion window in bytes (RFC 9002 §7.2 default).
+    cwnd: u64 = rfc_initial_window,
+    /// Post-loss floor (RFC 9002 §7.6.3 default; override via `CcOptions`).
+    min_window: u64 = minimum_window,
     /// Slow start threshold.
     ssthresh: u64 = max_cwnd,
     /// Bytes in flight.
@@ -54,6 +66,10 @@ pub const NewReno = struct {
 
     pub fn init() NewReno {
         return .{};
+    }
+
+    pub fn initWithOptions(opts: CcOptions) NewReno {
+        return .{ .cwnd = opts.initial_window, .min_window = opts.minimum_window };
     }
 
     /// Called when packets are acknowledged.
@@ -97,7 +113,7 @@ pub const NewReno = struct {
         }
 
         self.end_of_recovery = largest_lost_pn;
-        self.ssthresh = @max(self.cwnd / 2, minimum_window);
+        self.ssthresh = @max(self.cwnd / 2, self.min_window);
         self.cwnd = self.ssthresh;
         self.bytes_acked_ca = 0;
         self.state = .recovery;
@@ -110,7 +126,7 @@ pub const NewReno = struct {
     /// Bytes-in-flight is left untouched — outstanding packets remain in
     /// flight until they are acked, lost, or discarded.
     pub fn onPersistentCongestion(self: *NewReno) void {
-        self.cwnd = minimum_window;
+        self.cwnd = self.min_window;
         self.state = .slow_start;
         self.bytes_acked_ca = 0;
         self.end_of_recovery = null;
@@ -147,10 +163,19 @@ pub const CongestionController = union(enum) {
     cubic: @import("cubic.zig").Cubic,
 
     pub fn init(comptime tag: std.meta.Tag(CongestionController)) CongestionController {
+        return initWithOptions(tag, .{});
+    }
+
+    pub fn initWithOptions(comptime tag: std.meta.Tag(CongestionController), opts: CcOptions) CongestionController {
         return switch (tag) {
-            .new_reno => .{ .new_reno = NewReno.init() },
-            .cubic => .{ .cubic = @import("cubic.zig").Cubic.init() },
+            .new_reno => .{ .new_reno = NewReno.initWithOptions(opts) },
+            .cubic => .{ .cubic = @import("cubic.zig").Cubic.initWithOptions(opts) },
         };
+    }
+
+    /// Aggressive CC profile for libp2p gossip workloads.
+    pub fn initAggressive(comptime tag: std.meta.Tag(CongestionController)) CongestionController {
+        return initWithOptions(tag, CcOptions.aggressive);
     }
 
     pub fn onAck(self: *CongestionController, bytes_acked: u64, largest_acked_pn: u64) void {
@@ -274,15 +299,14 @@ test "new_reno: loss triggers recovery" {
 
 test "new_reno: loss does not collapse below minimum window" {
     const testing = std.testing;
-    var cc = NewReno.init();
+    var cc = NewReno.initWithOptions(CcOptions.aggressive);
     cc.cwnd = 12 * mss;
     // Several back-to-back loss events (distinct, increasing PNs) must not pin
-    // cwnd below the floor — this is the spurious-loss collapse that wedged the
-    // gossip stream.
+    // cwnd below the aggressive floor.
     var pn: u64 = 1;
     while (pn < 8) : (pn += 1) cc.onLoss(pn);
-    try testing.expectEqual(minimum_window, cc.cwnd);
-    try testing.expect(cc.cwnd >= 10 * mss);
+    try testing.expectEqual(aggressive_minimum_window, cc.cwnd);
+    try testing.expect(cc.cwnd >= aggressive_minimum_window);
 }
 
 test "new_reno: congestion avoidance" {

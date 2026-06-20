@@ -22,6 +22,14 @@ const nr = @import("congestion.zig");
 
 pub const mss: u64 = nr.mss;
 const max_cwnd: u64 = 64 * 1024 * 1024;
+/// RFC 9002 §7.2 initial congestion window (10 × max_datagram_size, capped).
+pub const rfc_initial_window: u64 = 14_720;
+/// RFC 9002 §7.6.3 minimum congestion window (2 × MSS).
+pub const rfc_minimum_window: u64 = 2 * mss;
+/// Libp2p/gossip-tuned initial window (32 × MSS) for bursty single-stream workloads.
+pub const aggressive_initial_window: u64 = 32 * mss;
+/// Raised post-loss floor for low-RTT spurious-reorder paths (10 × MSS).
+pub const aggressive_minimum_window: u64 = 10 * mss;
 
 /// CUBIC scaling constant C = 0.4.
 /// We use fixed-point: C_NUM/C_DEN = 4/10 = 0.4.
@@ -34,8 +42,10 @@ const BETA_NUM: u64 = 7;
 const BETA_DEN: u64 = 10;
 
 pub const Cubic = struct {
-    /// Congestion window in bytes.  Initial window of 32·MSS (see NewReno).
-    cwnd: u64 = 32 * mss,
+    /// Congestion window in bytes (RFC 9002 §7.2 default).
+    cwnd: u64 = rfc_initial_window,
+    /// Post-loss floor (RFC 9002 §7.6.3 default; override via `CcOptions`).
+    min_window: u64 = nr.minimum_window,
     /// Slow start threshold.
     ssthresh: u64 = max_cwnd,
     /// Bytes in flight.
@@ -44,6 +54,8 @@ pub const Cubic = struct {
     state: nr.CcState = .slow_start,
     /// W_max: window size (in MSS) at the last loss event.
     w_max: u64 = 0,
+    /// W_max from the previous congestion event (RFC 9438 §4.7 fast convergence).
+    w_max_last: u64 = 0,
     /// Epoch start: timestamp (ms) when the current congestion avoidance epoch started.
     epoch_start_ms: ?i64 = null,
     /// K: time (ms) for the cubic function to reach W_max.
@@ -60,6 +72,10 @@ pub const Cubic = struct {
 
     pub fn init() Cubic {
         return .{};
+    }
+
+    pub fn initWithOptions(opts: nr.CcOptions) Cubic {
+        return .{ .cwnd = opts.initial_window, .min_window = opts.minimum_window };
     }
 
     /// Called when packets are acknowledged. `largest_acked_pn` is the largest
@@ -155,10 +171,16 @@ pub const Cubic = struct {
         }
 
         self.end_of_recovery = largest_lost_pn;
-        // Save W_max before reducing (in MSS units).
-        self.w_max = self.cwnd / mss;
+        const cwnd_mss = self.cwnd / mss;
+        // RFC 9438 §4.7 fast convergence: when cwnd < prior W_max, scale down.
+        if (cwnd_mss < self.w_max_last) {
+            self.w_max = cwnd_mss * 17 / 20; // (1 + β) / 2 = 0.85
+        } else {
+            self.w_max = cwnd_mss;
+        }
+        self.w_max_last = self.w_max;
         // Multiplicative decrease: cwnd = cwnd × β.
-        self.ssthresh = @max(self.cwnd * BETA_NUM / BETA_DEN, nr.minimum_window);
+        self.ssthresh = @max(self.cwnd * BETA_NUM / BETA_DEN, self.min_window);
         self.cwnd = self.ssthresh;
         self.state = .recovery;
         // Reset epoch so next congestion avoidance starts fresh.
@@ -171,12 +193,13 @@ pub const Cubic = struct {
     /// Collapse to the minimum window and re-enter slow start; clear the
     /// CUBIC epoch so the next recovery starts fresh.
     pub fn onPersistentCongestion(self: *Cubic) void {
-        self.cwnd = nr.minimum_window;
+        self.cwnd = self.min_window;
         self.state = .slow_start;
         self.epoch_start_ms = null;
         self.bytes_acked_ca = 0;
         self.end_of_recovery = null;
         self.w_max = 0;
+        self.w_max_last = 0;
         self.k_ms = 0;
         self.tcp_cwnd = 0;
     }
@@ -293,6 +316,17 @@ test "cubic: integer cube root" {
     try testing.expectEqual(@as(u64, 3), intCbrt(27));
     try testing.expectEqual(@as(u64, 10), intCbrt(1000));
     try testing.expectEqual(@as(u64, 10), intCbrt(1100)); // floor
+}
+
+test "cubic: fast convergence scales W_max when cwnd drops" {
+    const testing = std.testing;
+    var cc = Cubic.init();
+    cc.cwnd = 80 * mss;
+    cc.w_max_last = 100; // prior W_max in MSS units
+    cc.onLoss(5);
+    // cwnd (80) < w_max_last (100) → W_max = 80 * 0.85 = 68
+    try testing.expectEqual(@as(u64, 68), cc.w_max);
+    try testing.expectEqual(@as(u64, 68), cc.w_max_last);
 }
 
 test "cubic: can_send check" {
