@@ -11403,6 +11403,81 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
 }
 
+test "raw-app server-initiated bidi: SERVER receives a CLIENT reply on the same stream (full duplex)" {
+    // The req/resp-over-inbound path (zig-libp2p) needs the *reverse* direction
+    // of the gossip fallback: after the server opens a bidi stream and sends a
+    // request, the CLIENT must be able to reply on that same server-initiated
+    // stream and have the SERVER receive it. All prior server-initiated tests
+    // are server→client only, so this duplex direction was never covered.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+    try std.testing.expectEqual(@as(u64, 1), sid % 4);
+
+    var drop = RawDrop{};
+
+    // 1. Server sends a request and FINs its send side — matching libp2p
+    //    req/resp (request → CloseWrite). The recv side stays open for the reply.
+    const request = "PING-FROM-SERVER";
+    {
+        var sent = false;
+        var got = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent) {
+                const acc = lb.server.sendRawStreamData(conn, sid, 0, request, true);
+                if (acc > 0) sent = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                if (b.len == request.len) {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        try std.testing.expect(got);
+    }
+
+    // 2. Client replies in TWO frames at increasing offsets, FIN on the last —
+    //    mimics multistream-ack-then-response, the real req/resp-over-inbound
+    //    byte pattern. The SERVER must reassemble both and see the FIN.
+    const reply_a = "ACK/multistream";
+    const reply_b = "PONG-FROM-CLIENT";
+    const reply_total = reply_a.len + reply_b.len;
+    var got_reply = false;
+    {
+        var sent_a = false;
+        var sent_b = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent_a) {
+                if (lb.client.sendRawStreamData(sid, 0, reply_a, false) > 0) sent_a = true;
+            } else if (!sent_b) {
+                if (lb.client.sendRawStreamData(sid, reply_a.len, reply_b, true) > 0) sent_b = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (rawAppRecvBuffer(conn, sid)) |b| {
+                if (b.len == reply_total and rawAppStreamFinReceived(conn, sid)) {
+                    got_reply = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(got_reply);
+    const got = rawAppRecvBuffer(conn, sid).?;
+    try std.testing.expectEqualSlices(u8, reply_a, got[0..reply_a.len]);
+    try std.testing.expectEqualSlices(u8, reply_b, got[reply_a.len..]);
+}
+
 test "raw-app server-initiated bidi: bulk multi-MB transfer drains across cwnd/ACK cycles" {
     // Regression for the zeam delayed-node sync stall: a responder that writes a
     // large (multi-MB) reqresp response all at once (e.g. blocks_by_range) must
