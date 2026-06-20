@@ -302,32 +302,26 @@ pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
 // 0-RTT Anti-Replay Nonce Cache
 // ---------------------------------------------------------------------------
 
-/// 64-entry ring-buffer nonce cache for 0-RTT anti-replay (RFC 9001 §8.1).
-///
-/// Key = first 8 bytes of the PSK identity (ticket blob).  Each ticket blob
-/// is unique per issuance, so this prefix reliably distinguishes replays
-/// within the cache window.
-///
-/// Usage:
-///   if (!server.nonce_cache.checkAndInsert(key)) {
-///       // Replay detected — do not activate early keys.
-///   }
-/// Maximum age (ms) for a nonce cache entry.  Entries older than this are
-/// considered expired and silently evicted.  10 seconds covers typical
-/// 0-RTT replay windows while limiting the cache's effective memory.
+/// Maximum age (ms) for a nonce cache entry.
 const NONCE_TTL_MS: i64 = 10_000;
 
+/// 4096-entry ring-buffer nonce cache for 0-RTT anti-replay (RFC 9001 §8.1).
+/// Key = first 8 bytes of the PSK identity (ticket blob).
 pub const NonceCache = struct {
+    pub const capacity: usize = 4096;
+
     const Entry = struct {
         key: [8]u8 = .{0} ** 8,
         inserted_ms: i64 = 0,
     };
 
-    entries: [64]Entry = [_]Entry{.{}} ** 64,
-    /// Number of valid entries (saturates at 64).
+    entries: [capacity]Entry = [_]Entry{.{}} ** capacity,
+    /// Number of valid entries (saturates at capacity).
     count: usize = 0,
     /// Next write position in the ring.
     head: usize = 0,
+    /// Evictions when the ring wraps (diagnostic for undersized cache).
+    evictions: u64 = 0,
 
     /// Check whether `key` has been seen before.
     /// Returns `true` (new) if the key is fresh and inserts it.
@@ -339,16 +333,15 @@ pub const NonceCache = struct {
 
     /// Testable version that accepts an explicit timestamp.
     pub fn checkAndInsertAt(self: *NonceCache, key: [8]u8, now_ms: i64) bool {
-        const n = @min(self.count, 64);
+        const n = @min(self.count, capacity);
         for (0..n) |i| {
-            // Skip expired entries.
             if (now_ms - self.entries[i].inserted_ms > NONCE_TTL_MS) continue;
-            if (std.mem.eql(u8, &self.entries[i].key, &key)) return false; // replay
+            if (std.crypto.timing_safe.eql([8]u8, self.entries[i].key, key)) return false;
         }
-        // Fresh key — insert at head.
+        if (self.count >= capacity) self.evictions += 1;
         self.entries[self.head] = .{ .key = key, .inserted_ms = now_ms };
-        self.head = (self.head + 1) % 64;
-        if (self.count < 64) self.count += 1;
+        self.head = (self.head + 1) % capacity;
+        if (self.count < capacity) self.count += 1;
         return true;
     }
 };
@@ -486,10 +479,11 @@ test "nonce_cache: detects replay" {
 
 test "nonce_cache: ring eviction" {
     var cache = NonceCache{};
-    // Fill all 64 slots.
-    for (0..64) |i| {
+    // Fill all slots.
+    for (0..NonceCache.capacity) |i| {
         var k: [8]u8 = .{0} ** 8;
-        k[0] = @intCast(i);
+        k[0] = @intCast(i % 256);
+        k[1] = @intCast(i >> 8);
         try std.testing.expect(cache.checkAndInsert(k));
     }
     // A 65th distinct key should succeed (evicts oldest).

@@ -61,6 +61,8 @@ const k_packet_threshold: u64 = 3;
 const k_max_ack_delay_ms: u64 = 25;
 /// Granularity timer resolution in ms
 const k_granularity_ms: u64 = 1;
+/// Maximum PTO backoff exponent (RFC 9002 §6.2.1; quinn uses 16).
+pub const max_pto_backoff_exponent: u32 = 16;
 /// Persistent congestion duration multiplier (RFC 9002 §7.6.1)
 const k_persistent_congestion_threshold: u64 = 3;
 
@@ -109,9 +111,10 @@ pub const RttEstimator = struct {
 
     /// Probe Timeout (PTO) value in ms (RFC 9002 §6.2.1).
     pub fn pto_ms(self: *const RttEstimator, max_ack_delay: u64, pto_count: u32) u64 {
+        const capped = @min(pto_count, max_pto_backoff_exponent);
         const base_pto: f64 = self.srtt_ms + @max(4.0 * self.rttvar_ms, @as(f64, @floatFromInt(k_granularity_ms)));
         const with_delay: f64 = base_pto + @as(f64, @floatFromInt(max_ack_delay));
-        const scaled = with_delay * std.math.pow(f64, 2.0, @floatFromInt(pto_count));
+        const scaled = with_delay * std.math.pow(f64, 2.0, @floatFromInt(capped));
         return @intFromFloat(scaled);
     }
 
@@ -170,7 +173,9 @@ pub const SentPacket = struct {
 
 /// Loss detection state for one packet number space.
 pub const LossDetector = struct {
-    pub const max_tracked_packets: usize = 2048;
+    /// High-BDP paths can hold thousands of in-flight packets; 16 KiB slots
+    /// covers ~10 GbE × 100 ms RTT without silent loss-detection blind spots.
+    pub const max_tracked_packets: usize = 16_384;
     const max_tracked = max_tracked_packets;
 
     sent: [max_tracked]SentPacket = undefined,
@@ -205,6 +210,10 @@ pub const LossDetector = struct {
             self.sent_count += 1;
             return true;
         }
+        log.warn(
+            "recovery: in-flight tracking cap ({d}) reached — packet pn={d} not tracked",
+            .{ max_tracked, pkt.pn },
+        );
         return false;
     }
 
