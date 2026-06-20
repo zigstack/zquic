@@ -576,7 +576,15 @@ pub fn build1RttPacketWithPhase(
     km: *const KeyMaterial,
     key_phase: bool,
 ) !usize {
-    return build1RttPacketFull(out, dcid, payload, pn, km, key_phase, .aes128_gcm);
+    return build1RttPacketFull(out, dcid, payload, pn, km, key_phase, .aes128_gcm, false);
+}
+
+/// RFC 9287: when the peer advertised `grease_quic_bit`, optionally clear the
+/// short-header fixed bit (0x40). `clear_fixed_bit` is a per-packet random draw.
+fn greaseQuicBitFirstByte(first: u8, peer_grease_quic_bit: bool, clear_fixed_bit: bool) u8 {
+    var out = first;
+    if (peer_grease_quic_bit and clear_fixed_bit) out &= ~@as(u8, 0x40);
+    return out;
 }
 
 /// Build a 1-RTT short-header packet under the connection's negotiated AEAD
@@ -599,6 +607,7 @@ pub fn build1RttPacketFull(
     km: *const KeyMaterial,
     key_phase: bool,
     cipher: PacketCipher,
+    peer_grease_quic_bit: bool,
 ) !usize {
     var hdr_buf: [64]u8 = undefined;
     var hp: usize = 0;
@@ -606,6 +615,13 @@ pub fn build1RttPacketFull(
     // Header Form=0, Fixed Bit=1, Spin=0, Reserved=00, Key Phase bit, PN_len=0
     var first: u8 = 0x40;
     if (key_phase) first |= 0x04;
+    // RFC 9287: when the peer advertised grease_quic_bit, randomize the QUIC
+    // bit (0x40) per packet so the peer's parser must tolerate either polarity.
+    if (peer_grease_quic_bit) {
+        var b: [1]u8 = undefined;
+        compat.random.bytes(&b);
+        first = greaseQuicBitFirstByte(first, true, b[0] & 1 == 0);
+    }
     hdr_buf[hp] = first;
     hp += 1;
     @memcpy(hdr_buf[hp .. hp + dcid.len], dcid.slice());
@@ -2607,6 +2623,7 @@ fn clientSend1RttImmediate(
         &conn.app_client_km,
         conn.key_phase_bit,
         conn.packet_cipher,
+        conn.peer_grease_quic_bit,
     ) catch return;
     conn.app_pn += 1;
     conn.note1RttSent();
@@ -5498,6 +5515,7 @@ pub const Server = struct {
             &conn.app_server_km,
             conn.key_phase_bit,
             conn.packet_cipher,
+            conn.peer_grease_quic_bit,
         ) catch |err| {
             dbg("io: build1RttPacketFull error payload_len={}: {}\n", .{ effective_payload.len, err });
             return;
@@ -7862,6 +7880,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return null;
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
@@ -8089,6 +8108,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch {
             if (owned_buf) |b| self.allocator.free(b);
             return 0;
@@ -8209,6 +8229,7 @@ pub const Client = struct {
                 &self.conn.app_client_km,
                 self.conn.key_phase_bit,
                 self.conn.packet_cipher,
+                self.conn.peer_grease_quic_bit,
             ) catch {
                 i += 1;
                 continue;
@@ -9456,6 +9477,7 @@ pub const Client = struct {
                     &self.conn.app_client_km,
                     self.conn.key_phase_bit,
                     self.conn.packet_cipher,
+                    self.conn.peer_grease_quic_bit,
                 ) catch return;
                 self.conn.app_pn += 1;
                 _ = compat.sendto(self.sock, close_pkt[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -9889,6 +9911,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         self.conn.note1RttSent();
@@ -9976,6 +9999,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -10014,6 +10038,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -10032,6 +10057,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -10352,6 +10378,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch |err| {
             dbg("io: migrate: PING build failed: {}\n", .{err});
             return;
@@ -10411,6 +10438,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -10459,6 +10487,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -10498,6 +10527,7 @@ pub const Client = struct {
             &self.conn.app_client_km,
             self.conn.key_phase_bit,
             self.conn.packet_cipher,
+            self.conn.peer_grease_quic_bit,
         ) catch return;
         self.conn.app_pn += 1;
         _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -10636,6 +10666,7 @@ pub const Client = struct {
                     &self.conn.app_client_km,
                     self.conn.key_phase_bit,
                     self.conn.packet_cipher,
+                    self.conn.peer_grease_quic_bit,
                 ) catch continue;
                 self.conn.app_pn += 1;
 
@@ -10691,6 +10722,7 @@ pub const Client = struct {
                             &self.conn.app_client_km,
                             self.conn.key_phase_bit,
                             self.conn.packet_cipher,
+                            self.conn.peer_grease_quic_bit,
                         )) |pkt_len| {
                             self.conn.app_pn += 1;
                             _ = compat.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
@@ -11264,9 +11296,9 @@ test "build1RttPacketFull: cipher param actually selects the AEAD (regression fo
     var buf_aes256: [256]u8 = undefined;
     var buf_chacha: [256]u8 = undefined;
 
-    const n_aes128 = try build1RttPacketFull(&buf_aes128, dcid, &payload, pn, &km, false, .aes128_gcm);
-    const n_aes256 = try build1RttPacketFull(&buf_aes256, dcid, &payload, pn, &km, false, .aes256_gcm);
-    const n_chacha = try build1RttPacketFull(&buf_chacha, dcid, &payload, pn, &km, false, .chacha20_poly1305);
+    const n_aes128 = try build1RttPacketFull(&buf_aes128, dcid, &payload, pn, &km, false, .aes128_gcm, false);
+    const n_aes256 = try build1RttPacketFull(&buf_aes256, dcid, &payload, pn, &km, false, .aes256_gcm, false);
+    const n_chacha = try build1RttPacketFull(&buf_chacha, dcid, &payload, pn, &km, false, .chacha20_poly1305, false);
 
     // All three produce the same packet length: header is identical and the
     // AEAD tag is 16 bytes for every cipher in the §5.3 matrix.
@@ -11827,4 +11859,40 @@ test "raw-app server-initiated bidi: retransmit after dropped packet still deliv
 
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+}
+
+test "greaseQuicBitFirstByte: clears fixed bit only when peer tolerates grease" {
+    try std.testing.expectEqual(@as(u8, 0x40), greaseQuicBitFirstByte(0x40, false, true));
+    try std.testing.expectEqual(@as(u8, 0x40), greaseQuicBitFirstByte(0x40, true, false));
+    try std.testing.expectEqual(@as(u8, 0x00), greaseQuicBitFirstByte(0x40, true, true));
+    try std.testing.expectEqual(@as(u8, 0x04), greaseQuicBitFirstByte(0x44, true, true));
+}
+
+test "build1RttPacketFull: greased QUIC bit randomizes fixed bit on wire" {
+    var km: KeyMaterial = .{};
+    km.secret = [_]u8{0xA5} ** 32;
+    km.expand();
+
+    const dcid = try ConnectionId.fromSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    const payload = [_]u8{0x42} ** 8;
+
+    var saw_fixed_set = false;
+    var saw_fixed_clear = false;
+    var send_buf: [256]u8 = undefined;
+    for (0..32) |i| {
+        _ = try build1RttPacketFull(
+            &send_buf,
+            dcid,
+            &payload,
+            @intCast(i + 1),
+            &km,
+            false,
+            .aes128_gcm,
+            true,
+        );
+        if (send_buf[0] & 0x40 != 0) saw_fixed_set = true else saw_fixed_clear = true;
+        if (saw_fixed_set and saw_fixed_clear) break;
+    }
+    try std.testing.expect(saw_fixed_set);
+    try std.testing.expect(saw_fixed_clear);
 }
