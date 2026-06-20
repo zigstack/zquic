@@ -1115,8 +1115,14 @@ fn enqueuePendingStreamSend(
 }
 
 /// Like `enqueuePendingStreamSend` but takes ownership of an already-heap
-/// `owned` buffer (loss-retransmit path).  Frees `owned` on coalesce-append
-/// or on duplicate-offset dedup.
+/// `owned` buffer (loss-retransmit path).  On a `true` return it has consumed
+/// `owned` — either stored it, or freed it (coalesce-append / duplicate-offset
+/// dedup).  On a `false` return it did NOT consume `owned`; the caller still
+/// owns the buffer and must free it (every call site does
+/// `if (!enqueuePendingStreamSendOwned(...)) allocator.free(owned)`).  Freeing
+/// `owned` on the false paths here too caused a DOUBLE-FREE → jemalloc heap
+/// corruption under sustained backpressure (pending queue full) → SIGSEGV in a
+/// later `onAck` free.
 fn enqueuePendingStreamSendOwned(
     conn: *ConnState,
     allocator: std.mem.Allocator,
@@ -1154,13 +1160,11 @@ fn enqueuePendingStreamSendOwned(
             // already returns true for any duplicate).
             if (owned.ptr != last.data.ptr) {
                 if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-                    allocator.free(owned);
-                    return false;
+                    return false; // caller owns `owned` on false (not consumed)
                 }
                 const new_len = last.data.len + owned.len;
                 const grown = allocator.realloc(last.data, new_len) catch {
-                    allocator.free(owned);
-                    return false;
+                    return false; // caller owns `owned`; last.data untouched
                 };
                 @memcpy(grown[last.data.len..][0..owned.len], owned);
                 allocator.free(owned);
@@ -1172,12 +1176,10 @@ fn enqueuePendingStreamSendOwned(
         }
     }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (not consumed)
     }
     if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (not consumed)
     }
     conn.pending_stream_sends.append(allocator, .{
         .stream_id = stream_id,
@@ -1185,8 +1187,7 @@ fn enqueuePendingStreamSendOwned(
         .fin = fin,
         .data = owned,
     }) catch {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (append failed, not stored)
     };
     conn.pending_stream_send_bytes +|= owned.len;
     return true;
@@ -10982,6 +10983,32 @@ test "pending stream send: cap rejects past per-conn entry budget" {
     // draining so the embedder reconnects (silently dropping would
     // corrupt the stream offset).
     try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
+}
+
+test "pending stream send (owned): false return leaves `owned` to the caller (no double-free)" {
+    // Regression for the devnet SIGSEGV: enqueuePendingStreamSendOwned must NOT
+    // free `owned` on a false return. Every call site does
+    // `if (!enqueuePendingStreamSendOwned(...)) allocator.free(owned)`, so
+    // freeing here too double-freed under sustained backpressure (pending queue
+    // full — the exact logged condition) → jemalloc heap corruption → SIGSEGV in
+    // a later `onAck` free. std.testing.allocator panics on the double-free, so
+    // reaching the end of this test clean is the assertion.
+    const a = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer freePendingStreamSends(&conn, a);
+
+    // Fill to the per-conn entry cap so the next owned-enqueue hits the
+    // queue-full false path.
+    var i: usize = 0;
+    while (i < pending_stream_send_cap) : (i += 1) {
+        try std.testing.expect(enqueuePendingStreamSend(&conn, a, 4, @intCast(i * 2), "x", false));
+    }
+
+    // Exercise the OWNED variant on the full queue exactly as the callers do.
+    const owned = try a.dupe(u8, "retransmit-me");
+    const queued = enqueuePendingStreamSendOwned(&conn, a, 4, 10_000_000, owned, false);
+    try std.testing.expect(!queued); // full → false
+    if (!queued) a.free(owned); // single, correct free — NOT a double-free
 }
 
 test "pending stream send: oversized write fans out into per-packet entries" {
