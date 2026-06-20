@@ -130,10 +130,13 @@ pub const AckFrame = struct {
             var prev_smallest = first.smallest;
             while (i < self.range_count) : (i += 1) {
                 const r = self.ranges[i];
-                // gap = prev_smallest - r.largest - 2
-                const gap = prev_smallest - r.largest - 2;
+                // gap = prev_smallest - r.largest - 2. Defensive: ranges are
+                // expected to be non-overlapping and ≥2 apart (callers coalesce
+                // first), but a malformed/adjacent pair must never panic the
+                // node on an integer overflow — saturate to 0 instead.
+                const gap = if (prev_smallest -| r.largest >= 2) prev_smallest - r.largest - 2 else 0;
                 try w.writeVarint(gap);
-                try w.writeVarint(r.largest - r.smallest);
+                try w.writeVarint(r.largest -| r.smallest);
                 prev_smallest = r.smallest;
             }
         }

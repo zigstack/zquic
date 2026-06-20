@@ -261,14 +261,36 @@ const AppAckTracker = struct {
                 }
             }
         }
+        // Coalesce adjacent / overlapping ranges. `observe` can extend a range
+        // until it is flush against (or overlapping) a neighbour without
+        // merging the two, leaving e.g. [12,15] and [5,11]. The wire gap
+        // encoding is `prev_smallest - largest - 2`, which underflows (and
+        // panics the node on an integer overflow) for any pair with a zero or
+        // negative gap. Merge them so consecutive ranges always have ≥1 PN of
+        // gap between them.
+        var m: usize = 0;
+        var c: usize = 0;
+        while (c < n) {
+            var cur = sorted[c];
+            c += 1;
+            // `sorted` is descending by smallest, so subsequent entries are
+            // lower; fold any whose top touches/overlaps `cur`'s bottom.
+            while (c < n and sorted[c].largest +| 1 >= cur.smallest) {
+                if (sorted[c].smallest < cur.smallest) cur.smallest = sorted[c].smallest;
+                if (sorted[c].largest > cur.largest) cur.largest = sorted[c].largest;
+                c += 1;
+            }
+            sorted[m] = cur;
+            m += 1;
+        }
         var frame = ack_frame_mod.AckFrame{
             .largest_acknowledged = sorted[0].largest,
             .ack_delay = 0,
             .ranges = undefined,
-            .range_count = n,
+            .range_count = m,
             .ecn = ecn,
         };
-        for (0..n) |k| {
+        for (0..m) |k| {
             frame.ranges[k] = sorted[k];
         }
         return frame.serialize(buf);
@@ -10982,6 +11004,30 @@ test "pending stream send: oversized write fans out into per-packet entries" {
     try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
     try std.testing.expect(conn.pending_stream_sends.items[4].fin);
     try std.testing.expect(!conn.pending_stream_sends.items[0].fin);
+}
+
+test "AppAckTracker: adjacent ranges coalesce and serialize without integer overflow" {
+    // Regression: under load `observe` could extend one range until it sat
+    // flush against another (e.g. [5,11] and [12,15]) without merging. The
+    // wire gap encoding `prev_smallest - largest - 2` then underflowed and
+    // panicked the whole node (seen on the 32-validator devnet, crashing
+    // `flushConnAppAck`).
+    var t = AppAckTracker{};
+    for ([_]u64{ 5, 6, 7, 8, 9, 10 }) |pn| _ = t.observe(pn); // range [5,10]
+    for ([_]u64{ 12, 13, 14, 15 }) |pn| _ = t.observe(pn); // range [12,15]
+    _ = t.observe(11); // extends [5,10] -> [5,11], now ADJACENT to [12,15]
+    try std.testing.expect(t.range_count >= 2);
+
+    var buf: [256]u8 = undefined;
+    const n = try t.buildWireFrame(&buf, null); // must NOT panic
+    try std.testing.expect(n > 0);
+
+    // Re-parse: a valid ACK acknowledging the full 5..15 span.
+    // Re-parse (serialize writes the type byte; parse expects it stripped).
+    // A valid ACK acknowledging the full 5..15 span — coalesced to one range.
+    const parsed = try ack_frame_mod.AckFrame.parse(buf[1..n], false);
+    try std.testing.expectEqual(@as(u64, 15), parsed.frame.largest_acknowledged);
+    try std.testing.expectEqual(@as(usize, 1), parsed.frame.range_count);
 }
 
 test "build1RttPacketFull: cipher param actually selects the AEAD (regression for AES-128 fallthrough)" {
