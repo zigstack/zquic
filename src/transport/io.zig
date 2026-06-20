@@ -1934,6 +1934,10 @@ pub const ConnState = struct {
     /// Throttle STREAMS_BLOCKED to one emission per cap-hit (RFC 9000 §19.14).
     streams_blocked_bidi_sent: bool = false,
     streams_blocked_uni_sent: bool = false,
+    /// Set by `rawAllocateNextLocal*` on `StreamLimitExceeded`; drained by
+    /// `Client.flushPendingStreamsBlocked` on the next `processPendingWork`.
+    streams_blocked_bidi_pending: bool = false,
+    streams_blocked_uni_pending: bool = false,
 
     // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
     early_km: KeyMaterial = undefined,
@@ -4781,25 +4785,10 @@ pub const Server = struct {
         _ = compat.sendto(self.sock, &pkt, 0, &dst.any, dst.getOsSockLen()) catch {};
     }
 
-    fn writeStreamsBlockedFrame(out: []u8, bidi: bool, maximum_streams: u64) ?usize {
-        if (out.len == 0) return null;
-        out[0] = if (bidi) @as(u8, 0x16) else @as(u8, 0x17);
-        const enc = varint.encode(out[1..], maximum_streams) catch return null;
-        return 1 + enc.len;
-    }
-
     fn maybeSendStreamsBlocked(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
-        if (bidi) {
-            if (conn.streams_blocked_bidi_sent) return;
-            conn.streams_blocked_bidi_sent = true;
-        } else {
-            if (conn.streams_blocked_uni_sent) return;
-            conn.streams_blocked_uni_sent = true;
-        }
-        const requested = if (bidi) localBidiStreamsOpened(conn) + 1 else localUniStreamsOpened(conn) + 1;
         var buf: [16]u8 = undefined;
-        const flen = writeStreamsBlockedFrame(&buf, bidi, requested) orelse return;
-        self.send1Rtt(conn, buf[0..flen], dst);
+        const frame = prepareConnStreamsBlocked(conn, bidi, &buf) orelse return;
+        self.send1Rtt(conn, frame, dst);
     }
     /// the new key phase bit set.  Called after handshake when key_update
     /// is enabled (quic-interop-runner "keyupdate" test case).
@@ -7264,7 +7253,10 @@ pub const OpenLocalStreamError = error{StreamLimitExceeded};
 /// Allocate the next locally initiated **unidirectional** stream ID (RFC 9000 §2.1).
 /// Do not mix with HTTP/0.9 or HTTP/3 stream usage on the same connection.
 pub fn rawAllocateNextLocalUniStream(conn: *ConnState) OpenLocalStreamError!u64 {
-    if (localUniStreamsOpened(conn) >= conn.peer_max_uni_streams) return error.StreamLimitExceeded;
+    if (localUniStreamsOpened(conn) >= conn.peer_max_uni_streams) {
+        noteConnStreamLimitHit(conn, false);
+        return error.StreamLimitExceeded;
+    }
     const id = conn.next_local_uni_stream_id;
     conn.next_local_uni_stream_id += 4;
     return id;
@@ -7272,7 +7264,10 @@ pub fn rawAllocateNextLocalUniStream(conn: *ConnState) OpenLocalStreamError!u64 
 
 /// Allocate the next locally initiated **bidirectional** stream ID.
 pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) OpenLocalStreamError!u64 {
-    if (localBidiStreamsOpened(conn) >= conn.peer_max_bidi_streams) return error.StreamLimitExceeded;
+    if (localBidiStreamsOpened(conn) >= conn.peer_max_bidi_streams) {
+        noteConnStreamLimitHit(conn, true);
+        return error.StreamLimitExceeded;
+    }
     const id = conn.next_local_bidi_stream_id;
     conn.next_local_bidi_stream_id += 4;
     return id;
@@ -7315,6 +7310,32 @@ fn localUniStreamsOpened(conn: *const ConnState) u64 {
     if ((n & 3) == 2) return if (n >= 2) (n - 2) / 4 else 0; // client uni: 2, 6, 10, …
     if ((n & 3) == 3) return if (n >= 3) (n - 3) / 4 else 0; // server uni: 3, 7, 11, …
     return 0;
+}
+
+fn writeStreamsBlockedFrame(out: []u8, bidi: bool, maximum_streams: u64) ?usize {
+    if (out.len == 0) return null;
+    out[0] = if (bidi) @as(u8, 0x16) else @as(u8, 0x17);
+    const enc = varint.encode(out[1..], maximum_streams) catch return null;
+    return 1 + enc.len;
+}
+
+/// Build one STREAMS_BLOCKED frame when the local stream cap is hit (RFC 9000 §19.14).
+/// Returns null when already emitted for this cap-hit episode.
+fn prepareConnStreamsBlocked(conn: *ConnState, bidi: bool, out: []u8) ?[]const u8 {
+    if (bidi) {
+        if (conn.streams_blocked_bidi_sent) return null;
+        conn.streams_blocked_bidi_sent = true;
+    } else {
+        if (conn.streams_blocked_uni_sent) return null;
+        conn.streams_blocked_uni_sent = true;
+    }
+    const requested = if (bidi) localBidiStreamsOpened(conn) + 1 else localUniStreamsOpened(conn) + 1;
+    const flen = writeStreamsBlockedFrame(out, bidi, requested) orelse return null;
+    return out[0..flen];
+}
+
+fn noteConnStreamLimitHit(conn: *ConnState, bidi: bool) void {
+    if (bidi) conn.streams_blocked_bidi_pending = true else conn.streams_blocked_uni_pending = true;
 }
 
 /// Opaque receive buffer for an inbound raw-application stream on a **server** `ConnState`.
@@ -7745,6 +7766,7 @@ pub const Client = struct {
         const now = compat.milliTimestamp();
         // Mirror Server.processPendingWork: drain deferred STREAM bytes before
         // PTO/keepalive so gossip pending queues drain like quinn SendBuffer.
+        self.flushPendingStreamsBlocked();
         self.drainPendingStreamSendsUntilStalled();
         self.checkPto();
         self.maybeSendPlpmtuProbe();
@@ -7836,6 +7858,43 @@ pub const Client = struct {
         });
         if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
         return pn;
+    }
+
+    /// Emit STREAMS_BLOCKED when the peer's stream limit blocks a local open.
+    fn maybeSendStreamsBlocked(self: *Client, bidi: bool) void {
+        var buf: [16]u8 = undefined;
+        const frame = prepareConnStreamsBlocked(&self.conn, bidi, &buf) orelse return;
+        _ = self.sendClient1Rtt(frame);
+    }
+
+    /// Drain deferred STREAMS_BLOCKED frames queued by `rawAllocateNextLocal*`.
+    pub fn flushPendingStreamsBlocked(self: *Client) void {
+        if (self.conn.streams_blocked_bidi_pending) {
+            self.conn.streams_blocked_bidi_pending = false;
+            self.maybeSendStreamsBlocked(true);
+        }
+        if (self.conn.streams_blocked_uni_pending) {
+            self.conn.streams_blocked_uni_pending = false;
+            self.maybeSendStreamsBlocked(false);
+        }
+    }
+
+    /// Open a locally initiated bidi stream; emits STREAMS_BLOCKED on cap hit.
+    pub fn tryOpenLocalBidiStream(self: *Client) OpenLocalStreamError!u64 {
+        const id = rawAllocateNextLocalBidiStream(&self.conn) catch |err| {
+            if (err == error.StreamLimitExceeded) self.maybeSendStreamsBlocked(true);
+            return err;
+        };
+        return id;
+    }
+
+    /// Open a locally initiated uni stream; emits STREAMS_BLOCKED on cap hit.
+    pub fn tryOpenLocalUniStream(self: *Client) OpenLocalStreamError!u64 {
+        const id = rawAllocateNextLocalUniStream(&self.conn) catch |err| {
+            if (err == error.StreamLimitExceeded) self.maybeSendStreamsBlocked(false);
+            return err;
+        };
+        return id;
     }
 
     /// Send a MAX_DATA (0x10) frame extending the server's connection-level send
@@ -8544,6 +8603,7 @@ pub const Client = struct {
             // when an outstanding burst has gone unacknowledged longer than
             // pto_ms.  Mirrors Server.checkPto.  Cheap when there is nothing
             // in flight (early-out inside the function).
+            self.flushPendingStreamsBlocked();
             self.checkPto();
 
             if (ready == 0) continue;
@@ -11012,6 +11072,27 @@ test "per-stream recv: bumpStreamRecvWindow answers STREAM_DATA_BLOCKED" {
     // bump grants one window above what we have received.
     const nm = conn.bumpStreamRecvWindow(0, true);
     try std.testing.expectEqual(@as(u64, 9_999_999 + 10_000_000), nm);
+}
+
+test "prepareConnStreamsBlocked: throttles repeat bidi emission" {
+    var conn = makeConnForStreamTest();
+    conn.peer_max_bidi_streams = 2;
+    conn.next_local_bidi_stream_id = 8;
+    var buf: [16]u8 = undefined;
+    const f1 = prepareConnStreamsBlocked(&conn, true, &buf);
+    try std.testing.expect(f1 != null);
+    try std.testing.expect(f1.?[0] == 0x16);
+    try std.testing.expect(conn.streams_blocked_bidi_sent);
+    try std.testing.expect(prepareConnStreamsBlocked(&conn, true, &buf) == null);
+}
+
+test "noteConnStreamLimitHit: sets pending flags for client drain" {
+    var conn = makeConnForStreamTest();
+    noteConnStreamLimitHit(&conn, true);
+    try std.testing.expect(conn.streams_blocked_bidi_pending);
+    try std.testing.expect(!conn.streams_blocked_uni_pending);
+    noteConnStreamLimitHit(&conn, false);
+    try std.testing.expect(conn.streams_blocked_uni_pending);
 }
 
 test "seedLocalRecvWindows: default preset" {
