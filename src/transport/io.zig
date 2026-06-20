@@ -3763,8 +3763,48 @@ pub const Server = struct {
             }
             if (plaintext[pos] == 0x02 or plaintext[pos] == 0x03) {
                 const is_ecn = plaintext[pos] == 0x03;
+                var ack_pos: usize = pos + 1;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += lar_r.len;
+                const largest_ack = lar_r.value;
+                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += del_r.len;
+                const ack_delay = del_r.value;
+                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += cnt_r.len;
+                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                const first_ack_range = fst_r.value;
+                var lost_buf: [32]recovery.SentPacket = undefined;
+                const now_ms: i64 = compat.milliTimestamp();
+                if (conn.ld.onAck(
+                    .initial,
+                    largest_ack,
+                    first_ack_range,
+                    ack_delay,
+                    @intCast(now_ms),
+                    &conn.rtt,
+                    &lost_buf,
+                    self.allocator,
+                )) |_| {
+                    noteConnAckInSpace(conn, .initial, now_ms);
+                } else |_| {}
                 pos += 1;
-                if (pos > pt_len) break;
                 pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                 continue;
             }
@@ -4554,21 +4594,28 @@ pub const Server = struct {
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
                 var ack_pos: usize = fpos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch break;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
                 const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
                 const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
                 const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
@@ -4587,6 +4634,7 @@ pub const Server = struct {
                 )) |_| {
                     noteConnAckInSpace(conn, .handshake, now_ms);
                 } else |_| {}
+                fpos += 1;
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                 continue;
             } else {
@@ -9416,29 +9464,51 @@ pub const Client = struct {
                 pos += 1;
                 continue;
             }
-            if (ft == 0x02 or ft == 0x03) { // ACK — parse and skip
-                pos += 1; // type byte
-                const lar = varint.decode(plaintext[pos..]) catch break;
-                pos += lar.len;
-                const del = varint.decode(plaintext[pos..]) catch break;
-                pos += del.len;
-                const cnt = varint.decode(plaintext[pos..]) catch break;
-                pos += cnt.len;
-                const fst = varint.decode(plaintext[pos..]) catch break;
-                pos += fst.len;
-                var ri: u64 = 0;
-                while (ri < cnt.value) : (ri += 1) {
-                    const gp = varint.decode(plaintext[pos..]) catch break;
-                    pos += gp.len;
-                    const rl = varint.decode(plaintext[pos..]) catch break;
-                    pos += rl.len;
-                }
-                if (ft == 0x03) { // ECN counts (3 varints)
-                    inline for (0..3) |_| {
-                        const ec = varint.decode(plaintext[pos..]) catch break;
-                        pos += ec.len;
-                    }
-                }
+            if (ft == 0x02 or ft == 0x03) {
+                const is_ecn = ft == 0x03;
+                var ack_pos: usize = pos + 1;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += lar_r.len;
+                const largest_ack = lar_r.value;
+                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += del_r.len;
+                const ack_delay = del_r.value;
+                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                ack_pos += cnt_r.len;
+                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    pos += 1;
+                    pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                    continue;
+                };
+                const first_ack_range = fst_r.value;
+                var lost_buf: [32]recovery.SentPacket = undefined;
+                const now_ms: i64 = compat.milliTimestamp();
+                if (self.conn.ld.onAck(
+                    .initial,
+                    largest_ack,
+                    first_ack_range,
+                    ack_delay,
+                    @intCast(now_ms),
+                    &self.conn.rtt,
+                    &lost_buf,
+                    self.allocator,
+                )) |_| {
+                    noteConnAckInSpace(&self.conn, .initial, now_ms);
+                } else |_| {}
+                pos += 1;
+                pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                 continue;
             }
             if (ft != 0x06) break; // not a CRYPTO frame — stop
@@ -9514,21 +9584,28 @@ pub const Client = struct {
             if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
                 var ack_pos: usize = fpos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch break;
+                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
+                    fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                    continue;
+                };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
                 const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
                 const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
                 const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                    fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
@@ -9547,6 +9624,7 @@ pub const Client = struct {
                 )) |_| {
                     noteConnAckInSpace(&self.conn, .handshake, now_ms);
                 } else |_| {}
+                fpos += 1;
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                 continue;
             }
