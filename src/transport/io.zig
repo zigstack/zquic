@@ -5409,9 +5409,11 @@ pub const Server = struct {
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
-                // Flow control (RFC 9000 §4.1): track highest end offset seen.
-                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
+                // Flow control (RFC 9000 §4.1): connection-level credit is the
+                // sum of payload bytes received on all streams (not the max
+                // stream end offset — parallel streams would under-count and
+                // never trigger MAX_DATA before the peer stalls).
+                conn.fc_bytes_recv +|= sf_r.frame.data.len;
                 if (conn.fc_bytes_recv > conn.fc_recv_max) {
                     // Flow control violation — close with FLOW_CONTROL_ERROR (0x03).
                     self.sendConnectionClose(conn, 0x03, "flow control violation", src);
@@ -5423,6 +5425,7 @@ pub const Server = struct {
                 // extend this stream's window before the peer exhausts it.
                 // Without this a long-lived stream (libp2p persistent /meshsub
                 // gossip) stalls at the initial per-stream limit — zquic#172.
+                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 const sra = conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, true);
                 if (sra.violation) {
                     self.sendConnectionClose(conn, 0x03, "stream flow control violation", src);
@@ -9730,7 +9733,7 @@ pub const Client = struct {
                 // advertised (libp2p persistent /meshsub gossip) would stall.
                 // zquic#172.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                if (recv_end > self.conn.fc_bytes_recv) self.conn.fc_bytes_recv = recv_end;
+                self.conn.fc_bytes_recv +|= sf_r.frame.data.len;
                 if (self.conn.fc_bytes_recv > self.conn.fc_recv_max) {
                     self.sendConnectionClose(0x03, "flow control violation");
                     return;
