@@ -982,6 +982,8 @@ const PendingStreamSend = struct {
     offset: u64 = 0,
     fin: bool = false,
     data: []u8 = &.{},
+    /// Bytes already put on the wire from the front of `data`.
+    sent_in_buf: usize = 0,
 };
 // Hard caps on the per-stream `pending_stream_sends` queue.  Either limit
 // triggers `enqueuePendingStreamSend` → `false`, which the embedder MUST
@@ -1035,6 +1037,7 @@ fn enqueuePendingStreamSend(
     // zero-length sentinel slice (ptr 0xffff…, len 0), which the drain path
     // would later hand to `allocator.free` and corrupt jemalloc's per-thread
     // cache — a SIGSEGV in an unrelated later allocation.
+    // Split at packet-build time in `drainPendingStreamSends` (not here).
     if (data.len == 0) {
         // …but the half-close must still reach the peer even when this stream's
         // payload is backpressured in the queue. A large response (libp2p
@@ -1055,25 +1058,6 @@ fn enqueuePendingStreamSend(
         }
         return true;
     }
-    // Split writes larger than one 1-RTT packet into per-packet entries.
-    // `drainPendingStreamSends` serializes one entry into one datagram and
-    // CANNOT fragment — an oversized entry fails `StreamFrame.serialize` and is
-    // dropped on the floor (the data is silently lost). So a single
-    // `sendRawStreamData` of, say, a 200 KB block (libp2p reqresp
-    // `blocks_by_range`) must be fanned out into ≤ `max_pending_stream_chunk`
-    // slices here, each of which serializes into exactly one packet on drain.
-    if (data.len > max_pending_stream_chunk) {
-        var rel: usize = 0;
-        while (rel < data.len) {
-            const take = @min(data.len - rel, max_pending_stream_chunk);
-            const is_last = rel + take == data.len;
-            if (!enqueuePendingStreamSend(conn, allocator, stream_id, offset +| rel, data[rel..][0..take], fin and is_last)) {
-                return false;
-            }
-            rel += take;
-        }
-        return true;
-    }
     // Embedder may retry the same offset after a backpressure 0; treat as
     // already accepted so we do not fill the queue with duplicate copies.
     for (conn.pending_stream_sends.items) |e| {
@@ -1085,8 +1069,8 @@ fn enqueuePendingStreamSend(
     // even though total bytes stay under the 8 MiB byte cap.
     if (conn.pending_stream_sends.items.len > 0) {
         const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and last.offset +| last.data.len == offset and
-            last.data.len + data.len <= max_pending_stream_chunk and !last.fin)
+        if (last.stream_id == stream_id and
+            last.offset +| (last.data.len - last.sent_in_buf) == offset and !last.fin)
         {
             if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
             const new_len = last.data.len + data.len;
@@ -1144,8 +1128,8 @@ fn enqueuePendingStreamSendOwned(
     }
     if (conn.pending_stream_sends.items.len > 0) {
         const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and last.offset +| last.data.len == offset and
-            last.data.len + owned.len <= max_pending_stream_chunk and !last.fin)
+        if (last.stream_id == stream_id and
+            last.offset +| (last.data.len - last.sent_in_buf) == offset and !last.fin)
         {
             // Defence-in-depth: if `owned` and `last.data` alias the same
             // heap buffer, realloc would invalidate `owned`'s backing
@@ -1853,10 +1837,12 @@ pub const ConnState = struct {
     // the `.default` preset (64 MiB conn / 16 MiB stream) so an unseeded conn
     // still behaves sanely. `fc_recv_max` above is the connection-level mirror
     // and is reset to `local_initial_max_data` by the same seed.
-    local_initial_max_data: u64 = 64 * 1024 * 1024,
-    local_initial_max_stream_data_bidi_local: u64 = 16 * 1024 * 1024,
-    local_initial_max_stream_data_bidi_remote: u64 = 16 * 1024 * 1024,
-    local_initial_max_stream_data_uni: u64 = 16 * 1024 * 1024,
+    // Memory vs throughput: defaults are conservative (1 MiB conn / 256 KiB stream).
+    // Libp2p embedders should use `transport_params_preset = .libp2p` or set explicitly.
+    local_initial_max_data: u64 = 1 * 1024 * 1024,
+    local_initial_max_stream_data_bidi_local: u64 = 256 * 1024,
+    local_initial_max_stream_data_bidi_remote: u64 = 256 * 1024,
+    local_initial_max_stream_data_uni: u64 = 256 * 1024,
     /// Per-stream receive accounting (RFC 9000 §4.1). Bounded; a slot is freed
     /// on FIN / RESET_STREAM (peer is done sending) so it tracks only
     /// concurrently-open inbound streams. When full, untracked streams fall
@@ -1907,6 +1893,9 @@ pub const ConnState = struct {
     // outgoing packets are suppressed and incoming are silently discarded.
     draining: bool = false,
     conn_close_sent: bool = false,
+    /// Serialized CONNECTION_CLOSE frame for re-emission during draining (RFC 9000 §10.2.2).
+    conn_close_frame: [256]u8 = [_]u8{0} ** 256,
+    conn_close_frame_len: u8 = 0,
     draining_deadline_ms: i64 = 0,
     // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
     last_recv_ms: i64 = 0,
@@ -1941,6 +1930,15 @@ pub const ConnState = struct {
     // packet match this token, the connection is treated as reset.
     stateless_reset_token: [16]u8 = [_]u8{0} ** 16,
     stateless_reset_token_set: bool = false,
+    /// RFC 9287: peer advertised `grease_quic_bit`; flip short-header bit when sending.
+    peer_grease_quic_bit: bool = false,
+    /// Throttle STREAMS_BLOCKED to one emission per cap-hit (RFC 9000 §19.14).
+    streams_blocked_bidi_sent: bool = false,
+    streams_blocked_uni_sent: bool = false,
+    /// Set by `rawAllocateNextLocal*` on `StreamLimitExceeded`; drained by
+    /// `Client.flushPendingStreamsBlocked` on the next `processPendingWork`.
+    streams_blocked_bidi_pending: bool = false,
+    streams_blocked_uni_pending: bool = false,
 
     // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
     early_km: KeyMaterial = undefined,
@@ -2091,6 +2089,8 @@ pub const ConnState = struct {
         self.peer_initial_max_stream_data_bidi_local = parsed.initial_max_stream_data_bidi_local;
         self.peer_initial_max_stream_data_bidi_remote = parsed.initial_max_stream_data_bidi_remote;
         self.peer_initial_max_stream_data_uni = parsed.initial_max_stream_data_uni;
+        self.peer_max_bidi_streams = parsed.initial_max_streams_bidi;
+        self.peer_max_uni_streams = parsed.initial_max_streams_uni;
         self.peer_max_streams_bidi = parsed.initial_max_streams_bidi;
         self.peer_max_streams_uni = parsed.initial_max_streams_uni;
         self.peer_max_idle_timeout_ms = parsed.max_idle_timeout_ms;
@@ -2108,6 +2108,7 @@ pub const ConnState = struct {
             self.migration.setPreferredAddress(migrationPreferredFromTp(pa));
             dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
         }
+        self.peer_grease_quic_bit = parsed.grease_quic_bit;
     }
 
     /// Match an incoming DCID against the alternative-CID pool.
@@ -2558,8 +2559,9 @@ fn prepareTransportConnectionClose(
     reason: []const u8,
     out: []u8,
 ) ?[]const u8 {
-    if (conn.conn_close_sent) return null;
-    conn.conn_close_sent = true;
+    if (conn.conn_close_frame_len > 0) {
+        return conn.conn_close_frame[0..conn.conn_close_frame_len];
+    }
     const frame = transport_frames.ConnectionClose{
         .is_application = false,
         .error_code = error_code,
@@ -2567,7 +2569,11 @@ fn prepareTransportConnectionClose(
         .reason_phrase = reason,
     };
     const len = frame.serialize(out) catch return null;
-    return out[0..len];
+    if (len > out.len) return null;
+    @memcpy(conn.conn_close_frame[0..len], out[0..len]);
+    conn.conn_close_frame_len = @intCast(len);
+    conn.conn_close_sent = true;
+    return conn.conn_close_frame[0..len];
 }
 
 fn enterConnDraining(conn: *ConnState) void {
@@ -2894,8 +2900,10 @@ pub const Server = struct {
     /// with `releaseRawAppStream`.  Mirrors the client-initiated open the
     /// embedder performs via `rawAllocateNextLocalBidiStream` + `sendRawStreamData`.
     pub fn openRawAppStream(self: *Server, conn: *ConnState) OpenRawAppStreamError!u64 {
-        _ = self;
-        const stream_id = try rawAllocateNextLocalBidiStream(conn);
+        const stream_id = rawAllocateNextLocalBidiStream(conn) catch |err| {
+            if (err == error.StreamLimitExceeded) self.maybeSendStreamsBlocked(conn, true, conn.peer);
+            return err;
+        };
         if (!registerRawAppRecvSlot(conn, stream_id)) {
             // No free slot — roll back the id so the next call retries the same
             // id instead of leaving a permanent hole in the §2.1 id space.
@@ -3124,76 +3132,86 @@ pub const Server = struct {
         if (conn.pending_stream_sends.items.len == 0) return;
         var i: usize = 0;
         while (i < conn.pending_stream_sends.items.len) {
-            const p = conn.pending_stream_sends.items[i];
+            const p = &conn.pending_stream_sends.items[i];
+            const unsent = p.data.len - p.sent_in_buf;
+            const chunk_len = @min(unsent, max_pending_stream_chunk);
             const stream_limit = conn.peerStreamSendLimit(p.stream_id, true);
-            if (stream_limit > 0 and p.offset +| p.data.len > stream_limit) {
+            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
                 i += 1;
                 continue;
             }
-            const projected: u64 = conn.fc_bytes_sent +| p.data.len;
+            const projected: u64 = conn.fc_bytes_sent +| chunk_len;
             if (projected > conn.fc_send_max) {
                 i += 1;
                 continue;
             }
-            const pace_bytes: u64 = @intCast(p.data.len);
+            const pace_bytes: u64 = @intCast(chunk_len);
             if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
                 maybeLogPendingStreamStall(conn, "server");
                 return;
             }
             const stream_id = p.stream_id;
             const offset = p.offset;
-            const fin = p.fin;
-            const buf = p.data;
-            _ = conn.pending_stream_sends.orderedRemove(i);
-            conn.pending_stream_send_bytes -|= buf.len;
-
+            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
+            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
             const sf = stream_frame_mod.StreamFrame{
                 .stream_id = stream_id,
                 .offset = offset,
-                .data = buf,
+                .data = chunk,
                 .fin = fin,
                 .has_length = true,
             };
             var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const flen = sf.serialize(&frame_buf) catch {
-                self.allocator.free(buf);
+                i += 1;
                 continue;
             };
             const pn_before = conn.app_pn;
             self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
-            if (conn.app_pn == pn_before) {
-                // send1Rtt suppressed (draining flipped mid-loop).  Free
-                // the buffer; any remaining entries will be freed by
-                // freeConnStateRawAppBuffers on conn reap.
-                self.allocator.free(buf);
-                return;
-            }
-            conn.fc_bytes_sent +|= buf.len;
+            if (conn.app_pn == pn_before) return;
+            conn.fc_bytes_sent +|= chunk_len;
             if (conn.ld.sent_count == 0) {
-                self.allocator.free(buf);
+                p.sent_in_buf += chunk_len;
+                p.offset += chunk_len;
+                conn.pending_stream_send_bytes -|= chunk_len;
+                if (p.sent_in_buf == p.data.len) {
+                    const buf = p.data;
+                    _ = conn.pending_stream_sends.orderedRemove(i);
+                    self.allocator.free(buf);
+                } else {
+                    i += 1;
+                }
                 continue;
             }
             const sent_pn = conn.app_pn - 1;
             const last = &conn.ld.sent[conn.ld.sent_count - 1];
             if (last.pn != sent_pn) {
-                self.allocator.free(buf);
+                i += 1;
                 continue;
             }
-            // Defence-in-depth: guard against the alias case where
-            // `old.ptr == buf.ptr` (see `sendRawStreamDataInner` for the
-            // full rationale).  Without this guard a wedged-cwnd retx
-            // path can free `buf` and then immediately store the same
-            // dangling pointer.
+            const rtx_buf = self.allocator.dupe(u8, chunk) catch {
+                i += 1;
+                continue;
+            };
             if (last.stream_data) |old| {
-                if (old.ptr != buf.ptr) self.allocator.free(old);
+                if (old.ptr != rtx_buf.ptr) self.allocator.free(old);
             }
             last.has_stream_data = true;
             last.stream_id = stream_id;
             last.stream_offset = offset;
-            last.stream_data = buf;
+            last.stream_data = rtx_buf;
             last.stream_fin = fin;
-            conn.pacerConsume(@intCast(buf.len));
-            // `orderedRemove` slid the tail down by one; the next entry is at the same index.
+            conn.pacerConsume(@intCast(chunk_len));
+            p.sent_in_buf += chunk_len;
+            p.offset += chunk_len;
+            conn.pending_stream_send_bytes -|= chunk_len;
+            if (p.sent_in_buf == p.data.len) {
+                const buf = p.data;
+                _ = conn.pending_stream_sends.orderedRemove(i);
+                self.allocator.free(buf);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -3525,7 +3543,12 @@ pub const Server = struct {
                 conn.app_stream_chunk = pm.app_stream_chunk;
                 conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
                 if (self.config.cubic) {
-                    conn.cc = congestion.CongestionController.init(.cubic);
+                    conn.cc = if (self.config.transport_params_preset == .libp2p)
+                        congestion.CongestionController.initAggressive(.cubic)
+                    else
+                        congestion.CongestionController.init(.cubic);
+                } else if (self.config.transport_params_preset == .libp2p) {
+                    conn.cc = congestion.CongestionController.initAggressive(.new_reno);
                 }
                 conn.deriveInitialKeys(dcid);
                 // Open qlog file named after the original destination CID (ODCID).
@@ -4736,10 +4759,38 @@ pub const Server = struct {
                 return decrypted.wire_len;
             }
         }
+        if (buf.len >= 1 + 8 and buf[0] & 0x80 == 0) {
+            self.emitStatelessReset(buf[1..9], src);
+        }
         return null;
     }
 
-    /// Trigger a local key update: rotate send keys and emit a packet with
+    fn deriveStatelessResetToken(secret: *const [32]u8, dcid: []const u8) [16]u8 {
+        var out: [32]u8 = undefined;
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
+        hmac.update("stateless_reset");
+        hmac.update(dcid);
+        hmac.final(&out);
+        var token: [16]u8 = undefined;
+        @memcpy(&token, out[0..16]);
+        return token;
+    }
+
+    fn emitStatelessReset(self: *Server, dcid: []const u8, dst: compat.Address) void {
+        if (dcid.len == 0 or dcid.len > types.max_cid_len) return;
+        var pkt: [32]u8 = undefined;
+        compat.random.bytes(pkt[0 .. pkt.len - 16]);
+        pkt[0] = (pkt[0] & 0x3f) | 0x40;
+        const token = deriveStatelessResetToken(&self.retry_secret, dcid);
+        @memcpy(pkt[pkt.len - 16 ..], &token);
+        _ = compat.sendto(self.sock, &pkt, 0, &dst.any, dst.getOsSockLen()) catch {};
+    }
+
+    fn maybeSendStreamsBlocked(self: *Server, conn: *ConnState, bidi: bool, dst: compat.Address) void {
+        var buf: [16]u8 = undefined;
+        const frame = prepareConnStreamsBlocked(conn, bidi, &buf) orelse return;
+        self.send1Rtt(conn, frame, dst);
+    }
     /// the new key phase bit set.  Called after handshake when key_update
     /// is enabled (quic-interop-runner "keyupdate" test case).
     fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: compat.Address) void {
@@ -4761,8 +4812,13 @@ pub const Server = struct {
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: compat.Address) void {
         dbg("io: processAppFrames called: {} bytes\n", .{frames.len});
         conn.qlog.packetReceived(.one_rtt, conn.app_recv_pn orelse 0, frames.len);
-        // RFC 9000 §10.2.2: silently discard all frames while draining.
-        if (conn.draining) return;
+        // RFC 9000 §10.2.2: re-emit CONNECTION_CLOSE in response to peer packets.
+        if (conn.draining) {
+            if (conn.conn_close_frame_len > 0) {
+                self.send1Rtt(conn, conn.conn_close_frame[0..conn.conn_close_frame_len], src);
+            }
+            return;
+        }
         conn.last_recv_ms = compat.milliTimestamp();
         // Detect address change (connection migration / port rebinding, RFC 9000 §9).
         // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
@@ -5343,9 +5399,11 @@ pub const Server = struct {
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
-                // Flow control (RFC 9000 §4.1): track highest end offset seen.
-                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
+                // Flow control (RFC 9000 §4.1): connection-level credit is the
+                // sum of payload bytes received on all streams (not the max
+                // stream end offset — parallel streams would under-count and
+                // never trigger MAX_DATA before the peer stalls).
+                conn.fc_bytes_recv +|= sf_r.frame.data.len;
                 if (conn.fc_bytes_recv > conn.fc_recv_max) {
                     // Flow control violation — close with FLOW_CONTROL_ERROR (0x03).
                     self.sendConnectionClose(conn, 0x03, "flow control violation", src);
@@ -5357,6 +5415,7 @@ pub const Server = struct {
                 // extend this stream's window before the peer exhausts it.
                 // Without this a long-lived stream (libp2p persistent /meshsub
                 // gossip) stalls at the initial per-stream limit — zquic#172.
+                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 const sra = conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, true);
                 if (sra.violation) {
                     self.sendConnectionClose(conn, 0x03, "stream flow control violation", src);
@@ -7195,7 +7254,10 @@ pub const OpenLocalStreamError = error{StreamLimitExceeded};
 /// Allocate the next locally initiated **unidirectional** stream ID (RFC 9000 §2.1).
 /// Do not mix with HTTP/0.9 or HTTP/3 stream usage on the same connection.
 pub fn rawAllocateNextLocalUniStream(conn: *ConnState) OpenLocalStreamError!u64 {
-    if (localUniStreamsOpened(conn) >= conn.peer_max_uni_streams) return error.StreamLimitExceeded;
+    if (localUniStreamsOpened(conn) >= conn.peer_max_uni_streams) {
+        noteConnStreamLimitHit(conn, false);
+        return error.StreamLimitExceeded;
+    }
     const id = conn.next_local_uni_stream_id;
     conn.next_local_uni_stream_id += 4;
     return id;
@@ -7203,7 +7265,10 @@ pub fn rawAllocateNextLocalUniStream(conn: *ConnState) OpenLocalStreamError!u64 
 
 /// Allocate the next locally initiated **bidirectional** stream ID.
 pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) OpenLocalStreamError!u64 {
-    if (localBidiStreamsOpened(conn) >= conn.peer_max_bidi_streams) return error.StreamLimitExceeded;
+    if (localBidiStreamsOpened(conn) >= conn.peer_max_bidi_streams) {
+        noteConnStreamLimitHit(conn, true);
+        return error.StreamLimitExceeded;
+    }
     const id = conn.next_local_bidi_stream_id;
     conn.next_local_bidi_stream_id += 4;
     return id;
@@ -7246,6 +7311,32 @@ fn localUniStreamsOpened(conn: *const ConnState) u64 {
     if ((n & 3) == 2) return if (n >= 2) (n - 2) / 4 else 0; // client uni: 2, 6, 10, …
     if ((n & 3) == 3) return if (n >= 3) (n - 3) / 4 else 0; // server uni: 3, 7, 11, …
     return 0;
+}
+
+fn writeStreamsBlockedFrame(out: []u8, bidi: bool, maximum_streams: u64) ?usize {
+    if (out.len == 0) return null;
+    out[0] = if (bidi) @as(u8, 0x16) else @as(u8, 0x17);
+    const enc = varint.encode(out[1..], maximum_streams) catch return null;
+    return 1 + enc.len;
+}
+
+/// Build one STREAMS_BLOCKED frame when the local stream cap is hit (RFC 9000 §19.14).
+/// Returns null when already emitted for this cap-hit episode.
+fn prepareConnStreamsBlocked(conn: *ConnState, bidi: bool, out: []u8) ?[]const u8 {
+    if (bidi) {
+        if (conn.streams_blocked_bidi_sent) return null;
+        conn.streams_blocked_bidi_sent = true;
+    } else {
+        if (conn.streams_blocked_uni_sent) return null;
+        conn.streams_blocked_uni_sent = true;
+    }
+    const requested = if (bidi) localBidiStreamsOpened(conn) + 1 else localUniStreamsOpened(conn) + 1;
+    const flen = writeStreamsBlockedFrame(out, bidi, requested) orelse return null;
+    return out[0..flen];
+}
+
+fn noteConnStreamLimitHit(conn: *ConnState, bidi: bool) void {
+    if (bidi) conn.streams_blocked_bidi_pending = true else conn.streams_blocked_uni_pending = true;
 }
 
 /// Opaque receive buffer for an inbound raw-application stream on a **server** `ConnState`.
@@ -7676,6 +7767,7 @@ pub const Client = struct {
         const now = compat.milliTimestamp();
         // Mirror Server.processPendingWork: drain deferred STREAM bytes before
         // PTO/keepalive so gossip pending queues drain like quinn SendBuffer.
+        self.flushPendingStreamsBlocked();
         self.drainPendingStreamSendsUntilStalled();
         self.checkPto();
         self.maybeSendPlpmtuProbe();
@@ -7767,6 +7859,43 @@ pub const Client = struct {
         });
         if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
         return pn;
+    }
+
+    /// Emit STREAMS_BLOCKED when the peer's stream limit blocks a local open.
+    fn maybeSendStreamsBlocked(self: *Client, bidi: bool) void {
+        var buf: [16]u8 = undefined;
+        const frame = prepareConnStreamsBlocked(&self.conn, bidi, &buf) orelse return;
+        _ = self.sendClient1Rtt(frame);
+    }
+
+    /// Drain deferred STREAMS_BLOCKED frames queued by `rawAllocateNextLocal*`.
+    pub fn flushPendingStreamsBlocked(self: *Client) void {
+        if (self.conn.streams_blocked_bidi_pending) {
+            self.conn.streams_blocked_bidi_pending = false;
+            self.maybeSendStreamsBlocked(true);
+        }
+        if (self.conn.streams_blocked_uni_pending) {
+            self.conn.streams_blocked_uni_pending = false;
+            self.maybeSendStreamsBlocked(false);
+        }
+    }
+
+    /// Open a locally initiated bidi stream; emits STREAMS_BLOCKED on cap hit.
+    pub fn tryOpenLocalBidiStream(self: *Client) OpenLocalStreamError!u64 {
+        const id = rawAllocateNextLocalBidiStream(&self.conn) catch |err| {
+            if (err == error.StreamLimitExceeded) self.maybeSendStreamsBlocked(true);
+            return err;
+        };
+        return id;
+    }
+
+    /// Open a locally initiated uni stream; emits STREAMS_BLOCKED on cap hit.
+    pub fn tryOpenLocalUniStream(self: *Client) OpenLocalStreamError!u64 {
+        const id = rawAllocateNextLocalUniStream(&self.conn) catch |err| {
+            if (err == error.StreamLimitExceeded) self.maybeSendStreamsBlocked(false);
+            return err;
+        };
+        return id;
     }
 
     /// Send a MAX_DATA (0x10) frame extending the server's connection-level send
@@ -8016,52 +8145,41 @@ pub const Client = struct {
         if (self.conn.pending_stream_sends.items.len == 0) return;
         var i: usize = 0;
         while (i < self.conn.pending_stream_sends.items.len) {
-            const p = self.conn.pending_stream_sends.items[i];
+            const p = &self.conn.pending_stream_sends.items[i];
+            const unsent = p.data.len - p.sent_in_buf;
+            const chunk_len = @min(unsent, max_pending_stream_chunk);
             const stream_limit = self.conn.peerStreamSendLimit(p.stream_id, false);
-            if (stream_limit > 0 and p.offset +| p.data.len > stream_limit) {
+            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
                 i += 1;
                 continue;
             }
-            const projected: u64 = self.conn.fc_bytes_sent +| p.data.len;
+            const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
             if (projected > self.conn.fc_send_max) {
                 i += 1;
                 continue;
             }
-            const pace_bytes: u64 = @intCast(p.data.len);
+            const pace_bytes: u64 = @intCast(chunk_len);
             if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
                 maybeLogPendingStreamStall(&self.conn, "client");
                 return;
             }
             const stream_id = p.stream_id;
             const offset = p.offset;
-            const fin = p.fin;
-            const buf = p.data;
-            _ = self.conn.pending_stream_sends.orderedRemove(i);
-            self.conn.pending_stream_send_bytes -|= buf.len;
-
+            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
+            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
             const sf = stream_frame_mod.StreamFrame{
                 .stream_id = stream_id,
                 .offset = offset,
-                .data = buf,
+                .data = chunk,
                 .fin = fin,
                 .has_length = true,
             };
             var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const flen = sf.serialize(&frame_buf) catch {
-                self.allocator.free(buf);
+                i += 1;
                 continue;
             };
             if (!self.conn.ld.hasCapacity()) {
-                // Re-queue at the front; do not put untracked bytes on the wire.
-                self.conn.pending_stream_sends.insert(self.allocator, i, .{
-                    .stream_id = stream_id,
-                    .offset = offset,
-                    .fin = fin,
-                    .data = buf,
-                }) catch {
-                    self.allocator.free(buf);
-                };
-                self.conn.pending_stream_send_bytes +|= buf.len;
                 maybeLogPendingStreamStall(&self.conn, "client");
                 return;
             }
@@ -8075,14 +8193,18 @@ pub const Client = struct {
                 self.conn.key_phase_bit,
                 self.conn.packet_cipher,
             ) catch {
-                self.allocator.free(buf);
+                i += 1;
                 continue;
             };
             const pn = self.conn.app_pn;
             self.conn.app_pn += 1;
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
-            self.conn.fc_bytes_sent +|= buf.len;
+            self.conn.fc_bytes_sent +|= chunk_len;
             self.conn.note1RttSent();
+            const rtx_buf = self.allocator.dupe(u8, chunk) catch {
+                i += 1;
+                continue;
+            };
             const recorded = self.conn.ld.onPacketSent(.{
                 .pn = pn,
                 .send_time_ms = @intCast(compat.milliTimestamp()),
@@ -8092,15 +8214,25 @@ pub const Client = struct {
                 .has_stream_data = true,
                 .stream_id = stream_id,
                 .stream_offset = offset,
-                .stream_data = buf,
+                .stream_data = rtx_buf,
                 .stream_fin = fin,
             });
             if (recorded) {
                 self.conn.cc.onPacketSent(@intCast(pkt_len));
                 self.conn.pacerConsume(@intCast(pkt_len));
+            } else {
+                self.allocator.free(rtx_buf);
             }
-            if (!recorded) self.allocator.free(buf);
-            // `orderedRemove` slid the tail down by one; next entry is at the same index.
+            p.sent_in_buf += chunk_len;
+            p.offset += chunk_len;
+            self.conn.pending_stream_send_bytes -|= chunk_len;
+            if (p.sent_in_buf == p.data.len) {
+                const buf = p.data;
+                _ = self.conn.pending_stream_sends.orderedRemove(i);
+                self.allocator.free(buf);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -8472,6 +8604,7 @@ pub const Client = struct {
             // when an outstanding burst has gone unacknowledged longer than
             // pto_ms.  Mirrors Server.checkPto.  Cheap when there is nothing
             // in flight (early-out inside the function).
+            self.flushPendingStreamsBlocked();
             self.checkPto();
 
             if (ready == 0) continue;
@@ -9060,6 +9193,10 @@ pub const Client = struct {
             if (pos + dlen > pt_len) break;
             const cdata = plaintext[pos .. pos + dlen];
             if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
+                // Quinn retransmits ServerHello in Initial when the client
+                // stalls; re-running TLS state derivation corrupts the
+                // transcript and wedges Handshake decryption.
+                if (self.conn.has_hs_keys) continue;
                 self.tls.processServerHello(cdata) catch |err| {
                     dbg("io: processServerHello failed: {}\n", .{err});
                     return;
@@ -9289,8 +9426,25 @@ pub const Client = struct {
         self.conn.ecn_ect0_recv += 1;
         self.conn.last_recv_ms = compat.milliTimestamp();
 
-        // RFC 9000 §10.2.2: silently discard all frames while draining.
-        if (self.conn.draining) return;
+        // RFC 9000 §10.2.2: re-emit CONNECTION_CLOSE in response to peer packets.
+        if (self.conn.draining) {
+            if (self.conn.conn_close_frame_len > 0) {
+                var close_pkt: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const payload = self.conn.conn_close_frame[0..self.conn.conn_close_frame_len];
+                const pkt_len = build1RttPacketFull(
+                    &close_pkt,
+                    self.conn.remote_cid,
+                    payload,
+                    self.conn.app_pn,
+                    &self.conn.app_client_km,
+                    self.conn.key_phase_bit,
+                    self.conn.packet_cipher,
+                ) catch return;
+                self.conn.app_pn += 1;
+                _ = compat.sendto(self.sock, close_pkt[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+            }
+            return;
+        }
 
         self.conn.peer_key_phase = incoming_phase;
 
@@ -9640,7 +9794,7 @@ pub const Client = struct {
                 // advertised (libp2p persistent /meshsub gossip) would stall.
                 // zquic#172.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                if (recv_end > self.conn.fc_bytes_recv) self.conn.fc_bytes_recv = recv_end;
+                self.conn.fc_bytes_recv +|= sf_r.frame.data.len;
                 if (self.conn.fc_bytes_recv > self.conn.fc_recv_max) {
                     self.sendConnectionClose(0x03, "flow control violation");
                     return;
@@ -10921,11 +11075,32 @@ test "per-stream recv: bumpStreamRecvWindow answers STREAM_DATA_BLOCKED" {
     try std.testing.expectEqual(@as(u64, 9_999_999 + 10_000_000), nm);
 }
 
+test "prepareConnStreamsBlocked: throttles repeat bidi emission" {
+    var conn = makeConnForStreamTest();
+    conn.peer_max_bidi_streams = 2;
+    conn.next_local_bidi_stream_id = 8;
+    var buf: [16]u8 = undefined;
+    const f1 = prepareConnStreamsBlocked(&conn, true, &buf);
+    try std.testing.expect(f1 != null);
+    try std.testing.expect(f1.?[0] == 0x16);
+    try std.testing.expect(conn.streams_blocked_bidi_sent);
+    try std.testing.expect(prepareConnStreamsBlocked(&conn, true, &buf) == null);
+}
+
+test "noteConnStreamLimitHit: sets pending flags for client drain" {
+    var conn = makeConnForStreamTest();
+    noteConnStreamLimitHit(&conn, true);
+    try std.testing.expect(conn.streams_blocked_bidi_pending);
+    try std.testing.expect(!conn.streams_blocked_uni_pending);
+    noteConnStreamLimitHit(&conn, false);
+    try std.testing.expect(conn.streams_blocked_uni_pending);
+}
+
 test "seedLocalRecvWindows: default preset" {
     var d = makeConnForStreamTest();
     d.seedLocalRecvWindows(.default);
-    try std.testing.expectEqual(@as(u64, 16_777_216), d.local_initial_max_stream_data_bidi_local);
-    try std.testing.expectEqual(@as(u64, 67_108_864), d.fc_recv_max);
+    try std.testing.expectEqual(@as(u64, 262_144), d.local_initial_max_stream_data_bidi_local);
+    try std.testing.expectEqual(@as(u64, 1_048_576), d.fc_recv_max);
 }
 
 test "seedLocalRecvWindows: libp2p preset" {
@@ -11011,26 +11186,18 @@ test "pending stream send (owned): false return leaves `owned` to the caller (no
     if (!queued) a.free(owned); // single, correct free — NOT a double-free
 }
 
-test "pending stream send: oversized write fans out into per-packet entries" {
+test "pending stream send: oversized write stored as single entry (split at drain)" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // A write larger than one 1-RTT packet must be split into
-    // `max_pending_stream_chunk`-sized entries (each serializes into exactly
-    // one datagram on drain) — never stored as a single oversized entry, which
-    // the drain path cannot fragment and would silently drop.
+    // Large writes are kept as one queue entry; `drainPendingStreamSends`
+    // slices at packet-build time instead of fanning out on enqueue.
     const big = try std.testing.allocator.alloc(u8, max_pending_stream_chunk * 4 + 100);
     defer std.testing.allocator.free(big);
     @memset(big, 0xaa);
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, big, true));
-    // 4 full-packet slices + 1 remainder = 5 entries, each ≤ one packet.
-    try std.testing.expectEqual(@as(usize, 5), conn.pending_stream_sends.items.len);
-    for (conn.pending_stream_sends.items) |e| {
-        try std.testing.expect(e.data.len <= max_pending_stream_chunk);
-    }
-    // Offsets are contiguous and only the final slice carries FIN.
-    try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
-    try std.testing.expect(conn.pending_stream_sends.items[4].fin);
-    try std.testing.expect(!conn.pending_stream_sends.items[0].fin);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_sends.items.len);
+    try std.testing.expectEqual(@as(usize, big.len), conn.pending_stream_sends.items[0].data.len);
+    try std.testing.expect(conn.pending_stream_sends.items[0].fin);
 }
 
 test "AppAckTracker: adjacent ranges coalesce and serialize without integer overflow" {

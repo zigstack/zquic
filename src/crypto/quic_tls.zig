@@ -154,24 +154,30 @@ pub const TransportParamsOpts = struct {
     /// token for active migration (RFC 9000 §9.6 / §18.2).
     preferred_address: ?PreferredAddressTp = null,
     /// `initial_max_data` (0x04): connection-level flow-control window.
-    initial_max_data: u64 = 67_108_864,
+    /// Default 1 MiB — conservative for memory; libp2p preset raises this.
+    initial_max_data: u64 = 1_048_576,
     /// `initial_max_stream_data_bidi_local` (0x05).
-    initial_max_stream_data_bidi_local: u64 = 16_777_216,
+    initial_max_stream_data_bidi_local: u64 = 262_144,
     /// `initial_max_stream_data_bidi_remote` (0x06).
-    initial_max_stream_data_bidi_remote: u64 = 16_777_216,
+    initial_max_stream_data_bidi_remote: u64 = 262_144,
     /// `initial_max_stream_data_uni` (0x07).
-    initial_max_stream_data_uni: u64 = 16_777_216,
+    initial_max_stream_data_uni: u64 = 262_144,
     /// `initial_max_streams_bidi` (0x08).
     initial_max_streams_bidi: u64 = 1000,
     /// `initial_max_streams_uni` (0x09).
     initial_max_streams_uni: u64 = 1000,
+    /// RFC 9287 `grease_quic_bit` (0x2ab2): advertise tolerance for greased
+    /// short-header QUIC bits from the peer.  Off by default so legacy quinn
+    /// interop images that mishandle 0x2ab2 still complete handshakes; opt in
+    /// explicitly when the peer is known to support RFC 9287.
+    grease_quic_bit: bool = false,
 };
 
 /// Preset transport-parameter profiles for common embedders.
 pub const TransportParamsPreset = enum {
-    /// zquic defaults (64 MiB conn / 16 MiB stream / 1000 streams).
+    /// zquic defaults (1 MiB conn / 256 KiB stream / 1000 streams).
     default,
-    /// Match `libp2p-quic` / quinn defaults used by rust-libp2p.
+    /// libp2p-quic / gossipsub bulk profile (15 MiB conn / 10 MiB stream).
     libp2p,
 };
 
@@ -307,6 +313,10 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     if (opts.retry_source_cid) |rscid| {
         pos = try writeParamBytes(out, pos, 0x10, rscid);
     }
+    // RFC 9287: grease_quic_bit (0x2ab2) — length-0 flag.
+    if (opts.grease_quic_bit) {
+        pos = try writeParamBytes(out, pos, 0x2ab2, &[_]u8{});
+    }
     return pos;
 }
 
@@ -365,6 +375,8 @@ pub const PeerTransportParams = struct {
     /// finds — call sites enforce role.  `null` when the param is absent
     /// or the body is malformed.
     preferred_address: ?PreferredAddressTp = null,
+    /// RFC 9287 `grease_quic_bit` (0x2ab2): peer tolerates greased QUIC bit.
+    grease_quic_bit: bool = false,
 };
 
 /// On-wire layout of the preferred_address transport parameter (RFC 9000
@@ -459,6 +471,7 @@ pub fn parseTransportParams(bytes: []const u8) varint.DecodeError!PeerTransportP
             0x0c => out.disable_active_migration = (value_len == 0),
             0x0d => out.preferred_address = parsePreferredAddress(value),
             0x0e => out.active_connection_id_limit = readVarintField(value) catch continue,
+            0x2ab2 => out.grease_quic_bit = (value_len == 0),
             else => {}, // unknown / reserved / connection-id params are not surfaced here
         }
     }
@@ -481,10 +494,10 @@ test "transport params: round-trip varint fields" {
     const n = try buildTransportParams(&buf, .{ .initial_source_cid = &cid });
     const parsed = try parseTransportParams(buf[0..n]);
     try testing.expectEqual(@as(u64, 30_000), parsed.max_idle_timeout_ms);
-    try testing.expectEqual(@as(u64, 67_108_864), parsed.initial_max_data);
-    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_bidi_local);
-    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_bidi_remote);
-    try testing.expectEqual(@as(u64, 16_777_216), parsed.initial_max_stream_data_uni);
+    try testing.expectEqual(@as(u64, 1_048_576), parsed.initial_max_data);
+    try testing.expectEqual(@as(u64, 262_144), parsed.initial_max_stream_data_bidi_local);
+    try testing.expectEqual(@as(u64, 262_144), parsed.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(@as(u64, 262_144), parsed.initial_max_stream_data_uni);
     try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_bidi);
     try testing.expectEqual(@as(u64, 1000), parsed.initial_max_streams_uni);
     try testing.expectEqual(@as(u8, 3), parsed.ack_delay_exponent);
@@ -508,6 +521,18 @@ test "transport params: disable_active_migration is a length-0 flag" {
     const bytes = [_]u8{ 0x0c, 0x00 };
     const parsed = try parseTransportParams(&bytes);
     try testing.expect(parsed.disable_active_migration);
+}
+
+test "transport params: grease_quic_bit round-trip when enabled" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const n = try buildTransportParams(&buf, .{
+        .initial_source_cid = &cid,
+        .grease_quic_bit = true,
+    });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expect(parsed.grease_quic_bit);
 }
 
 test "transport params: ack_delay_exponent above 20 is clamped to default" {
