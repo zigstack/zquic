@@ -117,7 +117,14 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
 /// `Server.initFromSocket` + `feedPacket` with their own heap-allocated
 /// connection map sized to their workload.  See the "Embedder guide" in
 /// the README.
-pub const MAX_CONNECTIONS: usize = 16;
+// Connections are heap-allocated (boxed) and referenced by pointer in the
+// `conns` slot table (see `Server.conns`), so this cap sizes only a pointer
+// array — memory scales with *active* connections, not the cap (quinn's slab
+// model). 16 was far too small for a libp2p mesh: a node accepting inbound
+// from N peers silently dropped every Initial past the 16th (`newConn` returns
+// null → no response → 20 s dial timeout `stalled_phase=initial`), ceilinging
+// the mesh at ~16 peers and starving attestation quorum on a 32-validator net.
+pub const MAX_CONNECTIONS: usize = 256;
 pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
 
 /// FIN retransmit attempts before giving up (~3 s at 200 ms intervals).
@@ -2678,7 +2685,13 @@ pub const Server = struct {
     raw_sock: ?std.posix.socket_t = null,
     cert_der: []u8,
     private_key: tls_vendor.config.PrivateKey,
-    conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
+    // Boxed connections: each `ConnState` is ~4 MB, so it is heap-allocated and
+    // referenced by pointer here — only active connections cost memory (quinn's
+    // slab model). `newConn` allocates; `reapDrainedConnections` and `deinit`
+    // free. Pointers stay stable across the lifetime of the connection, so the
+    // `*ConnState` the embedder caches (e.g. in a libp2p InboundStream) remains
+    // valid until the slot is reaped.
+    conns: [MAX_CONNECTIONS]?*ConnState = [_]?*ConnState{null} ** MAX_CONNECTIONS,
     /// Random server token secret for Retry token HMAC-SHA256 verification.
     /// Rotated periodically; `retry_secret_prev` is the previous secret and is
     /// accepted during a grace window equal to the token TTL so tokens minted
@@ -2850,7 +2863,7 @@ pub const Server = struct {
     /// Drain deferred STREAM bytes on every connection (quinn `poll_transmit`).
     fn drainAllPendingStreamSends(self: *Server) void {
         for (&self.conns) |*cslot| {
-            if (cslot.*) |*conn| {
+            if (cslot.*) |conn| {
                 if (!conn.has_app_keys or conn.draining) continue;
                 self.drainPendingStreamSendsUntilStalled(conn);
             }
@@ -3218,10 +3231,12 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         // Close any open qlog files before freeing memory.
         for (&self.conns) |*slot| {
-            if (slot.*) |*conn| {
+            if (slot.*) |conn| {
                 freeConnStateRawAppBuffers(conn, self.allocator);
                 conn.qlog.connectionClosed("server_shutdown");
                 conn.qlog.close();
+                self.allocator.destroy(conn);
+                slot.* = null;
             }
         }
         if (self.owns_socket) compat.close(self.sock);
@@ -3251,7 +3266,7 @@ pub const Server = struct {
         const now = compat.milliTimestamp();
         const local_idle_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
         for (&self.conns) |*slot| {
-            if (slot.*) |*conn| {
+            if (slot.*) |conn| {
                 const draining_expired = conn.draining and conn.draining_deadline_ms > 0 and
                     now >= conn.draining_deadline_ms;
 
@@ -3287,6 +3302,7 @@ pub const Server = struct {
                     dbg("io: idle timeout — closing connection\n", .{});
                 }
                 freeConnStateRawAppBuffers(conn, self.allocator);
+                self.allocator.destroy(conn);
                 slot.* = null;
             }
         }
@@ -3310,7 +3326,7 @@ pub const Server = struct {
 
             var poll_timeout_ms: i32 = 2000;
             for (&self.conns) |*cslot| {
-                if (cslot.*) |*conn| {
+                if (cslot.*) |conn| {
                     if (conn.http09_active_count > 0 or conn.http09_pending_count > 0 or
                         conn.http09_rtx_count > 0 or conn.http3_active_count > 0)
                     {
@@ -3492,7 +3508,7 @@ pub const Server = struct {
     /// Find an existing connection by DCID.
     fn findConn(self: *Server, dcid: ConnectionId) ?*ConnState {
         for (&self.conns) |*slot| {
-            if (slot.*) |*c| {
+            if (slot.*) |c| {
                 if (ConnectionId.eql(c.local_cid, dcid)) return c;
                 if (c.cidPoolFind(dcid) != null) return c;
             }
@@ -3503,7 +3519,7 @@ pub const Server = struct {
     /// Find an existing connection by the peer's UDP address (for retransmit detection).
     fn findConnByPeer(self: *Server, peer: compat.Address) ?*ConnState {
         for (&self.conns) |*slot| {
-            if (slot.*) |*c| {
+            if (slot.*) |c| {
                 if (compat.Address.eql(c.peer, peer)) return c;
             }
         }
@@ -3514,7 +3530,7 @@ pub const Server = struct {
     /// Used for 0-RTT packets, which carry this ID rather than local_cid.
     fn findConnByInitDcid(self: *Server, dcid: ConnectionId) ?*ConnState {
         for (&self.conns) |*slot| {
-            if (slot.*) |*c| {
+            if (slot.*) |c| {
                 if (c.init_dcid) |id| {
                     if (ConnectionId.eql(id, dcid)) return c;
                 }
@@ -3528,7 +3544,8 @@ pub const Server = struct {
         for (&self.conns) |*slot| {
             if (slot.* == null) {
                 const local_cid = ConnectionId.random(compat.random, 8);
-                slot.* = ConnState{
+                const conn = self.allocator.create(ConnState) catch return null;
+                conn.* = ConnState{
                     .local_cid = local_cid,
                     .remote_cid = scid,
                     .peer = peer,
@@ -3537,7 +3554,7 @@ pub const Server = struct {
                     .next_local_uni_stream_id = 3,
                     .next_local_bidi_stream_id = 1,
                 };
-                const conn = &(slot.*.?);
+                slot.* = conn;
                 const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
                 conn.max_udp_payload = pm.max_udp_payload;
                 conn.app_stream_chunk = pm.app_stream_chunk;
@@ -4671,7 +4688,7 @@ pub const Server = struct {
     /// Decrypt and handle one 1-RTT packet (RFC 9000 §12.2 coalescing).
     fn processOneServer1RttPacket(self: *Server, buf: []const u8, src: compat.Address) ?usize {
         for (&self.conns) |*slot| {
-            if (slot.*) |*conn| {
+            if (slot.*) |conn| {
                 if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
                 if (!conn.has_app_keys) continue;
                 // `local_cid.len` is a u5, which would propagate through
@@ -5544,7 +5561,7 @@ pub const Server = struct {
     /// Flush deferred 1-RTT ACKs for all connections (after a recv batch).
     fn flushAllConnAppAcks(self: *Server) void {
         for (&self.conns) |*cslot| {
-            const conn = if (cslot.*) |*c| c else continue;
+            const conn = if (cslot.*) |c| c else continue;
             if (!conn.has_app_keys) continue;
             if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
             if (conn.app_recv_ack.range_count == 0) continue;
@@ -5652,7 +5669,7 @@ pub const Server = struct {
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
-                if (cslot.*) |*conn| {
+                if (cslot.*) |conn| {
                     if (!conn.has_app_keys) continue;
                     // Drain congestion-deferred retransmissions first so lost
                     // data takes priority over fresh responses (RFC 9002 §7).
@@ -5710,7 +5727,7 @@ pub const Server = struct {
         var probe_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const overhead: usize = 48;
         for (&self.conns) |*cslot| {
-            const conn = if (cslot.*) |*c| c else continue;
+            const conn = if (cslot.*) |c| c else continue;
             if (conn.phase != .connected or conn.draining) continue;
             const probe_size = conn.plpmtu.maybeProbeSize(now_ms) orelse continue;
             if (probe_size <= overhead) continue;
@@ -5728,7 +5745,7 @@ pub const Server = struct {
     fn maybeAutoKeyUpdates(self: *Server) void {
         const now_ms = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
-            const conn = if (cslot.*) |*c| c else continue;
+            const conn = if (cslot.*) |c| c else continue;
             if (conn.phase != .connected or conn.draining) continue;
             if (conn.packets_since_key_update < auto_key_update_packet_threshold) continue;
             if (!conn.canInitiateKeyUpdate(now_ms)) continue;
@@ -5753,7 +5770,7 @@ pub const Server = struct {
     fn checkPto(self: *Server) void {
         const now_ms = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
-            const conn = if (cslot.*) |*c| c else continue;
+            const conn = if (cslot.*) |c| c else continue;
             if (!conn.has_app_keys) continue;
             if (conn.draining) continue;
             // Safety net: drain any flow-control-deferred application
@@ -5897,7 +5914,7 @@ pub const Server = struct {
         // more than the NS3 25-packet DropTail queue can absorb simultaneously.
         var budget: usize = 8;
         for (&self.conns) |*cslot| {
-            if (cslot.*) |*conn| {
+            if (cslot.*) |conn| {
                 for (&conn.http09_slots) |*slot| {
                     if (budget == 0) return;
                     if (!slot.awaiting_fin_ack) continue;
@@ -7134,7 +7151,7 @@ pub const Server = struct {
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
-                if (cslot.*) |*conn| {
+                if (cslot.*) |conn| {
                     for (&conn.http3_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
@@ -7154,7 +7171,7 @@ pub const Server = struct {
     fn http3RetransmitPendingFins(self: *Server) void {
         const now = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
-            if (cslot.*) |*conn| {
+            if (cslot.*) |conn| {
                 for (&conn.http3_slots) |*slot| {
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
@@ -11469,7 +11486,7 @@ fn rawPumpOnce(server: *Server, client: *Client, server_addr: compat.Address, dr
 
 fn rawServerConnectedConn(server: *Server) ?*ConnState {
     for (&server.conns) |*slot| {
-        if (slot.*) |*c| {
+        if (slot.*) |c| {
             if (c.phase == .connected) return c;
         }
     }
