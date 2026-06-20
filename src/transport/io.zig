@@ -1099,8 +1099,14 @@ fn enqueuePendingStreamSend(
 }
 
 /// Like `enqueuePendingStreamSend` but takes ownership of an already-heap
-/// `owned` buffer (loss-retransmit path).  Frees `owned` on coalesce-append
-/// or on duplicate-offset dedup.
+/// `owned` buffer (loss-retransmit path).  On a `true` return it has consumed
+/// `owned` — either stored it, or freed it (coalesce-append / duplicate-offset
+/// dedup).  On a `false` return it did NOT consume `owned`; the caller still
+/// owns the buffer and must free it (every call site does
+/// `if (!enqueuePendingStreamSendOwned(...)) allocator.free(owned)`).  Freeing
+/// `owned` on the false paths here too caused a DOUBLE-FREE → jemalloc heap
+/// corruption under sustained backpressure (pending queue full) → SIGSEGV in a
+/// later `onAck` free.
 fn enqueuePendingStreamSendOwned(
     conn: *ConnState,
     allocator: std.mem.Allocator,
@@ -1138,13 +1144,11 @@ fn enqueuePendingStreamSendOwned(
             // already returns true for any duplicate).
             if (owned.ptr != last.data.ptr) {
                 if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-                    allocator.free(owned);
-                    return false;
+                    return false; // caller owns `owned` on false (not consumed)
                 }
                 const new_len = last.data.len + owned.len;
                 const grown = allocator.realloc(last.data, new_len) catch {
-                    allocator.free(owned);
-                    return false;
+                    return false; // caller owns `owned`; last.data untouched
                 };
                 @memcpy(grown[last.data.len..][0..owned.len], owned);
                 allocator.free(owned);
@@ -1156,12 +1160,10 @@ fn enqueuePendingStreamSendOwned(
         }
     }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (not consumed)
     }
     if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (not consumed)
     }
     conn.pending_stream_sends.append(allocator, .{
         .stream_id = stream_id,
@@ -1169,8 +1171,7 @@ fn enqueuePendingStreamSendOwned(
         .fin = fin,
         .data = owned,
     }) catch {
-        allocator.free(owned);
-        return false;
+        return false; // caller owns `owned` on false (append failed, not stored)
     };
     conn.pending_stream_send_bytes +|= owned.len;
     return true;
@@ -11159,6 +11160,32 @@ test "pending stream send: cap rejects past per-conn entry budget" {
     try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
 }
 
+test "pending stream send (owned): false return leaves `owned` to the caller (no double-free)" {
+    // Regression for the devnet SIGSEGV: enqueuePendingStreamSendOwned must NOT
+    // free `owned` on a false return. Every call site does
+    // `if (!enqueuePendingStreamSendOwned(...)) allocator.free(owned)`, so
+    // freeing here too double-freed under sustained backpressure (pending queue
+    // full — the exact logged condition) → jemalloc heap corruption → SIGSEGV in
+    // a later `onAck` free. std.testing.allocator panics on the double-free, so
+    // reaching the end of this test clean is the assertion.
+    const a = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer freePendingStreamSends(&conn, a);
+
+    // Fill to the per-conn entry cap so the next owned-enqueue hits the
+    // queue-full false path.
+    var i: usize = 0;
+    while (i < pending_stream_send_cap) : (i += 1) {
+        try std.testing.expect(enqueuePendingStreamSend(&conn, a, 4, @intCast(i * 2), "x", false));
+    }
+
+    // Exercise the OWNED variant on the full queue exactly as the callers do.
+    const owned = try a.dupe(u8, "retransmit-me");
+    const queued = enqueuePendingStreamSendOwned(&conn, a, 4, 10_000_000, owned, false);
+    try std.testing.expect(!queued); // full → false
+    if (!queued) a.free(owned); // single, correct free — NOT a double-free
+}
+
 test "pending stream send: oversized write stored as single entry (split at drain)" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
@@ -11568,6 +11595,81 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "raw-app server-initiated bidi: SERVER receives a CLIENT reply on the same stream (full duplex)" {
+    // The req/resp-over-inbound path (zig-libp2p) needs the *reverse* direction
+    // of the gossip fallback: after the server opens a bidi stream and sends a
+    // request, the CLIENT must be able to reply on that same server-initiated
+    // stream and have the SERVER receive it. All prior server-initiated tests
+    // are server→client only, so this duplex direction was never covered.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+    try std.testing.expectEqual(@as(u64, 1), sid % 4);
+
+    var drop = RawDrop{};
+
+    // 1. Server sends a request and FINs its send side — matching libp2p
+    //    req/resp (request → CloseWrite). The recv side stays open for the reply.
+    const request = "PING-FROM-SERVER";
+    {
+        var sent = false;
+        var got = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent) {
+                const acc = lb.server.sendRawStreamData(conn, sid, 0, request, true);
+                if (acc > 0) sent = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                if (b.len == request.len) {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        try std.testing.expect(got);
+    }
+
+    // 2. Client replies in TWO frames at increasing offsets, FIN on the last —
+    //    mimics multistream-ack-then-response, the real req/resp-over-inbound
+    //    byte pattern. The SERVER must reassemble both and see the FIN.
+    const reply_a = "ACK/multistream";
+    const reply_b = "PONG-FROM-CLIENT";
+    const reply_total = reply_a.len + reply_b.len;
+    var got_reply = false;
+    {
+        var sent_a = false;
+        var sent_b = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent_a) {
+                if (lb.client.sendRawStreamData(sid, 0, reply_a, false) > 0) sent_a = true;
+            } else if (!sent_b) {
+                if (lb.client.sendRawStreamData(sid, reply_a.len, reply_b, true) > 0) sent_b = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (rawAppRecvBuffer(conn, sid)) |b| {
+                if (b.len == reply_total and rawAppStreamFinReceived(conn, sid)) {
+                    got_reply = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(got_reply);
+    const got = rawAppRecvBuffer(conn, sid).?;
+    try std.testing.expectEqualSlices(u8, reply_a, got[0..reply_a.len]);
+    try std.testing.expectEqualSlices(u8, reply_b, got[reply_a.len..]);
 }
 
 test "raw-app server-initiated bidi: bulk multi-MB transfer drains across cwnd/ACK cycles" {
