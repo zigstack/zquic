@@ -1009,12 +1009,30 @@ fn enqueuePendingStreamSend(
     fin: bool,
 ) bool {
     // Empty (FIN-only) frames carry no retransmittable data and must never be
-    // queued: `dupe(u8, &.{})` returns the allocator's zero-length sentinel
-    // slice (ptr 0xffff…, len 0), which the drain path would later hand to
-    // `allocator.free` and corrupt jemalloc's per-thread cache — surfacing as a
-    // SIGSEGV in an unrelated later allocation (e.g. drainGossipsubOutbox).  The
-    // FIN bit itself is replayed directly by the loss arm, not via this queue.
-    if (data.len == 0) return true;
+    // queued as their own entry: `dupe(u8, &.{})` returns the allocator's
+    // zero-length sentinel slice (ptr 0xffff…, len 0), which the drain path
+    // would later hand to `allocator.free` and corrupt jemalloc's per-thread
+    // cache — a SIGSEGV in an unrelated later allocation.
+    if (data.len == 0) {
+        // …but the half-close must still reach the peer even when this stream's
+        // payload is backpressured in the queue. A large response (libp2p
+        // reqresp blocks_by_range) saturates cwnd, so its trailing FIN arrives
+        // here with no room to send immediately; dropping it leaves the
+        // requester waiting on a stream-end that never comes (the response
+        // never "completes"). Ride the FIN out on the last queued frame for
+        // this stream instead of allocating a 0-byte entry.
+        if (fin) {
+            var i = conn.pending_stream_sends.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (conn.pending_stream_sends.items[i].stream_id == stream_id) {
+                    conn.pending_stream_sends.items[i].fin = true;
+                    break;
+                }
+            }
+        }
+        return true;
+    }
     // Split writes larger than one 1-RTT packet into per-packet entries.
     // `drainPendingStreamSends` serializes one entry into one datagram and
     // CANNOT fragment — an oversized entry fails `StreamFrame.serialize` and is
@@ -10907,6 +10925,25 @@ test "pending stream send: contiguous enqueues coalesce on same stream" {
     try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
     try std.testing.expectEqualSlices(u8, "aaaabbbbcccc", conn.pending_stream_sends.items[0].data);
     try std.testing.expect(conn.pending_stream_sends.items[0].fin);
+}
+
+test "pending stream send: FIN-only frame rides out on the last queued frame" {
+    var conn = makeConnForStreamTest();
+    defer freePendingStreamSends(&conn, std.testing.allocator);
+    // A large response's payload is backpressured in the queue; the trailing
+    // half-close (0-byte FIN) must attach to the last queued frame for that
+    // stream rather than be dropped — otherwise the peer never sees the FIN
+    // and the response never completes (gap-offsets prevent coalescing).
+    try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, "aaaa", false));
+    try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 100, "bbbb", false));
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_stream_sends.items.len);
+    try std.testing.expect(!conn.pending_stream_sends.items[1].fin);
+
+    // FIN-only at the end offset: no new entry, FIN set on the last frame.
+    try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 104, &.{}, true));
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_stream_sends.items.len);
+    try std.testing.expect(conn.pending_stream_sends.items[1].fin);
+    try std.testing.expect(!conn.pending_stream_sends.items[0].fin);
 }
 
 test "pending stream send: cap rejects past per-conn entry budget" {
