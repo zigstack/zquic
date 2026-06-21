@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reliably deliver a separate empty FIN frame on a backpressured stream
+  (residual ~1-2% req/resp-over-inbound flake).** When an endpoint wrote a
+  length-framed response with `fin=false` and then a *separate* empty STREAM
+  frame with `fin=true` at the next offset, the FIN was silently dropped if the
+  congestion/pacer gate happened to be blocked at the instant it was submitted.
+  The data frame had already gone straight to the wire, so
+  `enqueuePendingStreamSend`'s empty-FIN path found no queued frame to ride the
+  FIN out on and returned success without queuing anything — leaving the peer's
+  stream half-open until timeout (observed receiver signature: `saw_chunk=true
+  saw_end=false`, the server never reaching `rawAppStreamFullyReceived`). This
+  is the failing pattern behind the residual ~1-2%-per-attempt flake on the
+  zig-libp2p req/resp-over-inbound reverse direction (a QUIC *client* replying
+  on a server-initiated bidi stream). The empty-FIN path now appends a dedicated
+  FIN-only pending entry (empty `data`, never duped/freed as the allocator's
+  zero-length sentinel) that `drainPendingStreamSends` emits as a bare FIN once
+  the gate reopens; a lost bare FIN is still re-emitted by the existing FIN-only
+  loss-recovery arm. Both client and server drain paths now track a 0-byte FIN
+  with `stream_data = null` instead of duping the empty chunk. Covered by a
+  deterministic loopback regression test (forces the pacer-blocked submit
+  window) plus a 600-iteration happy-path loop of the separate-empty-FIN
+  pattern.
+
 ## [v1.7.37] - 2026-06-16
 
 ### Added
