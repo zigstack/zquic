@@ -58,8 +58,93 @@ pub const SentPacket = struct {
     in_flight: bool,
 };
 
-/// Connection-level statistics.
+/// UDP-layer counters (tx/rx datagrams and bytes).
+pub const UdpStats = struct {
+    datagrams_tx: u64 = 0,
+    datagrams_rx: u64 = 0,
+    bytes_tx: u64 = 0,
+    bytes_rx: u64 = 0,
+};
+
+/// Per-frame-type counters (RFC 9000 §19).
+pub const FrameStats = struct {
+    ping_tx: u64 = 0,
+    ping_rx: u64 = 0,
+    ack_tx: u64 = 0,
+    ack_rx: u64 = 0,
+    reset_stream_tx: u64 = 0,
+    reset_stream_rx: u64 = 0,
+    stop_sending_tx: u64 = 0,
+    stop_sending_rx: u64 = 0,
+    crypto_tx: u64 = 0,
+    crypto_rx: u64 = 0,
+    new_token_tx: u64 = 0,
+    new_token_rx: u64 = 0,
+    stream_tx: u64 = 0,
+    stream_rx: u64 = 0,
+    max_data_tx: u64 = 0,
+    max_data_rx: u64 = 0,
+    max_stream_data_tx: u64 = 0,
+    max_stream_data_rx: u64 = 0,
+    max_streams_tx: u64 = 0,
+    max_streams_rx: u64 = 0,
+    data_blocked_tx: u64 = 0,
+    data_blocked_rx: u64 = 0,
+    stream_data_blocked_tx: u64 = 0,
+    stream_data_blocked_rx: u64 = 0,
+    streams_blocked_tx: u64 = 0,
+    streams_blocked_rx: u64 = 0,
+    new_connection_id_tx: u64 = 0,
+    new_connection_id_rx: u64 = 0,
+    retire_connection_id_tx: u64 = 0,
+    retire_connection_id_rx: u64 = 0,
+    path_challenge_tx: u64 = 0,
+    path_challenge_rx: u64 = 0,
+    path_response_tx: u64 = 0,
+    path_response_rx: u64 = 0,
+    connection_close_tx: u64 = 0,
+    connection_close_rx: u64 = 0,
+    handshake_done_tx: u64 = 0,
+    handshake_done_rx: u64 = 0,
+};
+
+/// Path / loss / congestion snapshot fields (mirrors quinn `PathStats`).
+pub const PathStats = struct {
+    srtt_ms: f64 = 0,
+    min_rtt_ms: u64 = 0,
+    rttvar_ms: f64 = 0,
+    cwnd: u64 = 0,
+    bytes_in_flight: u64 = 0,
+    congestion_events: u64 = 0,
+    lost_packets: u64 = 0,
+    lost_bytes: u64 = 0,
+    pto_count: u64 = 0,
+    current_mtu: u16 = 0,
+    ecn_ect0_recv: u64 = 0,
+    ecn_ect1_recv: u64 = 0,
+    ecn_ce_recv: u64 = 0,
+    plpmtud_probes_sent: u64 = 0,
+    plpmtud_probes_acked: u64 = 0,
+    black_hole_detections: u64 = 0,
+};
+
+/// Cumulative counters maintained on the live connection.
+pub const StatsAccumulator = struct {
+    udp: UdpStats = .{},
+    frames: FrameStats = .{},
+    lost_packets: u64 = 0,
+    lost_bytes: u64 = 0,
+    plpmtud_probes_sent: u64 = 0,
+    plpmtud_probes_acked: u64 = 0,
+    black_hole_detections: u64 = 0,
+};
+
+/// Connection-level statistics snapshot.
 pub const Stats = struct {
+    udp: UdpStats = .{},
+    frames: FrameStats = .{},
+    path: PathStats = .{},
+    /// Legacy top-level aliases (datagram / byte totals).
     packets_sent: u64 = 0,
     packets_recv: u64 = 0,
     bytes_sent: u64 = 0,
