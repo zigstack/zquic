@@ -40,6 +40,7 @@ pub const transport = struct {
     pub const session_token = @import("transport/session_token.zig");
     pub const stats = @import("transport/stats.zig");
     pub const migration = @import("transport/migration.zig");
+    pub const send_buffer = @import("transport/send_buffer.zig");
     pub const io = @import("transport/io.zig");
     pub const path_mtu = @import("transport/path_mtu.zig");
 };
@@ -88,6 +89,7 @@ test {
     _ = @import("transport/stats.zig");
     _ = @import("transport/migration.zig");
     _ = @import("transport/raw_app_stream.zig");
+    _ = @import("transport/send_buffer.zig");
     _ = @import("transport/io.zig");
     _ = @import("transport/path_mtu.zig");
     _ = @import("http3/frame.zig");

@@ -164,6 +164,10 @@ pub const SentPacket = struct {
     has_stream_data: bool = false,
     stream_id: u64 = 0,
     stream_offset: u64 = 0,
+    /// Length of STREAM payload bytes when stored in a per-stream `SendBuffer`
+    /// (`stream_data == null`).  Enables partial retransmit without a heap copy
+    /// on the `SentPacket` (issue #184).
+    stream_byte_len: u32 = 0,
     /// Heap-owned plaintext bytes for the raw-application STREAM frame, kept
     /// so we can re-encrypt them under a fresh PN on loss.  `null` for the
     /// HTTP/0.9 and HTTP/3 paths — those rewind their own per-slot state from
@@ -179,6 +183,13 @@ pub const SentPacket = struct {
     stream_data: ?[]u8 = null,
     /// FIN flag accompanying `stream_data` (so retransmit preserves the bit).
     stream_fin: bool = false,
+};
+
+/// STREAM byte range ACKed via a packet-number ACK (issue #184).
+pub const StreamAck = struct {
+    stream_id: u64,
+    offset: u64,
+    len: u32,
 };
 
 /// Loss detection state for one packet number space.
@@ -294,6 +305,8 @@ pub const LossDetector = struct {
         /// ACK instead of once per lost packet — the recovery period bound
         /// is what matters, not the individual PNs.
         largest_lost_pn: ?u64,
+        /// Number of `StreamAck` entries written to `acked_stream_buf`.
+        acked_stream_count: usize = 0,
     };
 
     /// Process an ACK frame. Returns packets declared lost.
@@ -321,6 +334,8 @@ pub const LossDetector = struct {
         /// packets whose `stream_data` is non-null, ownership of that slice
         /// transfers to the caller (see `SentPacket.stream_data` docs).
         lost_buf: []SentPacket,
+        /// Caller-provided buffer for STREAM ranges ACKed in this PN space.
+        acked_stream_buf: []StreamAck,
         /// Allocator used to free `stream_data` for packets acked by this
         /// range.  Pass the same allocator that the producer used when
         /// attaching the data via `onPacketSent`.
@@ -367,6 +382,7 @@ pub const LossDetector = struct {
         // evaluate the persistent-congestion duration (RFC 9002 §7.6.1).
         var earliest_lost_eliciting_send_time: ?u64 = null;
         var latest_lost_eliciting_send_time: ?u64 = null;
+        var acked_stream_count: usize = 0;
 
         // Compute the time-threshold loss bound once per ACK (RFC 9002
         // §6.1.2).  A packet older than this is declared lost even if fewer
@@ -395,6 +411,15 @@ pub const LossDetector = struct {
                 if (self.sent[i].stream_data) |sd| {
                     _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
                     self.sent[i].stream_data = null;
+                } else if (self.sent[i].has_stream_data and self.sent[i].stream_data == null) {
+                    if (acked_stream_count < acked_stream_buf.len) {
+                        acked_stream_buf[acked_stream_count] = .{
+                            .stream_id = self.sent[i].stream_id,
+                            .offset = self.sent[i].stream_offset,
+                            .len = self.sent[i].stream_byte_len,
+                        };
+                        acked_stream_count += 1;
+                    }
                 }
                 self.sent[i] = self.sent[self.sent_count - 1];
                 self.sent_count -= 1;
@@ -479,6 +504,7 @@ pub const LossDetector = struct {
             .lost_bytes = lost_bytes,
             .persistent_congestion = pc,
             .largest_lost_pn = largest_lost_pn,
+            .acked_stream_count = acked_stream_count,
         };
     }
 };
@@ -531,7 +557,7 @@ test "loss: packet threshold detection" {
     // Packets 0, 1, 2 are in a gap and should be detected as lost via
     // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
     var lost_buf: [8]SentPacket = undefined;
-    const result = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, testing.allocator);
+    const result = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
     try testing.expect(result.lost_count >= 2);
 }
 
@@ -543,7 +569,7 @@ test "loss: rejects invalid first_ack_range > largest_acked" {
     // largest_acked=5, first_ack_range=10 → would underflow.
     try testing.expectError(
         error.FrameEncodingError,
-        ld.onAck(.application, 5, 10, 0, 200, &rtt, &lost_buf, testing.allocator),
+        ld.onAck(.application, 5, 10, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator),
     );
 }
 
@@ -563,7 +589,7 @@ test "loss: time-threshold declares old packet lost when gap < k_packet_threshol
     // Ack pn 1 at a time far enough past pn 0's send to trigger time-threshold.
     const now = 200 + loss_delay + 1;
     var lost_buf: [4]SentPacket = undefined;
-    const r = try ld.onAck(.application, 1, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 1, 0, 0, now, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
     try testing.expectEqual(@as(usize, 1), r.lost_count);
     try testing.expectEqual(@as(u64, 0), lost_buf[0].pn);
     try testing.expect(r.largest_lost_pn != null);
@@ -596,7 +622,7 @@ test "loss: persistent congestion across spread-out losses" {
     // large enough that time-threshold also fires on 3 and 4.
     const now = t_last + 30 + rtt.loss_delay_ms() + 1;
     var lost_buf: [16]SentPacket = undefined;
-    const r = try ld.onAck(.application, 5, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 5, 0, 0, now, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
     try testing.expect(r.lost_count >= 3);
     try testing.expect(r.persistent_congestion);
 }
@@ -625,7 +651,7 @@ test "loss: no persistent congestion when ack proves path is delivering" {
     // (largest_acked=4 ≥ 0+3) but pn 1 was acked inside the same ACK, so
     // even if a second loss were present, PC would not apply.
     var lost_buf: [8]SentPacket = undefined;
-    const r = try ld.onAck(.application, 4, 3, 0, t0 + pc_dur + 20, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 4, 3, 0, t0 + pc_dur + 20, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
     try testing.expect(r.lost_count >= 1);
     try testing.expect(!r.persistent_congestion);
 }
@@ -690,10 +716,10 @@ test "loss: stream_data is freed on ack and transferred on loss" {
     var lost_buf: [8]SentPacket = undefined;
     // Ack pn 0 (frees buf0 internally), then ack pn 5 separately so pn 1
     // is declared lost via k_packet_threshold.
-    const r0 = try ld.onAck(.application, 0, 0, 0, 200, &rtt, &lost_buf, a);
+    const r0 = try ld.onAck(.application, 0, 0, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, a);
     try testing.expectEqual(@as(usize, 0), r0.lost_count);
 
-    const r1 = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, a);
+    const r1 = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, a);
     try testing.expect(r1.lost_count >= 1);
     // Find the lost descriptor that owns the heap slice.
     var saw_transfer = false;
@@ -794,7 +820,7 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
         const largest = top -| rand.uintLessThan(u64, 3);
         const first_range = @min(range, largest);
 
-        const r = ld.onAck(.application, largest, first_range, 0, now, &rtt, &lost_buf, a) catch {
+        const r = ld.onAck(.application, largest, first_range, 0, now, &rtt, &lost_buf, &[_]StreamAck{}, a) catch {
             continue;
         };
 
@@ -813,7 +839,7 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
         // the time-threshold loss path, exercising large single-ACK losses.
         if (iter % 4096 == 0 and ld.sent_count > 0) {
             now += 10_000;
-            const flush = ld.onAck(.application, next_pn -| 1, 0, 0, now, &rtt, &lost_buf, a) catch continue;
+            const flush = ld.onAck(.application, next_pn -| 1, 0, 0, now, &rtt, &lost_buf, &[_]StreamAck{}, a) catch continue;
             var fi: usize = 0;
             while (fi < flush.lost_count) : (fi += 1) {
                 if (lost_buf[fi].stream_data) |sbuf| a.free(sbuf);
@@ -834,7 +860,7 @@ test "loss: per-PN-space ACK only affects matching space" {
     _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 196, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
 
     var lost_buf: [8]SentPacket = undefined;
-    const r = try ld.onAck(.application, 1, 1, 0, 200, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 1, 1, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
     try testing.expectEqual(@as(usize, 0), r.lost_count);
     try testing.expectEqual(@as(usize, 1), ld.sent_count);
     try testing.expectEqual(PacketNumberSpace.handshake, ld.sent[0].space);

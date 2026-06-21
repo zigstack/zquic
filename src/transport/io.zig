@@ -46,6 +46,7 @@ const raw_app_stream = @import("raw_app_stream.zig");
 const connection_mod = @import("connection.zig");
 const stats_mod = @import("stats.zig");
 const session_token_mod = @import("session_token.zig");
+const send_buffer_mod = @import("send_buffer.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
 
 /// Locally-initiate a key update after this many 1-RTT packets (RFC 9001 §6).
@@ -1054,6 +1055,44 @@ const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 /// steady-state per-conn send rate, so it only bounds post-stall catch-up bursts.
 const max_pending_drain_per_call: usize = 1024;
 
+fn streamSendQueuedBytes(conn: *const ConnState) usize {
+    var n: usize = 0;
+    for (&conn.stream_send_slots) |*slot| {
+        if (slot.active) n += slot.buf.byteLen();
+    }
+    return n;
+}
+
+fn streamSendHasWork(conn: *const ConnState) bool {
+    for (conn.stream_send_slots) |slot| {
+        if (!slot.active) continue;
+        if (slot.buf.hasWork()) return true;
+    }
+    return false;
+}
+
+fn applyStreamAcks(
+    conn: *ConnState,
+    allocator: std.mem.Allocator,
+    acks: []const recovery.StreamAck,
+) void {
+    for (acks) |a| {
+        if (send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], a.stream_id)) |buf| {
+            buf.onAck(allocator, a.offset, a.len);
+        }
+    }
+    conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
+}
+
+fn freeStreamSendSlots(conn: *ConnState, allocator: std.mem.Allocator) void {
+    for (&conn.stream_send_slots) |*slot| {
+        if (slot.active) {
+            slot.buf.deinit(allocator);
+            slot.* = .{};
+        }
+    }
+}
+
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
 /// Returns false when the per-connection caps are exhausted; callers must
@@ -1067,87 +1106,12 @@ fn enqueuePendingStreamSend(
     data: []const u8,
     fin: bool,
 ) bool {
-    // Empty (FIN-only) frames carry no retransmittable data and must never be
-    // queued as their own entry: `dupe(u8, &.{})` returns the allocator's
-    // zero-length sentinel slice (ptr 0xffff…, len 0), which the drain path
-    // would later hand to `allocator.free` and corrupt jemalloc's per-thread
-    // cache — a SIGSEGV in an unrelated later allocation.
-    // Split at packet-build time in `drainPendingStreamSends` (not here).
-    if (data.len == 0) {
-        // …but the half-close must still reach the peer even when this stream's
-        // payload is backpressured in the queue. A large response (libp2p
-        // reqresp blocks_by_range) saturates cwnd, so its trailing FIN arrives
-        // here with no room to send immediately; dropping it leaves the
-        // requester waiting on a stream-end that never comes (the response
-        // never "completes"). Ride the FIN out on the last queued frame for
-        // this stream instead of allocating a 0-byte entry.
-        if (fin) {
-            var i = conn.pending_stream_sends.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (conn.pending_stream_sends.items[i].stream_id == stream_id) {
-                    conn.pending_stream_sends.items[i].fin = true;
-                    return true;
-                }
-            }
-            // No queued frame to carry the FIN: this stream's payload already
-            // went straight to the wire, leaving the queue empty for it. The
-            // half-close must still be delivered, so append a dedicated
-            // FIN-only entry that `drainPendingStreamSends` emits as a bare FIN
-            // once the congestion/pacer gate reopens. Its `data` is the empty
-            // slice (never duped or freed — that would hand the allocator its
-            // zero-length sentinel and corrupt the heap; `drainPendingStreamSends`
-            // and `freePendingStreamSends` both skip the free on len==0).
-            // Dropping the FIN here instead silently half-closed the stream and
-            // hung req/resp until timeout — the ~1-2% empty-FIN-on-blocked-gate
-            // flake on the req/resp-over-inbound reverse direction.
-            if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
-            conn.pending_stream_sends.append(allocator, .{
-                .stream_id = stream_id,
-                .offset = offset,
-                .fin = true,
-                .data = &.{},
-            }) catch return false;
-        }
-        return true;
-    }
-    // Embedder may retry the same offset after a backpressure 0; treat as
-    // already accepted so we do not fill the queue with duplicate copies.
-    for (conn.pending_stream_sends.items) |e| {
-        if (e.stream_id == stream_id and e.offset == offset) return true;
-    }
-    // Coalesce contiguous tail bytes on the same stream (gossipsub /meshsub
-    // sends sequential 1200-byte chunks).  Without this, CC-blocked gossip
-    // creates one queue entry per chunk and hits the 1024-entry cap in ~30s
-    // even though total bytes stay under the 8 MiB byte cap.
-    if (conn.pending_stream_sends.items.len > 0) {
-        const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and
-            last.offset +| (last.data.len - last.sent_in_buf) == offset and !last.fin)
-        {
-            if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
-            const new_len = last.data.len + data.len;
-            const grown = allocator.realloc(last.data, new_len) catch return false;
-            @memcpy(grown[last.data.len..][0..data.len], data);
-            last.data = grown;
-            if (fin) last.fin = true;
-            conn.pending_stream_send_bytes +|= data.len;
-            return true;
-        }
-    }
-    if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
-    if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
-    const dup = allocator.dupe(u8, data) catch return false;
-    conn.pending_stream_sends.append(allocator, .{
-        .stream_id = stream_id,
-        .offset = offset,
-        .fin = fin,
-        .data = dup,
-    }) catch {
-        allocator.free(dup);
-        return false;
-    };
-    conn.pending_stream_send_bytes +|= data.len;
+    const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
+    if (data.len == 0 and !fin) return true;
+    const projected = streamSendQueuedBytes(conn) + data.len;
+    if (projected > pending_stream_send_bytes_cap) return false;
+    sbuf.append(allocator, offset, data, fin) catch return false;
+    conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
     return true;
 }
 
@@ -1168,65 +1132,12 @@ fn enqueuePendingStreamSendOwned(
     owned: []u8,
     fin: bool,
 ) bool {
-    // Empty (FIN-only) frames carry no retransmittable data; never queue them.
-    // Do NOT free `owned` — a zero-length slice is the allocator's sentinel,
-    // not a real allocation, and freeing it corrupts the heap.  (Post-v1.7.27
-    // the retransmit path never tracks empty stream_data, so this is defensive.)
     if (owned.len == 0) return true;
-    for (conn.pending_stream_sends.items) |e| {
-        if (e.stream_id == stream_id and e.offset == offset) {
-            allocator.free(owned);
-            return true;
-        }
-    }
-    if (conn.pending_stream_sends.items.len > 0) {
-        const last = &conn.pending_stream_sends.items[conn.pending_stream_sends.items.len - 1];
-        if (last.stream_id == stream_id and
-            last.offset +| (last.data.len - last.sent_in_buf) == offset and !last.fin)
-        {
-            // Defence-in-depth: if `owned` and `last.data` alias the same
-            // heap buffer, realloc would invalidate `owned`'s backing
-            // storage and the subsequent @memcpy would read freed memory.
-            // This should never happen (the caller's contract is that
-            // `owned` is freshly allocated and unique), but a stale-slice
-            // bug elsewhere could otherwise corrupt jemalloc's metadata
-            // and crash the process.  Skip the coalesce path on alias and
-            // fall through to the append path, which a few lines below
-            // detects the same alias via the for-loop dedup check above
-            // (in practice we never reach that because the for-loop
-            // already returns true for any duplicate).
-            if (owned.ptr != last.data.ptr) {
-                if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-                    return false; // caller owns `owned` on false (not consumed)
-                }
-                const new_len = last.data.len + owned.len;
-                const grown = allocator.realloc(last.data, new_len) catch {
-                    return false; // caller owns `owned`; last.data untouched
-                };
-                @memcpy(grown[last.data.len..][0..owned.len], owned);
-                allocator.free(owned);
-                last.data = grown;
-                if (fin) last.fin = true;
-                conn.pending_stream_send_bytes +|= owned.len;
-                return true;
-            }
-        }
-    }
-    if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
-        return false; // caller owns `owned` on false (not consumed)
-    }
-    if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
-        return false; // caller owns `owned` on false (not consumed)
-    }
-    conn.pending_stream_sends.append(allocator, .{
-        .stream_id = stream_id,
-        .offset = offset,
-        .fin = fin,
-        .data = owned,
-    }) catch {
-        return false; // caller owns `owned` on false (append failed, not stored)
-    };
-    conn.pending_stream_send_bytes +|= owned.len;
+    const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
+    if (streamSendQueuedBytes(conn) + owned.len > pending_stream_send_bytes_cap) return false;
+    sbuf.append(allocator, offset, owned, fin) catch return false;
+    allocator.free(owned);
+    conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
     return true;
 }
 
@@ -1288,6 +1199,136 @@ fn abandonEarlyPnSpaces(conn: *ConnState, allocator: std.mem.Allocator) void {
 /// (multi-KB coalesced gossip frames) could never accumulate enough pacing
 /// tokens and would wedge `drainPendingStreamSends`.  See `pacerUpdate` for
 /// the cwnd-scaled burst budget.
+fn streamSendActiveSlotCount(conn: *const ConnState) usize {
+    var n: usize = 0;
+    for (conn.stream_send_slots) |slot| {
+        if (slot.active) n += 1;
+    }
+    return n;
+}
+
+fn connAttachStreamToLastAppPacket(
+    conn: *ConnState,
+    stream_id: u64,
+    offset: u64,
+    byte_len: u32,
+    fin: bool,
+) void {
+    if (conn.ld.sent_count == 0) return;
+    const sent_pn = conn.app_pn -| 1;
+    const last = &conn.ld.sent[conn.ld.sent_count - 1];
+    if (last.pn != sent_pn or last.space != .application) return;
+    last.has_stream_data = byte_len > 0 or fin;
+    last.stream_id = stream_id;
+    last.stream_offset = offset;
+    last.stream_byte_len = byte_len;
+    last.stream_data = null;
+    last.stream_fin = fin;
+}
+
+fn emitStreamPollServer(
+    self: *Server,
+    conn: *ConnState,
+    stream_id: u64,
+    poll: send_buffer_mod.PollResult,
+) bool {
+    const chunk_len = poll.data.len;
+    if (!poll.retransmit) {
+        const stream_limit = conn.peerStreamSendLimit(stream_id, true);
+        if (stream_limit > 0 and poll.offset +| chunk_len > stream_limit) return false;
+        const projected: u64 = conn.fc_bytes_sent +| chunk_len;
+        if (projected > conn.fc_send_max) return false;
+    }
+    const pace_bytes: u64 = @intCast(if (chunk_len > 0) chunk_len else 1);
+    if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) return false;
+
+    const sf = stream_frame_mod.StreamFrame{
+        .stream_id = stream_id,
+        .offset = poll.offset,
+        .data = poll.data,
+        .fin = poll.fin,
+        .has_length = true,
+    };
+    var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    const flen = sf.serialize(&frame_buf) catch return false;
+    const pn_before = conn.app_pn;
+    self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
+    if (conn.app_pn == pn_before) return false;
+
+    if (!poll.retransmit and chunk_len > 0) conn.fc_bytes_sent +|= chunk_len;
+    if (send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], stream_id)) |sbuf| {
+        sbuf.onSent(poll.offset, chunk_len);
+    }
+    connAttachStreamToLastAppPacket(conn, stream_id, poll.offset, @intCast(chunk_len), poll.fin);
+    conn.pacerConsume(pace_bytes);
+    return true;
+}
+
+fn emitStreamPollClient(
+    self: *Client,
+    stream_id: u64,
+    poll: send_buffer_mod.PollResult,
+) bool {
+    const chunk_len = poll.data.len;
+    if (!poll.retransmit) {
+        const stream_limit = self.conn.peerStreamSendLimit(stream_id, false);
+        if (stream_limit > 0 and poll.offset +| chunk_len > stream_limit) return false;
+        const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
+        if (projected > self.conn.fc_send_max) return false;
+    }
+    const pace_bytes: u64 = @intCast(if (chunk_len > 0) chunk_len else 1);
+    if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) return false;
+    if (!self.conn.ld.hasCapacity()) return false;
+
+    const sf = stream_frame_mod.StreamFrame{
+        .stream_id = stream_id,
+        .offset = poll.offset,
+        .data = poll.data,
+        .fin = poll.fin,
+        .has_length = true,
+    };
+    var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    const flen = sf.serialize(&frame_buf) catch return false;
+    var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+    const pkt_len = build1RttPacketFull(
+        &send_buf,
+        self.conn.remote_cid,
+        frame_buf[0..flen],
+        self.conn.app_pn,
+        &self.conn.app_client_km,
+        self.conn.key_phase_bit,
+        self.conn.packet_cipher,
+        self.conn.peer_grease_quic_bit,
+    ) catch return false;
+    const pn = self.conn.app_pn;
+    self.conn.app_pn += 1;
+    self.batchSend(send_buf[0..pkt_len]);
+    if (!poll.retransmit and chunk_len > 0) self.conn.fc_bytes_sent +|= chunk_len;
+    if (send_buffer_mod.findStreamSendSlot(self.conn.stream_send_slots[0..], stream_id)) |sbuf| {
+        sbuf.onSent(poll.offset, chunk_len);
+    }
+    self.conn.note1RttSent();
+    const recorded = self.conn.ld.onPacketSent(.{
+        .pn = pn,
+        .send_time_ms = @intCast(compat.milliTimestamp()),
+        .size = pkt_len,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .has_stream_data = chunk_len > 0 or poll.fin,
+        .stream_id = stream_id,
+        .stream_offset = poll.offset,
+        .stream_byte_len = @intCast(chunk_len),
+        .stream_data = null,
+        .stream_fin = poll.fin,
+        .space = .application,
+    });
+    if (recorded) {
+        self.conn.cc.onPacketSent(@intCast(pkt_len));
+        self.conn.pacerConsume(pace_bytes);
+    }
+    return recorded;
+}
+
 fn connCanTransmitAppData(conn: *ConnState, now_ms: i64, bytes: u64) bool {
     conn.pacerUpdate(now_ms);
     const pace_bytes = @min(bytes, congestion.mss);
@@ -1295,11 +1336,11 @@ fn connCanTransmitAppData(conn: *ConnState, now_ms: i64, bytes: u64) bool {
 }
 
 fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
-    if (conn.pending_stream_sends.items.len == 0) return;
+    if (!streamSendHasWork(conn)) return;
     const now_ms = compat.milliTimestamp();
     if (now_ms - conn.pending_stream_stall_warn_ms < 5000) return;
     conn.pacerUpdate(now_ms);
-    const head_bytes: u64 = @intCast(conn.pending_stream_sends.items[0].data.len);
+    const head_bytes: u64 = @intCast(conn.pending_stream_send_bytes);
     const pace_bytes = @min(head_bytes, congestion.mss);
     const block = connTransmitBlock(conn, pace_bytes) orelse return;
     conn.pending_stream_stall_warn_ms = now_ms;
@@ -1310,10 +1351,10 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     // (cong_events climbing) from ACK-clock starvation (acked flat) from
     // local-send-drop spurious loss (local_send_drops climbing).
     log.info(
-        "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
+        "io: {s} pending-stream-send drain stalled: {} streams, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
         .{
             side,
-            conn.pending_stream_sends.items.len,
+            streamSendActiveSlotCount(conn),
             conn.pending_stream_send_bytes,
             @tagName(block),
             conn.cc.getBytesInFlight(),
@@ -1358,6 +1399,7 @@ fn freePendingStreamSends(conn: *ConnState, allocator: std.mem.Allocator) void {
     }
     conn.pending_stream_sends.deinit(allocator);
     conn.pending_stream_sends = .empty;
+    freeStreamSendSlots(conn, allocator);
     conn.pending_stream_send_bytes = 0;
 }
 
@@ -1366,11 +1408,11 @@ fn warnPendingStreamSendQueueFull(conn: *ConnState, stream_id: u64, side: []cons
     if (now - conn.pending_stream_send_queue_full_warn_ms < 5000) return;
     conn.pending_stream_send_queue_full_warn_ms = now;
     const peer_lim = conn.peerStreamSendLimit(stream_id, std.mem.eql(u8, side, "server"));
-    log.warn("io: {s} pending-stream-send queue full ({} entries, {} bytes) on stream_id={}; backpressure. CC: cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={} fc_sent={} fc_max={} stream_lim={}\n", .{
-        side,                          conn.pending_stream_sends.items.len, conn.pending_stream_send_bytes, stream_id,
-        conn.cc.getCwnd(),             conn.cc.getSsthresh(),               @tagName(conn.cc.getState()),   conn.cc.getBytesInFlight(),
-        conn.cc.getCongestionEvents(), conn.cc.getTotalBytesAcked(),        conn.rtt.srtt_ms,               conn.rtt.min_rtt_ms,
-        conn.rtt.latest_rtt_ms,        conn.fc_bytes_sent,                  conn.fc_send_max,               peer_lim,
+    log.warn("io: {s} pending-stream-send queue full ({} streams, {} bytes) on stream_id={}; backpressure. CC: cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={} fc_sent={} fc_max={} stream_lim={}\n", .{
+        side,                          streamSendActiveSlotCount(conn), conn.pending_stream_send_bytes, stream_id,
+        conn.cc.getCwnd(),             conn.cc.getSsthresh(),           @tagName(conn.cc.getState()),   conn.cc.getBytesInFlight(),
+        conn.cc.getCongestionEvents(), conn.cc.getTotalBytesAcked(),    conn.rtt.srtt_ms,               conn.rtt.min_rtt_ms,
+        conn.rtt.latest_rtt_ms,        conn.fc_bytes_sent,              conn.fc_send_max,               peer_lim,
     });
 }
 
@@ -1785,6 +1827,10 @@ pub const ConnState = struct {
 
     /// Opaque application STREAM receive buffers (server: peer → us).
     raw_app_streams: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
+
+    /// Per-stream send buffers for raw-app egress (issue #184).
+    stream_send_slots: [send_buffer_mod.stream_send_slot_max]send_buffer_mod.StreamSendSlot =
+        [_]send_buffer_mod.StreamSendSlot{.{}} ** send_buffer_mod.stream_send_slot_max,
 
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
@@ -3177,166 +3223,58 @@ pub const Server = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return 0;
         }
-        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Without
-        // this, zquic can send STREAM payload past the peer's advertised
-        // MAX_DATA budget; the peer would then close with FLOW_CONTROL_ERROR
-        // (0x03).  Only the *original* byte range counts toward the
-        // cumulative limit; retransmits (owned_buf set) re-emit bytes
-        // already charged.
-        const is_fresh = owned_buf == null;
-        if (is_fresh) {
+        if (owned_buf) |buf| {
+            if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, buf, fin)) {
+                self.allocator.free(buf);
+                return 0;
+            }
+            self.drainPendingStreamSends(conn);
+            return data.len;
+        }
+        self.drainPendingStreamSendsUntilStalled(conn);
+        const stream_limit = conn.peerStreamSendLimit(stream_id, true);
+        const exceeds_stream = stream_limit > 0 and offset +| data.len > stream_limit;
+        const projected: u64 = conn.fc_bytes_sent +| data.len;
+        const exceeds_conn = projected > conn.fc_send_max;
+        if (exceeds_stream or exceeds_conn) {
+            if (exceeds_stream) {
+                dbg("io: server per-stream gate stream_id={} end={} limit={} — enqueueing pending + STREAM_DATA_BLOCKED\n", .{
+                    stream_id, offset + data.len, stream_limit,
+                });
+                var blk_buf: [24]u8 = undefined;
+                blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+                const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return 0;
+                const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return 0;
+                self.send1Rtt(conn, blk_buf[0 .. 1 + sid_enc.len + lim_enc.len], conn.peer);
+            }
+            if (exceeds_conn) {
+                dbg("io: server send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — enqueueing pending + DATA_BLOCKED\n", .{
+                    stream_id, data.len, conn.fc_bytes_sent, conn.fc_send_max,
+                });
+                var blk_buf: [16]u8 = undefined;
+                blk_buf[0] = 0x14;
+                const enc = varint.encode(blk_buf[1..], conn.fc_send_max) catch return 0;
+                self.send1Rtt(conn, blk_buf[0 .. 1 + enc.len], conn.peer);
+            }
+            return self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
+        }
+        const now_ms = compat.milliTimestamp();
+        const pace_bytes: u64 = @intCast(data.len);
+        if (!connCanTransmitAppData(conn, now_ms, pace_bytes)) {
             self.drainPendingStreamSendsUntilStalled(conn);
-            // Per-stream send-credit gate (RFC 9000 §4.1, §19.13). Compares
-            // the highest end-offset on this stream against the peer's
-            // advertised limit — initial §18.2 value, raised by any
-            // MAX_STREAM_DATA (0x11) frames the peer has sent since.
-            const stream_limit = conn.peerStreamSendLimit(stream_id, true);
-            const exceeds_stream = stream_limit > 0 and offset +| data.len > stream_limit;
-            const projected: u64 = conn.fc_bytes_sent +| data.len;
-            const exceeds_conn = projected > conn.fc_send_max;
-            if (exceeds_stream or exceeds_conn) {
-                if (exceeds_stream) {
-                    dbg("io: server per-stream gate stream_id={} end={} limit={} — enqueueing pending + STREAM_DATA_BLOCKED\n", .{
-                        stream_id, offset + data.len, stream_limit,
-                    });
-                    var blk_buf: [24]u8 = undefined;
-                    blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
-                    const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return 0;
-                    const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return 0;
-                    self.send1Rtt(conn, blk_buf[0 .. 1 + sid_enc.len + lim_enc.len], conn.peer);
-                }
-                if (exceeds_conn) {
-                    dbg("io: server send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — enqueueing pending + DATA_BLOCKED\n", .{
-                        stream_id, data.len, conn.fc_bytes_sent, conn.fc_send_max,
-                    });
-                    var blk_buf: [16]u8 = undefined;
-                    blk_buf[0] = 0x14;
-                    const enc = varint.encode(blk_buf[1..], conn.fc_send_max) catch return 0;
-                    self.send1Rtt(conn, blk_buf[0 .. 1 + enc.len], conn.peer);
-                }
-                // Queue the bytes so they go on the wire once the peer
-                // raises MAX_STREAM_DATA / MAX_DATA.  Returns 0 if the
-                // pending queue is full so the embedder retries instead
-                // of advancing its send_offset and punching a hole.
+            if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
                 return self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
             }
-            // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
-            const now_ms = compat.milliTimestamp();
-            const pace_bytes: u64 = @intCast(data.len);
-            if (!connCanTransmitAppData(conn, now_ms, pace_bytes)) {
-                self.drainPendingStreamSendsUntilStalled(conn);
-                if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
-                    return self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
-                }
-            }
-        } else if (owned_buf) |buf| {
-            const now_ms = compat.milliTimestamp();
-            if (!connCanTransmitAppData(conn, now_ms, @intCast(buf.len))) {
-                if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, buf, fin)) {
-                    self.allocator.free(buf);
-                }
-                return data.len;
-            }
         }
-        const sf = stream_frame_mod.StreamFrame{
-            .stream_id = stream_id,
-            .offset = offset,
-            .data = data,
-            .fin = fin,
-            .has_length = true,
-        };
-        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const flen = sf.serialize(&frame_buf) catch {
-            // Frame too big for one datagram (or some other serialize
-            // failure).  Re-queue as fresh send so a future drain pass
-            // can split it (see drainPendingStreamSends slicing).
-            if (owned_buf) |b| {
-                if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, b, fin)) {
-                    self.allocator.free(b);
-                }
-                return data.len;
-            }
-            return self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
-        };
-        const pn_before = conn.app_pn;
-        self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
-        // If send1Rtt actually emitted a packet, app_pn advanced.  Attach the
-        // retransmit buffer to the LD entry it just appended so the loss
-        // detector can replay this STREAM frame under a fresh PN on loss.
-        // `send1Rtt` only fails silently for `draining` — in that case
-        // app_pn does not move.  Treat as "not on wire": re-queue fresh
-        // bytes so the caller doesn't advance its offset, or free the
-        // owned retransmit buf if this was a replay path.
-        if (conn.app_pn == pn_before) {
-            if (owned_buf) |b| {
-                if (!enqueuePendingStreamSendOwned(conn, self.allocator, stream_id, offset, b, fin)) {
-                    self.allocator.free(b);
-                }
-                return data.len;
-            }
-            return self.serverEnqueueFreshStream(conn, stream_id, offset, data, fin);
+        if (!enqueuePendingStreamSend(conn, self.allocator, stream_id, offset, data, fin)) {
+            warnPendingStreamSendQueueFull(conn, stream_id, "server");
+            return 0;
         }
-        // Fresh STREAM bytes went on the wire — charge flow control even when
-        // the loss detector is full and we cannot attach a retransmit buffer.
-        if (is_fresh) conn.fc_bytes_sent +|= data.len;
-        if (conn.ld.sent_count == 0) {
-            if (owned_buf) |b| self.allocator.free(b);
-            if (is_fresh) conn.pacerConsume(@intCast(data.len));
-            return data.len;
-        }
-        const sent_pn = conn.app_pn - 1;
-        const last = &conn.ld.sent[conn.ld.sent_count - 1];
-        if (last.pn != sent_pn) {
-            if (owned_buf) |b| self.allocator.free(b);
-            if (is_fresh) conn.pacerConsume(@intCast(data.len));
-            return data.len;
-        }
-        // Zero-length STREAM frames (FIN-only stream closes) have nothing to
-        // retransmit.  `dupe(u8, &.{})` returns the allocator's zero-length
-        // sentinel slice (ptr 0xffff…, len 0); attaching and freeing it on
-        // ack/loss hands jemalloc a bogus pointer and segfaults.  (The prior
-        // `edata_list_inactive_remove` SIGSEGV referenced below was the same
-        // bug: two empty dupes share the sentinel ptr, so the alias guard
-        // skipped the free and left the sentinel attached to crash later in
-        // `onAck`.)  Carry such packets with no retransmit buffer.
-        const buf: ?[]u8 = if (owned_buf) |b| b else if (data.len == 0) null else (self.allocator.dupe(u8, data) catch {
-            // First send: copy the embedder-supplied data onto the heap so we
-            // own it until the carrying packet is acked (the embedder's slice
-            // typically points into a transient frame buffer).
-            if (is_fresh) conn.pacerConsume(@intCast(data.len));
-            return data.len;
-        });
-        if (buf) |b| {
-            // Defence-in-depth: free any pre-existing data so we don't leak if
-            // some unrelated path already attached one.  Guard against the
-            // alias case where `old.ptr == b.ptr` — without this, the retx
-            // path that passes the same slice as both `data` and `owned_buf`
-            // could free `b` and then immediately store the same dangling
-            // pointer, corrupting jemalloc's slab metadata once the buffer's
-            // slot is reused.
-            if (last.stream_data) |old| {
-                if (old.ptr != b.ptr) self.allocator.free(old);
-            }
-            last.has_stream_data = true;
-            last.stream_id = stream_id;
-            last.stream_offset = offset;
-            last.stream_data = b;
-            last.stream_fin = fin;
-        } else if (fin) {
-            // FIN-only frame (empty data): no retransmit buffer, but mark the
-            // packet so the loss arm re-sends the bare FIN if it is lost (the
-            // raw-app retransmit loop gates on `has_stream_data`).
-            last.has_stream_data = true;
-            last.stream_id = stream_id;
-            last.stream_offset = offset;
-            last.stream_data = null;
-            last.stream_fin = true;
-        }
-        if (is_fresh) conn.pacerConsume(@intCast(data.len));
+        self.drainPendingStreamSends(conn);
         return data.len;
     }
 
-    /// Try to put queued raw STREAM bytes (`pending_stream_sends`) on the
+    /// Try to put queued raw STREAM bytes (per-stream `SendBuffer`) on the
     /// wire, honoring the same per-stream + connection-level flow-control
     /// gates as the initial submission.  Called whenever the peer raises
     /// MAX_DATA / MAX_STREAM_DATA, and on every `checkPto` tick as a
@@ -3346,98 +3284,25 @@ pub const Server = struct {
     /// `sendRawStreamDataInner`.
     fn drainPendingStreamSends(self: *Server, conn: *ConnState) void {
         if (conn.draining or conn.phase != .connected or !conn.has_app_keys) return;
-        if (conn.pending_stream_sends.items.len == 0) return;
-        var i: usize = 0;
+        if (!streamSendHasWork(conn)) return;
         var drained: usize = 0;
-        while (i < conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
-            const p = &conn.pending_stream_sends.items[i];
-            const unsent = p.data.len - p.sent_in_buf;
-            const chunk_len = @min(unsent, max_pending_stream_chunk);
-            const stream_limit = conn.peerStreamSendLimit(p.stream_id, true);
-            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
-                i += 1;
-                continue;
+        for (&conn.stream_send_slots) |*slot| {
+            if (!slot.active) continue;
+            while (drained < max_pending_drain_per_call) {
+                const poll = slot.buf.pollTransmit(max_pending_stream_chunk) orelse break;
+                if (!emitStreamPollServer(self, conn, slot.stream_id, poll)) {
+                    maybeLogPendingStreamStall(conn, "server");
+                    conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
+                    return;
+                }
+                drained += 1;
             }
-            const projected: u64 = conn.fc_bytes_sent +| chunk_len;
-            if (projected > conn.fc_send_max) {
-                i += 1;
-                continue;
-            }
-            const pace_bytes: u64 = @intCast(chunk_len);
-            if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
-                maybeLogPendingStreamStall(conn, "server");
+            if (drained >= max_pending_drain_per_call) {
+                conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
                 return;
             }
-            const stream_id = p.stream_id;
-            const offset = p.offset;
-            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
-            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
-            const sf = stream_frame_mod.StreamFrame{
-                .stream_id = stream_id,
-                .offset = offset,
-                .data = chunk,
-                .fin = fin,
-                .has_length = true,
-            };
-            var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const flen = sf.serialize(&frame_buf) catch {
-                i += 1;
-                continue;
-            };
-            const pn_before = conn.app_pn;
-            self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
-            if (conn.app_pn == pn_before) return;
-            conn.fc_bytes_sent +|= chunk_len;
-            drained += 1;
-            if (conn.ld.sent_count == 0) {
-                p.sent_in_buf += chunk_len;
-                p.offset += chunk_len;
-                conn.pending_stream_send_bytes -|= chunk_len;
-                if (p.sent_in_buf == p.data.len) {
-                    const buf = p.data;
-                    _ = conn.pending_stream_sends.orderedRemove(i);
-                    if (buf.len > 0) self.allocator.free(buf);
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            const sent_pn = conn.app_pn - 1;
-            const last = &conn.ld.sent[conn.ld.sent_count - 1];
-            if (last.pn != sent_pn) {
-                i += 1;
-                continue;
-            }
-            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
-            // Never dupe an empty chunk: that yields the allocator's zero-length
-            // sentinel slice, which freeing on ack/loss corrupts the heap. Track
-            // with no stream_data; a lost bare FIN is re-emitted by the FIN-only
-            // loss-recovery arm.
-            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
-                i += 1;
-                continue;
-            });
-            if (last.stream_data) |old| {
-                if (rtx_buf == null or old.ptr != rtx_buf.?.ptr) self.allocator.free(old);
-            }
-            last.has_stream_data = rtx_buf != null;
-            last.stream_id = stream_id;
-            last.stream_offset = offset;
-            last.stream_data = rtx_buf;
-            last.stream_fin = fin;
-            conn.pacerConsume(@intCast(chunk_len));
-            p.sent_in_buf += chunk_len;
-            p.offset += chunk_len;
-            conn.pending_stream_send_bytes -|= chunk_len;
-            if (p.sent_in_buf == p.data.len) {
-                const buf = p.data;
-                _ = conn.pending_stream_sends.orderedRemove(i);
-                if (buf.len > 0) self.allocator.free(buf);
-            } else {
-                i += 1;
-            }
         }
+        conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
     }
 
     pub fn deinit(self: *Server) void {
@@ -3970,6 +3835,7 @@ pub const Server = struct {
                     @intCast(now_ms),
                     &conn.rtt,
                     &lost_buf,
+                    &[_]recovery.StreamAck{},
                     self.allocator,
                 )) |_| {
                     noteConnAckInSpace(conn, .initial, now_ms);
@@ -4800,6 +4666,7 @@ pub const Server = struct {
                     @intCast(now_ms),
                     &conn.rtt,
                     &lost_buf,
+                    &[_]recovery.StreamAck{},
                     self.allocator,
                 )) |_| {
                     noteConnAckInSpace(conn, .handshake, now_ms);
@@ -5326,6 +5193,7 @@ pub const Server = struct {
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
                 var lost_buf: [32]recovery.SentPacket = undefined;
+                var acked_stream_buf: [64]recovery.StreamAck = undefined;
                 const ld_result = conn.ld.onAck(
                     .application,
                     largest_ack,
@@ -5334,6 +5202,7 @@ pub const Server = struct {
                     @intCast(compat.milliTimestamp()),
                     &conn.rtt,
                     &lost_buf,
+                    acked_stream_buf[0..],
                     self.allocator,
                 ) catch {
                     // Malformed ACK (e.g. first_ack_range > largest_acked) —
@@ -5348,6 +5217,7 @@ pub const Server = struct {
                 if (ld_result.bytes_acked > 0) {
                     conn.cc.onAck(ld_result.bytes_acked, largest_ack);
                 }
+                applyStreamAcks(conn, self.allocator, acked_stream_buf[0..ld_result.acked_stream_count]);
                 conn.noteLossFromAck(ld_result.lost_count, ld_result.lost_bytes);
                 if (conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
@@ -5481,11 +5351,14 @@ pub const Server = struct {
                             break;
                         }
                         // raw_application_streams: zquic is the data source.
-                        // The lost packet carries a heap-owned plaintext copy
-                        // of the STREAM payload in `lp.stream_data`; re-send
-                        // it via `sendRawStreamDataInner` so the bytes get a
-                        // fresh PN and the new SentPacket adopts the buffer.
-                        if (lp.stream_data) |buf| {
+                        // Per-stream `SendBuffer` holds plaintext; mark the lost
+                        // range and drain narrow retransmits (issue #184).
+                        if (lp.stream_byte_len > 0 and lp.stream_data == null) {
+                            if (send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], lp.stream_id)) |sbuf| {
+                                sbuf.onLoss(self.allocator, lp.stream_offset, lp.stream_byte_len) catch {};
+                            }
+                            self.drainPendingStreamSends(conn);
+                        } else if (lp.stream_data) |buf| {
                             // Retransmissions are subject to the congestion
                             // window (RFC 9002 §6.2.4 / §7).  When cwnd has room
                             // resend immediately; otherwise queue the frame so
@@ -6238,7 +6111,7 @@ pub const Server = struct {
                 const has_substantial_data_stuck =
                     conn.cc.getBytesInFlight() >= 1024 or
                     conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
-                    conn.pending_stream_sends.items.len > 0;
+                    streamSendHasWork(conn);
                 if (elapsed_since_ack_lost >= lost_threshold_ms and has_substantial_data_stuck) {
                     log.warn("io: server declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); sent={} acked={} lost={} cong_events={} cwnd={} ssthresh={} srtt_ms={} marking draining", .{
                         elapsed_since_ack_lost,
@@ -6246,7 +6119,7 @@ pub const Server = struct {
                         conn.cc.getBytesInFlight(),
                         conn.ld.sent_count,
                         recovery.LossDetector.max_tracked_packets,
-                        conn.pending_stream_sends.items.len,
+                        streamSendActiveSlotCount(conn),
                         conn.app_pn,
                         conn.cc.getTotalBytesAcked(),
                         conn.ld.total_declared_lost,
@@ -7826,6 +7699,7 @@ pub fn rawAppStreamFullyReceived(conn: *ConnState, stream_id: u64) bool {
 /// on that stream from being reassembled, so prefer to gate on
 /// `rawAppStreamFinReceived`.
 pub fn releaseRawAppStream(conn: *ConnState, stream_id: u64, allocator: std.mem.Allocator) bool {
+    send_buffer_mod.releaseStreamSendSlot(conn.stream_send_slots[0..], allocator, stream_id);
     for (&conn.raw_app_streams) |*slot| {
         if (slot.active and slot.stream_id == stream_id) {
             slot.deinit(allocator);
@@ -8451,286 +8325,84 @@ pub const Client = struct {
             if (owned_buf) |b| self.allocator.free(b);
             return 0;
         }
-        // Connection-level send-credit gate (RFC 9000 §4.1 / §19.9).  Mirror
-        // of Server.sendRawStreamDataInner.  Retransmits (owned_buf set)
-        // bypass the gate because their byte range was already charged on
-        // the original send.
-        const is_fresh = owned_buf == null;
-        if (is_fresh) {
+        if (owned_buf) |buf| {
+            if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
+                self.allocator.free(buf);
+                return 0;
+            }
+            self.drainPendingStreamSends();
+            return data.len;
+        }
+        self.drainPendingStreamSendsUntilStalled();
+        const stream_limit = self.conn.peerStreamSendLimit(stream_id, false);
+        const exceeds_stream = stream_limit > 0 and offset +| data.len > stream_limit;
+        const projected: u64 = self.conn.fc_bytes_sent +| data.len;
+        const exceeds_conn = projected > self.conn.fc_send_max;
+        if (exceeds_stream or exceeds_conn) {
+            if (exceeds_stream) {
+                dbg("io: client per-stream gate stream_id={} end={} limit={} — enqueueing pending + STREAM_DATA_BLOCKED\n", .{
+                    stream_id, offset + data.len, stream_limit,
+                });
+                var blk_buf: [24]u8 = undefined;
+                blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+                const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return 0;
+                const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return 0;
+                const blk_frame = blk_buf[0 .. 1 + sid_enc.len + lim_enc.len];
+                _ = self.sendClient1Rtt(blk_frame);
+            }
+            if (exceeds_conn) {
+                dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — enqueueing pending + DATA_BLOCKED\n", .{
+                    stream_id, data.len, self.conn.fc_bytes_sent, self.conn.fc_send_max,
+                });
+                var blk_buf: [16]u8 = undefined;
+                blk_buf[0] = 0x14;
+                const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return 0;
+                _ = self.sendClient1Rtt(blk_buf[0 .. 1 + enc.len]);
+            }
+            return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
+        }
+        const now_ms = compat.milliTimestamp();
+        const pace_bytes: u64 = @intCast(data.len);
+        if (!connCanTransmitAppData(&self.conn, now_ms, pace_bytes)) {
             self.drainPendingStreamSendsUntilStalled();
-            // Per-stream + connection-level send-credit gates (RFC 9000
-            // §4.1, §19.9, §19.13).  Mirrors the server-side gate.  On
-            // failure we enqueue the bytes instead of silently dropping
-            // them — see Server.sendRawStreamDataInner for the rationale
-            // and the original-bug analysis in
-            // CHANGELOG.md (entry for v1.7.0 "buffer flow-control-blocked
-            // raw stream sends").
-            const stream_limit = self.conn.peerStreamSendLimit(stream_id, false);
-            const exceeds_stream = stream_limit > 0 and offset +| data.len > stream_limit;
-            const projected: u64 = self.conn.fc_bytes_sent +| data.len;
-            const exceeds_conn = projected > self.conn.fc_send_max;
-            if (exceeds_stream or exceeds_conn) {
-                if (exceeds_stream) {
-                    dbg("io: client per-stream gate stream_id={} end={} limit={} — enqueueing pending + STREAM_DATA_BLOCKED\n", .{
-                        stream_id, offset + data.len, stream_limit,
-                    });
-                    var blk_buf: [24]u8 = undefined;
-                    blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
-                    const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return 0;
-                    const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], stream_limit) catch return 0;
-                    const blk_frame = blk_buf[0 .. 1 + sid_enc.len + lim_enc.len];
-                    _ = self.sendClient1Rtt(blk_frame);
-                }
-                if (exceeds_conn) {
-                    dbg("io: client send-credit gate stream_id={} bytes={} fc_bytes_sent={} fc_send_max={} — enqueueing pending + DATA_BLOCKED\n", .{
-                        stream_id, data.len, self.conn.fc_bytes_sent, self.conn.fc_send_max,
-                    });
-                    var blk_buf: [16]u8 = undefined;
-                    blk_buf[0] = 0x14;
-                    const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return 0;
-                    _ = self.sendClient1Rtt(blk_buf[0 .. 1 + enc.len]);
-                }
+            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
                 return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
             }
-            // Congestion + pacer + loss-detector gate (quinn `poll_transmit`).
-            const now_ms = compat.milliTimestamp();
-            const pace_bytes: u64 = @intCast(data.len);
-            if (!connCanTransmitAppData(&self.conn, now_ms, pace_bytes)) {
-                self.drainPendingStreamSendsUntilStalled();
-                if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
-                    return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
-                }
-            }
-        } else if (owned_buf) |buf| {
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), @intCast(buf.len))) {
-                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
-                    self.allocator.free(buf);
-                }
-                return data.len;
-            }
         }
-        return self.clientSendRawStreamFrame(stream_id, offset, data, fin, owned_buf);
-    }
-
-    /// Build and send one STREAM frame on 1-RTT (shared by fresh send and
-    /// after CC drain retry).  Returns bytes accepted on success.
-    fn clientSendRawStreamFrame(
-        self: *Client,
-        stream_id: u64,
-        offset: u64,
-        data: []const u8,
-        fin: bool,
-        owned_buf: ?[]u8,
-    ) usize {
-        const is_fresh = owned_buf == null;
-        if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), @intCast(data.len))) {
-            if (is_fresh) return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
-            if (owned_buf) |buf| {
-                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
-                    self.allocator.free(buf);
-                }
-                return data.len;
-            }
+        if (!enqueuePendingStreamSend(&self.conn, self.allocator, stream_id, offset, data, fin)) {
+            warnPendingStreamSendQueueFull(&self.conn, stream_id, "client");
             return 0;
         }
-        const sf = stream_frame_mod.StreamFrame{
-            .stream_id = stream_id,
-            .offset = offset,
-            .data = data,
-            .fin = fin,
-            .has_length = true,
-        };
-        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const flen = sf.serialize(&frame_buf) catch {
-            if (owned_buf) |b| self.allocator.free(b);
-            return 0;
-        };
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacketFull(
-            &send_buf,
-            self.conn.remote_cid,
-            frame_buf[0..flen],
-            self.conn.app_pn,
-            &self.conn.app_client_km,
-            self.conn.key_phase_bit,
-            self.conn.packet_cipher,
-            self.conn.peer_grease_quic_bit,
-        ) catch {
-            if (owned_buf) |b| self.allocator.free(b);
-            return 0;
-        };
-        if (!self.conn.ld.hasCapacity()) {
-            if (is_fresh) return self.clientEnqueueFreshStream(stream_id, offset, data, fin);
-            if (owned_buf) |buf| {
-                if (!enqueuePendingStreamSendOwned(&self.conn, self.allocator, stream_id, offset, buf, fin)) {
-                    self.allocator.free(buf);
-                }
-                return data.len;
-            }
-            return 0;
-        }
-        const pn = self.conn.app_pn;
-        self.conn.app_pn += 1;
-        // Batched send (sendmmsg at the next flush); the datagram is copied into
-        // the batch so `send_buf` may be reused immediately. Loss recovery still
-        // tracks the packet for retransmit exactly as the immediate-send path did.
-        self.batchSend(send_buf[0..pkt_len]);
-        // Charge fresh-send bytes against the connection-level limit.
-        if (is_fresh) self.conn.fc_bytes_sent +|= data.len;
-
-        // Track for retransmit.  See Server.sendRawStreamDataInner for the
-        // ownership-transfer protocol; the Client mirrors it.
-        //
-        // Zero-length STREAM frames (FIN-only — every libp2p stream close sends
-        // `sendRawStreamData(.., &[_]u8{}, true)`) have nothing to retransmit.
-        // `dupe(u8, &.{})` returns the allocator's zero-length sentinel slice
-        // (ptr 0xffff…, len 0); tracking it and freeing it on ack/loss hands
-        // jemalloc a bogus pointer and segfaults (`arena_dalloc_large`).  Carry
-        // such packets with no retransmit buffer instead.
-        const buf: ?[]u8 = if (owned_buf) |b| b else if (data.len == 0) null else (self.allocator.dupe(u8, data) catch return 0);
-        self.conn.note1RttSent();
-        const recorded = self.conn.ld.onPacketSent(.{
-            .pn = pn,
-            .send_time_ms = @intCast(compat.milliTimestamp()),
-            .size = pkt_len,
-            .ack_eliciting = true,
-            .in_flight = true,
-            .has_stream_data = buf != null,
-            .stream_id = stream_id,
-            .stream_offset = offset,
-            .stream_data = buf,
-            .stream_fin = fin,
-            .space = .application,
-        });
-        // Mirror Server.send1Rtt: only count toward bytes_in_flight when the
-        // loss detector is tracking the packet.  Without this, checkPto
-        // branch 1 (cc.getBytesInFlight() > 0) never fires, tail losses on
-        // the outbound client path are not PTO-probed, and quinn peers wedge
-        // on undelivered gossip STREAM frames.
-        if (recorded) {
-            self.conn.cc.onPacketSent(@intCast(pkt_len));
-            if (is_fresh) self.conn.pacerConsume(@intCast(pkt_len));
-        }
-        if (!recorded) {
-            // LD full — caller's data has already gone on the wire; we just
-            // can't retransmit it on loss.  Free the buffer to avoid the leak.
-            if (buf) |b| self.allocator.free(b);
-        }
+        self.drainPendingStreamSends();
         return data.len;
     }
 
-    /// Try to put queued raw STREAM bytes (`pending_stream_sends`) on the
+    /// Try to put queued raw STREAM bytes (per-stream `SendBuffer`) on the
     /// wire, honoring the same per-stream + connection-level flow-control
     /// gates as the initial submission.  Mirrors
     /// `Server.drainPendingStreamSends`; see that function for the
     /// design notes.
     fn drainPendingStreamSends(self: *Client) void {
         if (self.conn.draining or self.conn.phase != .connected or !self.conn.has_app_keys) return;
-        if (self.conn.pending_stream_sends.items.len == 0) return;
-        var i: usize = 0;
+        if (!streamSendHasWork(&self.conn)) return;
         var drained: usize = 0;
-        while (i < self.conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
-            const p = &self.conn.pending_stream_sends.items[i];
-            const unsent = p.data.len - p.sent_in_buf;
-            const chunk_len = @min(unsent, max_pending_stream_chunk);
-            const stream_limit = self.conn.peerStreamSendLimit(p.stream_id, false);
-            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
-                i += 1;
-                continue;
+        for (&self.conn.stream_send_slots) |*slot| {
+            if (!slot.active) continue;
+            while (drained < max_pending_drain_per_call) {
+                const poll = slot.buf.pollTransmit(max_pending_stream_chunk) orelse break;
+                if (!emitStreamPollClient(self, slot.stream_id, poll)) {
+                    maybeLogPendingStreamStall(&self.conn, "client");
+                    self.conn.pending_stream_send_bytes = streamSendQueuedBytes(&self.conn);
+                    return;
+                }
+                drained += 1;
             }
-            const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
-            if (projected > self.conn.fc_send_max) {
-                i += 1;
-                continue;
-            }
-            const pace_bytes: u64 = @intCast(chunk_len);
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
-                maybeLogPendingStreamStall(&self.conn, "client");
+            if (drained >= max_pending_drain_per_call) {
+                self.conn.pending_stream_send_bytes = streamSendQueuedBytes(&self.conn);
                 return;
-            }
-            const stream_id = p.stream_id;
-            const offset = p.offset;
-            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
-            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
-            const sf = stream_frame_mod.StreamFrame{
-                .stream_id = stream_id,
-                .offset = offset,
-                .data = chunk,
-                .fin = fin,
-                .has_length = true,
-            };
-            var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const flen = sf.serialize(&frame_buf) catch {
-                i += 1;
-                continue;
-            };
-            if (!self.conn.ld.hasCapacity()) {
-                maybeLogPendingStreamStall(&self.conn, "client");
-                return;
-            }
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                frame_buf[0..flen],
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.packet_cipher,
-                self.conn.peer_grease_quic_bit,
-            ) catch {
-                i += 1;
-                continue;
-            };
-            const pn = self.conn.app_pn;
-            self.conn.app_pn += 1;
-            // Batched 1-RTT send (sendmmsg at the next flush). This is the
-            // deferred-stream / retransmit drain — the hottest client send path
-            // when forwarding gossip under backpressure.
-            self.batchSend(send_buf[0..pkt_len]);
-            self.conn.fc_bytes_sent +|= chunk_len;
-            self.conn.note1RttSent();
-            drained += 1;
-            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
-            // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
-            // allocator's zero-length sentinel slice, which freeing on ack/loss
-            // corrupts the heap. Track with no stream_data; a lost bare FIN is
-            // re-emitted by the FIN-only loss-recovery arm.
-            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
-                i += 1;
-                continue;
-            });
-            const recorded = self.conn.ld.onPacketSent(.{
-                .pn = pn,
-                .send_time_ms = @intCast(compat.milliTimestamp()),
-                .size = pkt_len,
-                .ack_eliciting = true,
-                .in_flight = true,
-                .has_stream_data = rtx_buf != null,
-                .stream_id = stream_id,
-                .stream_offset = offset,
-                .stream_data = rtx_buf,
-                .stream_fin = fin,
-                .space = .application,
-            });
-            if (recorded) {
-                self.conn.cc.onPacketSent(@intCast(pkt_len));
-                self.conn.pacerConsume(@intCast(pkt_len));
-            } else if (rtx_buf) |b| {
-                self.allocator.free(b);
-            }
-            p.sent_in_buf += chunk_len;
-            p.offset += chunk_len;
-            self.conn.pending_stream_send_bytes -|= chunk_len;
-            if (p.sent_in_buf == p.data.len) {
-                const buf = p.data;
-                _ = self.conn.pending_stream_sends.orderedRemove(i);
-                if (buf.len > 0) self.allocator.free(buf);
-            } else {
-                i += 1;
             }
         }
+        self.conn.pending_stream_send_bytes = streamSendQueuedBytes(&self.conn);
     }
 
     /// RFC 8899: probe a larger UDP payload when PLPMTUD state allows it.
@@ -8862,7 +8534,7 @@ pub const Client = struct {
         const has_substantial_data_stuck =
             self.conn.cc.getBytesInFlight() >= 1024 or
             self.conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
-            self.conn.pending_stream_sends.items.len > 0;
+            streamSendHasWork(&self.conn);
         if (self.conn.phase == .connected and
             elapsed_since_ack >= lost_threshold_ms and has_substantial_data_stuck)
         {
@@ -8872,7 +8544,7 @@ pub const Client = struct {
                 self.conn.cc.getBytesInFlight(),
                 self.conn.ld.sent_count,
                 recovery.LossDetector.max_tracked_packets,
-                self.conn.pending_stream_sends.items.len,
+                streamSendActiveSlotCount(&self.conn),
                 self.conn.app_pn,
                 self.conn.cc.getTotalBytesAcked(),
                 self.conn.ld.total_declared_lost,
@@ -8967,6 +8639,7 @@ pub const Client = struct {
 
     /// Mirror of the connection-level `releaseRawAppStream`.
     pub fn releaseRawAppStream(self: *Client, stream_id: u64) bool {
+        send_buffer_mod.releaseStreamSendSlot(self.conn.stream_send_slots[0..], self.allocator, stream_id);
         for (&self.raw_app_recv) |*slot| {
             if (slot.active and slot.stream_id == stream_id) {
                 slot.deinit(self.allocator);
@@ -9769,6 +9442,7 @@ pub const Client = struct {
                     @intCast(now_ms),
                     &self.conn.rtt,
                     &lost_buf,
+                    &[_]recovery.StreamAck{},
                     self.allocator,
                 )) |_| {
                     noteConnAckInSpace(&self.conn, .initial, now_ms);
@@ -9886,6 +9560,7 @@ pub const Client = struct {
                     @intCast(now_ms),
                     &self.conn.rtt,
                     &lost_buf,
+                    &[_]recovery.StreamAck{},
                     self.allocator,
                 )) |_| {
                     noteConnAckInSpace(&self.conn, .handshake, now_ms);
@@ -10127,6 +9802,7 @@ pub const Client = struct {
                 const first_ack_range = fst_r.value;
 
                 var lost_buf: [32]recovery.SentPacket = undefined;
+                var acked_stream_buf: [64]recovery.StreamAck = undefined;
                 const ld_result = self.conn.ld.onAck(
                     .application,
                     largest_ack,
@@ -10135,12 +9811,14 @@ pub const Client = struct {
                     @intCast(compat.milliTimestamp()),
                     &self.conn.rtt,
                     &lost_buf,
+                    acked_stream_buf[0..],
                     self.allocator,
                 ) catch {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
                 if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked, largest_ack);
+                applyStreamAcks(&self.conn, self.allocator, acked_stream_buf[0..ld_result.acked_stream_count]);
                 self.conn.noteLossFromAck(ld_result.lost_count, ld_result.lost_bytes);
                 if (self.conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
@@ -10185,7 +9863,12 @@ pub const Client = struct {
                             self.conn.syncPathMtuFields();
                         }
                     }
-                    if (lp.stream_data) |sbuf| {
+                    if (lp.stream_byte_len > 0 and lp.stream_data == null) {
+                        if (send_buffer_mod.findStreamSendSlot(self.conn.stream_send_slots[0..], lp.stream_id)) |sbuf| {
+                            sbuf.onLoss(self.allocator, lp.stream_offset, lp.stream_byte_len) catch {};
+                        }
+                        self.drainPendingStreamSends();
+                    } else if (lp.stream_data) |sbuf| {
                         const rtx_bytes: u64 = @intCast(sbuf.len);
                         if (connCanTransmitAppData(&self.conn, compat.milliTimestamp(), rtx_bytes)) {
                             _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, sbuf, lp.stream_fin, sbuf);
@@ -11774,51 +11457,40 @@ test "seedLocalRecvWindows: libp2p preset" {
 test "pending stream send: contiguous enqueues coalesce on same stream" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // Sequential gossipsub chunks on one stream append to the tail entry
-    // instead of consuming one slot per chunk.
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, "aaaa", false));
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 4, "bbbb", false));
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 8, "cccc", true));
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_sends.items.len);
+    const sbuf = send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], 4).?;
+    try std.testing.expectEqual(@as(usize, 1), sbuf.segments.items.len);
     try std.testing.expectEqual(@as(usize, 12), conn.pending_stream_send_bytes);
-    try std.testing.expectEqual(@as(u64, 0), conn.pending_stream_sends.items[0].offset);
-    try std.testing.expectEqualSlices(u8, "aaaabbbbcccc", conn.pending_stream_sends.items[0].data);
-    try std.testing.expect(conn.pending_stream_sends.items[0].fin);
+    try std.testing.expectEqual(@as(u64, 0), sbuf.segments.items[0].offset);
+    try std.testing.expectEqualSlices(u8, "aaaabbbbcccc", sbuf.segments.items[0].data);
+    try std.testing.expect(sbuf.fin_at != null);
 }
 
 test "pending stream send: FIN-only frame rides out on the last queued frame" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // A large response's payload is backpressured in the queue; the trailing
-    // half-close (0-byte FIN) must attach to the last queued frame for that
-    // stream rather than be dropped — otherwise the peer never sees the FIN
-    // and the response never completes (gap-offsets prevent coalescing).
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, "aaaa", false));
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 100, "bbbb", false));
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_stream_sends.items.len);
-    try std.testing.expect(!conn.pending_stream_sends.items[1].fin);
+    const sbuf = send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], 4).?;
+    try std.testing.expectEqual(@as(usize, 2), sbuf.segments.items.len);
+    try std.testing.expect(sbuf.fin_at == null);
 
-    // FIN-only at the end offset: no new entry, FIN set on the last frame.
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 104, &.{}, true));
-    try std.testing.expectEqual(@as(usize, 2), conn.pending_stream_sends.items.len);
-    try std.testing.expect(conn.pending_stream_sends.items[1].fin);
-    try std.testing.expect(!conn.pending_stream_sends.items[0].fin);
+    try std.testing.expectEqual(@as(usize, 2), sbuf.segments.items.len);
+    try std.testing.expectEqual(@as(?u64, 104), sbuf.fin_at);
+    try std.testing.expect(sbuf.segments.items[0].offset == 0);
 }
 
-test "pending stream send: cap rejects past per-conn entry budget" {
+test "pending stream send: cap rejects past per-stream slot budget" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // Fill to the per-conn entry cap with tiny payloads so we hit the
-    // entry-count limit (not the byte limit).  Use gaps in offset so
-    // coalescing does not collapse the entries.
     var i: usize = 0;
-    while (i < pending_stream_send_cap) : (i += 1) {
-        try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
+    while (i < send_buffer_mod.stream_send_slot_max) : (i += 1) {
+        try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, @intCast(i * 4), 0, "x", false));
     }
-    // One more must fail; the caller is expected to mark the conn
-    // draining so the embedder reconnects (silently dropping would
-    // corrupt the stream offset).
-    try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
+    try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, @intCast(i * 4), 0, "x", false));
 }
 
 test "pending stream send (owned): false return leaves `owned` to the caller (no double-free)" {
@@ -11833,32 +11505,29 @@ test "pending stream send (owned): false return leaves `owned` to the caller (no
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, a);
 
-    // Fill to the per-conn entry cap so the next owned-enqueue hits the
-    // queue-full false path.
+    // Fill all per-stream send slots so the next enqueue hits the slot cap.
     var i: usize = 0;
-    while (i < pending_stream_send_cap) : (i += 1) {
-        try std.testing.expect(enqueuePendingStreamSend(&conn, a, 4, @intCast(i * 2), "x", false));
+    while (i < send_buffer_mod.stream_send_slot_max) : (i += 1) {
+        try std.testing.expect(enqueuePendingStreamSend(&conn, a, @intCast(i * 4), 0, "x", false));
     }
 
-    // Exercise the OWNED variant on the full queue exactly as the callers do.
     const owned = try a.dupe(u8, "retransmit-me");
-    const queued = enqueuePendingStreamSendOwned(&conn, a, 4, 10_000_000, owned, false);
+    const queued = enqueuePendingStreamSendOwned(&conn, a, @intCast(i * 4), 0, owned, false);
     try std.testing.expect(!queued); // full → false
     if (!queued) a.free(owned); // single, correct free — NOT a double-free
 }
 
-test "pending stream send: oversized write stored as single entry (split at drain)" {
+test "pending stream send: oversized write stored as single segment (split at drain)" {
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, std.testing.allocator);
-    // Large writes are kept as one queue entry; `drainPendingStreamSends`
-    // slices at packet-build time instead of fanning out on enqueue.
     const big = try std.testing.allocator.alloc(u8, max_pending_stream_chunk * 4 + 100);
     defer std.testing.allocator.free(big);
     @memset(big, 0xaa);
     try std.testing.expect(enqueuePendingStreamSend(&conn, std.testing.allocator, 4, 0, big, true));
-    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_sends.items.len);
-    try std.testing.expectEqual(@as(usize, big.len), conn.pending_stream_sends.items[0].data.len);
-    try std.testing.expect(conn.pending_stream_sends.items[0].fin);
+    const sbuf = send_buffer_mod.findStreamSendSlot(conn.stream_send_slots[0..], 4).?;
+    try std.testing.expectEqual(@as(usize, 1), sbuf.segments.items.len);
+    try std.testing.expectEqual(@as(usize, big.len), sbuf.segments.items[0].data.len);
+    try std.testing.expect(sbuf.fin_at != null);
 }
 
 test "AppAckTracker: adjacent ranges coalesce and serialize without integer overflow" {
@@ -12043,7 +11712,7 @@ test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
     try std.testing.expectEqual(@as(u64, @intCast(pkt_len)), conn.cc.getBytesInFlight());
 
     var lost_buf: [8]recovery.SentPacket = undefined;
-    const ld_result = try conn.ld.onAck(.application, pn, 0, 0, 1000, &conn.rtt, &lost_buf, std.testing.allocator);
+    const ld_result = try conn.ld.onAck(.application, pn, 0, 0, 1000, &conn.rtt, &lost_buf, &[_]recovery.StreamAck{}, std.testing.allocator);
     if (ld_result.bytes_acked > 0) conn.cc.onAck(ld_result.bytes_acked, pn);
     try std.testing.expectEqual(@as(u64, 0), conn.cc.getBytesInFlight());
 }
@@ -12615,7 +12284,7 @@ test "raw-app server-initiated bidi: CLIENT separate empty-FIN survives a pacer-
     // 3. Submit the SEPARATE empty FIN while the pacer is drained — this is the
     //    flake window. The data frame already went on the wire, so
     //    `pending_stream_sends` is empty for this stream.
-    try std.testing.expectEqual(@as(usize, 0), lb.client.conn.pending_stream_sends.items.len);
+    try std.testing.expect(!streamSendHasWork(&lb.client.conn));
     lb.client.conn.pacing_tokens = 0;
     lb.client.conn.pacing_last_ms = compat.milliTimestamp();
     _ = lb.client.sendRawStreamData(sid, response.len, &[_]u8{}, true);
