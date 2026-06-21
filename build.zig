@@ -4,21 +4,32 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const verbose = b.option(bool, "verbose", "Enable verbose debug output") orelse false;
+    // Shadow simulator (https://shadow.github.io) intercepts at the libc layer
+    // via LD_PRELOAD; it cannot inject into the default pure-Zig Linux build
+    // which uses raw `std.os.linux.*` syscalls and links no libc. When
+    // -Dshadow=true, force libc linkage on Linux so `compat.zig` routes time /
+    // random / network calls through libc, and disable the `sendmmsg(2)` /
+    // `recvmmsg(2)` batched-I/O path (Shadow's shim only handles single-syscall
+    // I/O). See `docs/shadow.md` and #216.
+    const shadow = b.option(bool, "shadow", "Build for the Shadow network simulator (forces libc on Linux, disables batched I/O)") orelse false;
 
     // src/compat.zig restores the std-library bits that 0.16 deleted by
     // dispatching directly to raw syscalls on Linux (no libc) and to libc on
     // Darwin (where there is no stable kernel ABI).  Apple platforms must
     // therefore link libc; Linux deliberately does not, keeping zquic a
-    // pure-Zig binary on that target.
+    // pure-Zig binary on that target. The `-Dshadow=true` build flag overrides
+    // the Linux branch to link libc (Shadow's shim requires it).
     const tag = target.result.os.tag;
     const needs_libc: bool = switch (tag) {
         .macos, .ios, .tvos, .watchos, .visionos, .driverkit => true,
+        .linux => shadow,
         else => false,
     };
 
     // Build-options module (verbose flag accessible as @import("build_options").verbose)
     const opts = b.addOptions();
     opts.addOption(bool, "verbose", verbose);
+    opts.addOption(bool, "shadow", shadow);
 
     // src/compat.zig calls libc directly (getaddrinfo, gettimeofday,
     // arc4random_buf/getrandom, …) for the std-library replacements that were

@@ -1,6 +1,6 @@
 # zquic
 
-Pure-Zig QUIC (RFC 9000 / 9001 / 9002), TLS 1.3, HTTP/3, and QPACK. Current release: **[v1.6.10](https://github.com/ch4r10t33r/zquic/releases/tag/v1.6.10)**.
+Pure-Zig QUIC (RFC 9000 / 9001 / 9002), TLS 1.3, HTTP/3, and QPACK. Current release: **[v1.7.48](https://github.com/ch4r10t33r/zquic/releases/tag/v1.7.48)**.
 
 [![CI](https://github.com/ch4r10t33r/zquic/actions/workflows/ci.yml/badge.svg)](https://github.com/ch4r10t33r/zquic/actions/workflows/ci.yml)
 
@@ -20,9 +20,15 @@ Import as a package dependency (`build.zig.zon`):
 
 ```zig
 .zquic = .{
-    .url = "git+https://github.com/ch4r10t33r/zquic.git?ref=v1.6.10#3f8c8669758bbe57da72017b5db5fd30863e8369",
-    .hash = "zquic-1.6.10-2zRc1Il1EwC1WAXVszicLjgivbbHOM8b0yQgvdNYwEyb",
+    .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.48.tar.gz",
+    .hash = "zquic-1.7.0-2zRc1PSAFgDCESpm-vZsUr4O02HM0dpzmVJSx5WXW6ES",
 },
+```
+
+Or fetch the latest tag automatically:
+
+```sh
+zig fetch --save "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.48.tar.gz"
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes. Tags publish Linux amd64 binaries via `.github/workflows/release.yml`.
@@ -44,7 +50,7 @@ All standard QUIC frame types, flow control, migration, key update, 0-RTT/resump
 
 **zquic ↔ zquic:** all 13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) cases pass on CI (`handshake`, `transfer`, `retry`, `chacha20`, `keyupdate`, `resumption`, `zerortt`, `http3`, `connectionmigration`, `multiplexing`, `v2`, `ecn`, `rebind-port`).
 
-**Cross-impl (quinn, etc.):** handshake and transfer smoke runs on every PR; the full matrix runs nightly via `.github/workflows/interop-cross-impl.yml`. Recent work (#162) fixed quinn→zquic HTTP/0.9 multiplexing under paced congestion control.
+**Cross-impl (quinn ↔ zquic):** per-commit CI runs the P0 subset (`handshake`, `transfer` in both directions plus `multiplexing(zquic→quinn)`); the full matrix runs nightly via `.github/workflows/interop-cross-impl.yml` and reclassifies the known capability gaps (HTTP/3, 0-RTT, session resumption, key update, Retry, ChaCha20, port rebinding, quinn-driven multiplexing) as `UNSUPPORTED` rather than failed — see `EXPECTED_UNSUPPORTED` in that workflow for the current list. Recent quinn-interop hardening: `transfer(cross-zquic-quinn)` flow-control regression (#201), per-PN-space loss detector with RFC 9001 §4.9 Initial/Handshake abandonment (#211), CONNECTION_CLOSE retransmission during draining (#194), stateless reset emission with rate-limit + 41-byte trigger floor (#206), NEW_TOKEN issuance + replay (#213).
 
 Local interop:
 
@@ -53,6 +59,23 @@ zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu
 docker build -t zquic:interop -f interop/Dockerfile.prebuilt .
 # then run quic-interop-runner against zquic:interop
 ```
+
+## Shadow simulator (`-Dshadow=true`)
+
+zquic builds for the [Shadow network simulator](https://shadow.github.io/), which gives deterministic, bit-exact replays of multi-peer scenarios — no NIC variance, no scheduler jitter. Shadow's shim intercepts at the libc layer via `LD_PRELOAD`, so the default pure-Zig Linux build (raw `std.os.linux.*` syscalls, no libc) is invisible to it; the `-Dshadow=true` flag fixes that:
+
+```sh
+zig build -Dtarget=x86_64-linux-gnu -Dshadow=true -Doptimize=ReleaseSafe
+file zig-out/bin/server   # → dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2
+```
+
+What changes under `-Dshadow=true`:
+
+- `link_libc = true` on Linux — dynamically linked against glibc so the Shadow shim can inject.
+- `compat.zig`'s `clock_gettime` and `getrandom` route through libc (gated on `!builtin.link_libc`) so Shadow's virtual clock + deterministic randomness apply.
+- `transport/batch_io.zig` disables the `sendmmsg(2)`/`recvmmsg(2)` batched path and falls back to per-message `sendto`/`recvfrom` (Shadow's shim doesn't virtualize the batched syscalls).
+
+See [docs/shadow.md](docs/shadow.md) for a minimal `shadow.yaml` and the known limitations. The default no-libc Linux build is unaffected.
 
 ## Embedder API
 
@@ -65,10 +88,14 @@ The stack is built for [quic-interop-runner](https://github.com/quic-interop/qui
 | External UDP loop | `Server.feedPacket`, `Client.feedPacket`, `processPendingWork` |
 | Pre-bound socket | `Server.initFromSocket`, `Client.initFromSocket` |
 | Heap-allocated client | `Client.initInPlace` (avoids stack-sized return copies in downstream callers) |
-| Open/send on streams | `rawAllocateNextLocal*Stream`, `sendRawStreamData` |
+| Open client-initiated streams | `rawAllocateNextLocalBidiStream` / `rawAllocateNextLocalUniStream` (emit `STREAMS_BLOCKED` on cap-hit, #188 / #205) |
+| Open server-initiated streams | `Server.openRawAppStream` (libp2p gossip-over-any-connection, #171) |
+| Send / FIN on streams | `sendRawStreamData` (now splits at packet-build time via `sent_in_buf` cursor, #199) |
 | In-memory TLS certs | `cert_pem` / `key_pem` / `client_cert_pem` / `client_key_pem` on config structs (#129) |
+| Congestion-control profile | `CcOptions.aggressive` opts into the libp2p-tuned 32·MSS IW / 10·MSS floor; default tracks RFC 9002 §7.2 / §7.6.3 (#195) |
+| Conn capacity | `MAX_CONNECTIONS = 256`, boxed (quinn-style slab) — heap cost scales with active conns, not the cap (#209) |
 
-Demo `Endpoint` / interop `Server` use small fixed connection arrays (`max_connections` 8 / `MAX_CONNECTIONS` 16) to stay stack-friendly in tests. Production embedders should heap-size their own connection tables via `initFromSocket` + `feedPacket`.
+Demo `Endpoint` uses a small fixed connection array (`max_connections` 8) to stay stack-friendly in tests. Production embedders should still heap-size their own connection tables via `initFromSocket` + `feedPacket` for unbounded scale.
 
 ## Layout
 
@@ -91,8 +118,17 @@ Varint encoding is re-exported from the shared [`zig-varint`](https://github.com
 
 ## Platform notes
 
-- **Linux:** statically linked release binaries; syscalls via `std.os.linux`, no OpenSSL/quictls.
-- **macOS:** links `libSystem` (required for supported syscalls and code signing); source remains pure Zig.
+- **Linux (default):** statically linked release binaries; syscalls via `std.os.linux`, no OpenSSL/quictls, no libc.
+- **Linux (`-Dshadow=true`):** dynamically linked against glibc with libc-mediated syscalls so the [Shadow simulator](#shadow-simulator--dshadowtrue)'s shim can inject. See [docs/shadow.md](docs/shadow.md).
+- **macOS:** links `libSystem` (Darwin has no stable syscall ABI); source remains pure Zig.
+
+## Open work
+
+A standing quinn-vs-zquic gap analysis tracks remaining capability deltas:
+
+- **Tracker:** [#138](https://github.com/ch4r10t33r/zquic/issues/138) (closed sub-issues linked from the comment thread).
+- **Open at v1.7.48:** RFC 9221 unreliable datagrams (#181), per-stream send buffer abstraction (#184), connection statistics expansion (#186), `ACK_FREQUENCY` extension (#187), stream priority API (#191), BBR congestion controller (#192).
+- **Shadow simulator support:** Phase 1 (build flag, syscall routing, batched-I/O fallback) tracked in #216 — Phase 2 (Docker image + CI matrix) is the next step.
 
 ## License
 
