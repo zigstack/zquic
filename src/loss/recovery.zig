@@ -140,6 +140,15 @@ pub const RttEstimator = struct {
     }
 };
 
+/// QUIC packet number spaces (RFC 9000 §12.3).
+pub const PacketNumberSpace = enum(u2) {
+    initial,
+    handshake,
+    application,
+};
+
+pub const pn_space_count: usize = 3;
+
 /// A record of a packet that has been sent but not yet acknowledged.
 pub const SentPacket = struct {
     pn: u64,
@@ -147,6 +156,7 @@ pub const SentPacket = struct {
     size: usize,
     ack_eliciting: bool,
     in_flight: bool,
+    space: PacketNumberSpace = .application,
     /// Stream metadata for application-layer retransmission.
     /// When `has_stream_data` is true the packet carried a STREAM frame for
     /// the given stream starting at `stream_offset`.  The loss detector
@@ -180,8 +190,40 @@ pub const LossDetector = struct {
 
     sent: [max_tracked]SentPacket = undefined,
     sent_count: usize = 0,
-    largest_acked: u64 = 0,
-    loss_time_ms: ?u64 = null,
+    largest_acked: [pn_space_count]u64 = [_]u64{0} ** pn_space_count,
+    loss_time_ms: [pn_space_count]?u64 = .{null} ** pn_space_count,
+
+    fn spaceIdx(space: PacketNumberSpace) usize {
+        return @intFromEnum(space);
+    }
+
+    /// True when this PN space still has ack-eliciting packets in flight.
+    pub fn inflightInSpace(self: *const LossDetector, space: PacketNumberSpace) bool {
+        for (self.sent[0..self.sent_count]) |p| {
+            if (p.space == space and p.ack_eliciting and p.in_flight) return true;
+        }
+        return false;
+    }
+
+    /// Stop tracking in-flight packets in a PN space (RFC 9001: Initial/Handshake
+    /// keys are discarded once the handshake completes).
+    pub fn abandonSpace(self: *LossDetector, space: PacketNumberSpace, allocator: std.mem.Allocator) void {
+        var i: usize = 0;
+        while (i < self.sent_count) {
+            if (self.sent[i].space == space) {
+                if (self.sent[i].stream_data) |sd| {
+                    _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
+                }
+                self.sent[i] = self.sent[self.sent_count - 1];
+                self.sent_count -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        const sidx = spaceIdx(space);
+        self.largest_acked[sidx] = 0;
+        self.loss_time_ms[sidx] = null;
+    }
 
     /// Free any heap-owned retransmit buffers attached to in-flight packets.
     /// Caller passes the same allocator used when populating `stream_data`.
@@ -244,6 +286,7 @@ pub const LossDetector = struct {
     /// (RFC 9000 §19.3: the first range must not underflow the packet number space).
     pub fn onAck(
         self: *LossDetector,
+        space: PacketNumberSpace,
         largest_acked: u64,
         /// First ACK range from the ACK frame (RFC 9000 §19.3.1).
         /// The number of contiguous packets before `largest_acked` that are
@@ -270,12 +313,14 @@ pub const LossDetector = struct {
         // accept of packets [0..largest_acked], so we reject here.
         if (first_ack_range > largest_acked) return error.FrameEncodingError;
 
+        const sidx = spaceIdx(space);
         var rtt_updated = false;
 
-        // Update RTT sample for the largest acknowledged packet.
-        if (largest_acked > self.largest_acked) {
-            self.largest_acked = largest_acked;
+        // Update RTT sample for the largest acknowledged packet in this space.
+        if (largest_acked > self.largest_acked[sidx]) {
+            self.largest_acked[sidx] = largest_acked;
             for (self.sent[0..self.sent_count]) |p| {
+                if (p.space != space) continue;
                 if (p.pn == largest_acked) {
                     const sample = now_ms -| p.send_time_ms;
                     rtt.update(sample, ack_delay_ms);
@@ -316,6 +361,10 @@ pub const LossDetector = struct {
         var i: usize = 0;
         while (i < self.sent_count) {
             const p = self.sent[i];
+            if (p.space != space) {
+                i += 1;
+                continue;
+            }
 
             // Packet is definitively acked: within [smallest_acked .. largest_acked].
             if (p.pn >= smallest_acked and p.pn <= largest_acked) {
@@ -463,7 +512,7 @@ test "loss: packet threshold detection" {
     // Packets 0, 1, 2 are in a gap and should be detected as lost via
     // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
     var lost_buf: [8]SentPacket = undefined;
-    const result = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf, testing.allocator);
+    const result = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, testing.allocator);
     try testing.expect(result.lost_count >= 2);
 }
 
@@ -475,7 +524,7 @@ test "loss: rejects invalid first_ack_range > largest_acked" {
     // largest_acked=5, first_ack_range=10 → would underflow.
     try testing.expectError(
         error.FrameEncodingError,
-        ld.onAck(5, 10, 0, 200, &rtt, &lost_buf, testing.allocator),
+        ld.onAck(.application, 5, 10, 0, 200, &rtt, &lost_buf, testing.allocator),
     );
 }
 
@@ -495,7 +544,7 @@ test "loss: time-threshold declares old packet lost when gap < k_packet_threshol
     // Ack pn 1 at a time far enough past pn 0's send to trigger time-threshold.
     const now = 200 + loss_delay + 1;
     var lost_buf: [4]SentPacket = undefined;
-    const r = try ld.onAck(1, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 1, 0, 0, now, &rtt, &lost_buf, testing.allocator);
     try testing.expectEqual(@as(usize, 1), r.lost_count);
     try testing.expectEqual(@as(u64, 0), lost_buf[0].pn);
     try testing.expect(r.largest_lost_pn != null);
@@ -528,7 +577,7 @@ test "loss: persistent congestion across spread-out losses" {
     // large enough that time-threshold also fires on 3 and 4.
     const now = t_last + 30 + rtt.loss_delay_ms() + 1;
     var lost_buf: [16]SentPacket = undefined;
-    const r = try ld.onAck(5, 0, 0, now, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 5, 0, 0, now, &rtt, &lost_buf, testing.allocator);
     try testing.expect(r.lost_count >= 3);
     try testing.expect(r.persistent_congestion);
 }
@@ -557,7 +606,7 @@ test "loss: no persistent congestion when ack proves path is delivering" {
     // (largest_acked=4 ≥ 0+3) but pn 1 was acked inside the same ACK, so
     // even if a second loss were present, PC would not apply.
     var lost_buf: [8]SentPacket = undefined;
-    const r = try ld.onAck(4, 3, 0, t0 + pc_dur + 20, &rtt, &lost_buf, testing.allocator);
+    const r = try ld.onAck(.application, 4, 3, 0, t0 + pc_dur + 20, &rtt, &lost_buf, testing.allocator);
     try testing.expect(r.lost_count >= 1);
     try testing.expect(!r.persistent_congestion);
 }
@@ -622,10 +671,10 @@ test "loss: stream_data is freed on ack and transferred on loss" {
     var lost_buf: [8]SentPacket = undefined;
     // Ack pn 0 (frees buf0 internally), then ack pn 5 separately so pn 1
     // is declared lost via k_packet_threshold.
-    const r0 = try ld.onAck(0, 0, 0, 200, &rtt, &lost_buf, a);
+    const r0 = try ld.onAck(.application, 0, 0, 0, 200, &rtt, &lost_buf, a);
     try testing.expectEqual(@as(usize, 0), r0.lost_count);
 
-    const r1 = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf, a);
+    const r1 = try ld.onAck(.application, 5, 0, 0, 200, &rtt, &lost_buf, a);
     try testing.expect(r1.lost_count >= 1);
     // Find the lost descriptor that owns the heap slice.
     var saw_transfer = false;
@@ -726,7 +775,7 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
         const largest = top -| rand.uintLessThan(u64, 3);
         const first_range = @min(range, largest);
 
-        const r = ld.onAck(largest, first_range, 0, now, &rtt, &lost_buf, a) catch {
+        const r = ld.onAck(.application, largest, first_range, 0, now, &rtt, &lost_buf, a) catch {
             continue;
         };
 
@@ -745,7 +794,7 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
         // the time-threshold loss path, exercising large single-ACK losses.
         if (iter % 4096 == 0 and ld.sent_count > 0) {
             now += 10_000;
-            const flush = ld.onAck(next_pn -| 1, 0, 0, now, &rtt, &lost_buf, a) catch continue;
+            const flush = ld.onAck(.application, next_pn -| 1, 0, 0, now, &rtt, &lost_buf, a) catch continue;
             var fi: usize = 0;
             while (fi < flush.lost_count) : (fi += 1) {
                 if (lost_buf[fi].stream_data) |sbuf| a.free(sbuf);
@@ -754,4 +803,37 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
     }
     // ld.deinit frees any stream_data still tracked — testing.allocator will
     // flag a leak if the ownership accounting dropped a buffer.
+}
+
+test "loss: per-PN-space ACK only affects matching space" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 190, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .handshake });
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 195, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 196, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
+
+    var lost_buf: [8]SentPacket = undefined;
+    const r = try ld.onAck(.application, 1, 1, 0, 200, &rtt, &lost_buf, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.lost_count);
+    try testing.expectEqual(@as(usize, 1), ld.sent_count);
+    try testing.expectEqual(PacketNumberSpace.handshake, ld.sent[0].space);
+    try testing.expectEqual(@as(u64, 0), ld.sent[0].pn);
+}
+
+test "loss: abandonSpace drops only the targeted PN space" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 100, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .initial });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 110, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .handshake });
+    _ = ld.onPacketSent(.{ .pn = 2, .send_time_ms = 120, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
+    ld.abandonSpace(.initial, testing.allocator);
+    ld.abandonSpace(.handshake, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), ld.sent_count);
+    try testing.expectEqual(PacketNumberSpace.application, ld.sent[0].space);
+    try testing.expectEqual(@as(u64, 2), ld.sent[0].pn);
+    try testing.expect(!ld.inflightInSpace(.initial));
+    try testing.expect(!ld.inflightInSpace(.handshake));
+    try testing.expect(ld.inflightInSpace(.application));
 }
