@@ -205,6 +205,26 @@ pub const LossDetector = struct {
         return false;
     }
 
+    /// Stop tracking in-flight packets in a PN space (RFC 9001: Initial/Handshake
+    /// keys are discarded once the handshake completes).
+    pub fn abandonSpace(self: *LossDetector, space: PacketNumberSpace, allocator: std.mem.Allocator) void {
+        var i: usize = 0;
+        while (i < self.sent_count) {
+            if (self.sent[i].space == space) {
+                if (self.sent[i].stream_data) |sd| {
+                    _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
+                }
+                self.sent[i] = self.sent[self.sent_count - 1];
+                self.sent_count -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        const sidx = spaceIdx(space);
+        self.largest_acked[sidx] = 0;
+        self.loss_time_ms[sidx] = null;
+    }
+
     /// Free any heap-owned retransmit buffers attached to in-flight packets.
     /// Caller passes the same allocator used when populating `stream_data`.
     pub fn deinit(self: *LossDetector, allocator: std.mem.Allocator) void {
@@ -800,4 +820,20 @@ test "loss: per-PN-space ACK only affects matching space" {
     try testing.expectEqual(@as(usize, 1), ld.sent_count);
     try testing.expectEqual(PacketNumberSpace.handshake, ld.sent[0].space);
     try testing.expectEqual(@as(u64, 0), ld.sent[0].pn);
+}
+
+test "loss: abandonSpace drops only the targeted PN space" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 100, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .initial });
+    _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 110, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .handshake });
+    _ = ld.onPacketSent(.{ .pn = 2, .send_time_ms = 120, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
+    ld.abandonSpace(.initial, testing.allocator);
+    ld.abandonSpace(.handshake, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), ld.sent_count);
+    try testing.expectEqual(PacketNumberSpace.application, ld.sent[0].space);
+    try testing.expectEqual(@as(u64, 2), ld.sent[0].pn);
+    try testing.expect(!ld.inflightInSpace(.initial));
+    try testing.expect(!ld.inflightInSpace(.handshake));
+    try testing.expect(ld.inflightInSpace(.application));
 }

@@ -1237,6 +1237,20 @@ fn recordAckElicitingSent(
     });
 }
 
+/// RFC 9001 §4.9.1: Initial and Handshake PN spaces are abandoned once 1-RTT
+/// keys are available.  Drop any stale in-flight tracking so PTO does not probe
+/// discarded spaces during application data transfer.
+fn abandonEarlyPnSpaces(conn: *ConnState, allocator: std.mem.Allocator) void {
+    conn.ld.abandonSpace(.initial, allocator);
+    conn.ld.abandonSpace(.handshake, allocator);
+    conn.last_ack_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.initial)] = 0;
+    conn.last_ack_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
+    conn.pto_count[@intFromEnum(recovery.PacketNumberSpace.initial)] = 0;
+    conn.pto_count[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
+    conn.last_pto_ms[@intFromEnum(recovery.PacketNumberSpace.initial)] = 0;
+    conn.last_pto_ms[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
+}
+
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
 /// `bytes` is the application payload size; we cap the pacer-credit check at
 /// one MSS because each call site ultimately emits at most one MTU-sized
@@ -4653,6 +4667,7 @@ pub const Server = struct {
 
         dbg("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
+        abandonEarlyPnSpaces(conn, self.allocator);
         // Handshake complete → peer address is validated (RFC 9000 §8.1).
         conn.address_validated = true;
         conn.migration.trustActivePath();
@@ -6043,7 +6058,7 @@ pub const Server = struct {
             // The branch logs `log.warn` (not `dbg`) so the wedge is visible
             // in release builds — previously the fire was only observable
             // with `-Dverbose=true`, which masked the bug entirely.
-            if (conn.last_ack_ms != 0) {
+            if (conn.has_app_keys and conn.last_ack_ms != 0) {
                 const elapsed_since_ack_lost: i64 = now_ms - conn.last_ack_ms;
                 const lost_threshold_ms: i64 = @intCast(@max(idle_ms_u64 * 2, @as(u64, 60_000)));
                 const has_substantial_data_stuck =
@@ -6068,8 +6083,11 @@ pub const Server = struct {
 
             // Branch 1: per-space PTO probes (RFC 9002 §6.2.3).
             var pto_fired = false;
-            const pto_spaces = [_]recovery.PacketNumberSpace{ .initial, .handshake, .application };
-            for (pto_spaces) |space| {
+            const pto_space_list: []const recovery.PacketNumberSpace = if (conn.has_app_keys)
+                &[_]recovery.PacketNumberSpace{.application}
+            else
+                &[_]recovery.PacketNumberSpace{ .initial, .handshake };
+            for (pto_space_list) |space| {
                 const idx = @intFromEnum(space);
                 if (!conn.ld.inflightInSpace(space)) continue;
                 const ack_ms = conn.last_ack_ms_by_space[idx];
@@ -8617,7 +8635,9 @@ pub const Client = struct {
             self.conn.cc.getBytesInFlight() >= 1024 or
             self.conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
             self.conn.pending_stream_sends.items.len > 0;
-        if (elapsed_since_ack >= lost_threshold_ms and has_substantial_data_stuck) {
+        if (self.conn.phase == .connected and
+            elapsed_since_ack >= lost_threshold_ms and has_substantial_data_stuck)
+        {
             log.warn("io: client declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); marking draining", .{
                 elapsed_since_ack,
                 lost_threshold_ms,
@@ -8632,8 +8652,11 @@ pub const Client = struct {
             return;
         }
 
-        const pto_spaces = [_]recovery.PacketNumberSpace{ .initial, .handshake, .application };
-        for (pto_spaces) |space| {
+        const pto_space_list: []const recovery.PacketNumberSpace = if (self.conn.has_app_keys)
+            &[_]recovery.PacketNumberSpace{.application}
+        else
+            &[_]recovery.PacketNumberSpace{ .initial, .handshake };
+        for (pto_space_list) |space| {
             const idx = @intFromEnum(space);
             if (!self.conn.ld.inflightInSpace(space)) continue;
             const ack_ms = self.conn.last_ack_ms_by_space[idx];
@@ -9952,6 +9975,7 @@ pub const Client = struct {
             if (ft == 0x1e) { // HANDSHAKE_DONE
                 dbg("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
+                abandonEarlyPnSpaces(&self.conn, self.allocator);
                 if (self.config.keylog_path) |kpath| {
                     writeKeylog(kpath, self.tls.client_random, &self.tls.secrets);
                 }
