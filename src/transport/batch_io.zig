@@ -21,7 +21,12 @@ const std = @import("std");
 const compat = @import("../compat.zig");
 const types = @import("../types.zig");
 const builtin = @import("builtin");
-const is_linux = builtin.os.tag == .linux;
+const build_options = @import("build_options");
+/// Use the Linux `sendmmsg(2)`/`recvmmsg(2)` batched path. Disabled under the
+/// Shadow build (#216) — the simulator's shim does not virtualize those calls,
+/// so the per-message `sendto`/`recvfrom` portable path is used instead and all
+/// I/O routes through Shadow's intercepted libc.
+const is_linux_batched = builtin.os.tag == .linux and !build_options.shadow;
 
 /// Platform-safe MSG_DONTWAIT constant (std.posix.MSG is void on some macOS builds).
 const MSG_DONTWAIT: u32 = if (@hasDecl(std.posix, "MSG") and @typeInfo(@TypeOf(std.posix.MSG)) == .@"struct")
@@ -68,7 +73,7 @@ pub const SendBatch = struct {
         self.count = 0;
         if (cnt == 0) return;
 
-        if (is_linux) {
+        if (is_linux_batched) {
             flushLinux(sock, self.entries[0..cnt]);
         } else {
             for (self.entries[0..cnt]) |*e| {
@@ -190,7 +195,7 @@ pub const RecvBatch = struct {
     /// blocking call (suitable after poll() indicates data is available).
     /// Returns the number of messages received.
     pub fn recv(self: *RecvBatch, sock: std.posix.socket_t, blocking_first: bool) usize {
-        if (is_linux) {
+        if (is_linux_batched) {
             return recvLinux(self, sock, blocking_first);
         } else {
             return recvPortable(self, sock, blocking_first);

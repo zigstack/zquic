@@ -193,7 +193,11 @@ pub fn close(sock: posix.socket_t) void {
 // `getrandom(2)` on Linux and `getentropy(3)` elsewhere via libc.
 
 fn osRandomBytes(buf: []u8) void {
-    if (comptime builtin.os.tag == .linux) {
+    // Raw kernel `getrandom(2)` is used only on no-libc Linux (default zquic
+    // build). When libc is linked — Darwin, or Linux with `-Dshadow=true` —
+    // route through libc so the Shadow simulator's shim can intercept and
+    // produce deterministic randomness. See #216.
+    if (comptime builtin.os.tag == .linux and !builtin.link_libc) {
         // getrandom(2) is the kernel's CSPRNG; never blocks once seeded.
         // Raw syscall — no libc dependency.
         var off: usize = 0;
@@ -205,6 +209,20 @@ fn osRandomBytes(buf: []u8) void {
             } else if (e == .INTR) {
                 continue;
             } else {
+                @panic("getrandom failed");
+            }
+        }
+    } else if (comptime builtin.os.tag == .linux) {
+        // Linux with libc linked (Shadow build) — use libc `getrandom(3)`,
+        // which the Shadow shim intercepts.
+        var off: usize = 0;
+        while (off < buf.len) {
+            const n = std.c.getrandom(buf.ptr + off, buf.len - off, 0);
+            if (n > 0) {
+                off += @intCast(n);
+            } else {
+                const e = std.posix.errno(n);
+                if (e == .INTR) continue;
                 @panic("getrandom failed");
             }
         }
@@ -235,8 +253,12 @@ pub const random: std.Random = std.Random.init(&random_src, RandomSrc.fill);
 // stable syscall ABI).
 
 /// Returns the current wall-clock time in nanoseconds since the Unix epoch.
+///
+/// Linux without libc takes the raw `clock_gettime(2)` syscall. Linux with
+/// libc (Darwin, or `-Dshadow=true`) goes through libc — required so the
+/// Shadow simulator's shim can virtualize simulated time (#216).
 pub fn nanoTimestamp() i128 {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.os.tag == .linux and !builtin.link_libc) {
         var ts: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_gettime(.REALTIME, &ts);
         return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
