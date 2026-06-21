@@ -9128,6 +9128,14 @@ pub const Client = struct {
         var deadline = compat.milliTimestamp() + 120_000;
 
         while (compat.milliTimestamp() < deadline) {
+            // Flush any 1-RTT datagrams queued on `Client.send_batch` by the
+            // previous iteration's processPacket / checkPto / sendClient1Rtt.
+            // runEventLoop is the interop-binary's drive path and does NOT go
+            // through processPendingWork / feedPacket (the other Client entry
+            // points that already flush). Without this defer, ACKs and stream
+            // frames piled up in the batch and the handshake stalled at the
+            // 14 s interop-runner deadline — exactly the regression we shipped.
+            defer self.flushSendBatch();
             const now = compat.milliTimestamp();
             const remaining = deadline - now;
             if (remaining < 0) {
