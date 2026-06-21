@@ -43,6 +43,8 @@ const batch_io = @import("batch_io.zig");
 const path_mtu_mod = @import("path_mtu.zig");
 const migration_mod = @import("migration.zig");
 const raw_app_stream = @import("raw_app_stream.zig");
+const connection_mod = @import("connection.zig");
+const stats_mod = @import("stats.zig");
 const session_token_mod = @import("session_token.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
 
@@ -2061,6 +2063,10 @@ pub const ConnState = struct {
     peer_ecn_ect1: u64 = 0,
     peer_ecn_ce: u64 = 0,
 
+    // Observability counters (see `connection.zig` `Stats` / issue #186).
+    stats_acc: connection_mod.StatsAccumulator = .{},
+    handshake_rtt_ms: ?u64 = null,
+
     // ── Congestion control + loss detection (RFC 9002) ────────────────────────
     // Congestion controller: NewReno (default) or CUBIC (configurable).
     cc: congestion.CongestionController = congestion.CongestionController.init(.new_reno),
@@ -2097,6 +2103,84 @@ pub const ConnState = struct {
     /// Return the QUIC version constant for this connection.
     pub fn quicVersion(self: *const ConnState) u32 {
         return if (self.use_v2) QUIC_VERSION_2 else QUIC_VERSION_1;
+    }
+
+    pub fn noteDatagramRecv(self: *ConnState, len: usize) void {
+        stats_mod.noteDatagramRx(&self.stats_acc, len);
+    }
+
+    pub fn noteDatagramSent(self: *ConnState, len: usize) void {
+        stats_mod.noteDatagramTx(&self.stats_acc, len);
+    }
+
+    pub fn noteFrameReceived(self: *ConnState, ft: u64) void {
+        stats_mod.noteFrameRx(&self.stats_acc.frames, ft);
+    }
+
+    pub fn note1RttPayloadSent(self: *ConnState, payload: []const u8, pkt_len: usize) void {
+        self.noteDatagramSent(pkt_len);
+        stats_mod.noteFramesInPayload(&self.stats_acc.frames, payload);
+    }
+
+    pub fn noteLossFromAck(self: *ConnState, lost_count: usize, lost_bytes: u64) void {
+        self.stats_acc.lost_packets += @intCast(lost_count);
+        self.stats_acc.lost_bytes += lost_bytes;
+    }
+
+    pub fn captureHandshakeRtt(self: *ConnState) void {
+        if (self.handshake_rtt_ms == null and self.rtt.first_rtt_sample) {
+            self.handshake_rtt_ms = self.rtt.latest_rtt_ms;
+        }
+    }
+
+    pub fn beginPlpmtuProbe(self: *ConnState, size: u16, pn: u64, now_ms: i64) void {
+        self.stats_acc.plpmtud_probes_sent += 1;
+        self.plpmtu.beginProbe(size, pn, now_ms);
+    }
+
+    pub fn onPlpmtuProbeAcked(self: *ConnState, pn: u64) void {
+        const was_probing = self.plpmtu.probing;
+        self.plpmtu.onProbeAcked(pn);
+        if (was_probing) self.stats_acc.plpmtud_probes_acked += 1;
+    }
+
+    pub fn onPlpmtuProbeLost(self: *ConnState) void {
+        const was_bh = self.plpmtu.black_hole;
+        self.plpmtu.onProbeLost();
+        if (!was_bh and self.plpmtu.black_hole) self.stats_acc.black_hole_detections += 1;
+    }
+
+    /// Snapshot connection statistics for embedder / metrics export.
+    pub fn snapshotStats(self: *const ConnState) connection_mod.Stats {
+        var pto_total: u64 = 0;
+        for (self.pto_count) |c| pto_total += c;
+        return .{
+            .udp = self.stats_acc.udp,
+            .frames = self.stats_acc.frames,
+            .path = .{
+                .srtt_ms = self.rtt.srtt_ms,
+                .min_rtt_ms = self.rtt.min_rtt_ms,
+                .rttvar_ms = self.rtt.rttvar_ms,
+                .cwnd = self.cc.getCwnd(),
+                .bytes_in_flight = self.cc.getBytesInFlight(),
+                .congestion_events = self.cc.getCongestionEvents(),
+                .lost_packets = self.stats_acc.lost_packets,
+                .lost_bytes = self.stats_acc.lost_bytes,
+                .pto_count = pto_total,
+                .current_mtu = self.plpmtu.effectiveMtu(),
+                .ecn_ect0_recv = self.ecn_ect0_recv,
+                .ecn_ect1_recv = self.ecn_ect1_recv,
+                .ecn_ce_recv = self.ecn_ce_recv,
+                .plpmtud_probes_sent = self.stats_acc.plpmtud_probes_sent,
+                .plpmtud_probes_acked = self.stats_acc.plpmtud_probes_acked,
+                .black_hole_detections = self.stats_acc.black_hole_detections,
+            },
+            .packets_sent = self.stats_acc.udp.datagrams_tx,
+            .packets_recv = self.stats_acc.udp.datagrams_rx,
+            .bytes_sent = self.stats_acc.udp.bytes_tx,
+            .bytes_recv = self.stats_acc.udp.bytes_rx,
+            .handshake_rtt_ms = self.handshake_rtt_ms,
+        };
     }
 
     pub fn deriveInitialKeys(self: *ConnState, dcid: ConnectionId) void {
@@ -2957,6 +3041,12 @@ pub const Server = struct {
     /// Inject a UDP payload as if it had been received on `recvfrom` (shared-socket / embedder recv loops).
     pub fn feedPacket(self: *Server, buf: []const u8, src: compat.Address) void {
         self.processPacket(buf, src);
+    }
+
+    /// Return a snapshot of per-connection statistics (issue #186).
+    pub fn connStats(self: *const Server, conn: *const ConnState) connection_mod.Stats {
+        _ = self;
+        return conn.snapshotStats();
     }
 
     /// Drain deferred STREAM bytes on every connection (quinn `poll_transmit`).
@@ -4719,6 +4809,7 @@ pub const Server = struct {
         // Handshake complete → peer address is validated (RFC 9000 §8.1).
         conn.address_validated = true;
         conn.migration.trustActivePath();
+        conn.captureHandshakeRtt();
 
         const pending_n = conn.pending_1rtt_n;
         conn.pending_1rtt_n = 0;
@@ -4992,6 +5083,7 @@ pub const Server = struct {
 
                 conn.ecn_ect0_recv += 1;
                 conn.peer_key_phase = incoming_phase;
+                conn.noteDatagramRecv(buf.len);
 
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
                 if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
@@ -5169,6 +5261,7 @@ pub const Server = struct {
             };
             const ft = ft_r.value;
             pos += ft_r.len;
+            conn.noteFrameReceived(ft);
 
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
@@ -5237,9 +5330,10 @@ pub const Server = struct {
                 if (ld_result.bytes_acked > 0) {
                     conn.cc.onAck(ld_result.bytes_acked, largest_ack);
                 }
+                conn.noteLossFromAck(ld_result.lost_count, ld_result.lost_bytes);
                 if (conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
-                        conn.plpmtu.onProbeAcked(probe_pn);
+                        conn.onPlpmtuProbeAcked(probe_pn);
                         conn.syncPathMtuFields();
                     }
                 }
@@ -5286,7 +5380,7 @@ pub const Server = struct {
                     const lp = lost_buf[li];
                     if (conn.plpmtu.probing) {
                         if (conn.plpmtu.probe_pn == lp.pn) {
-                            conn.plpmtu.onProbeLost();
+                            conn.onPlpmtuProbeLost();
                             conn.syncPathMtuFields();
                         }
                     }
@@ -5752,6 +5846,7 @@ pub const Server = struct {
         };
         conn.app_pn += 1;
         conn.note1RttSent();
+        conn.note1RttPayloadSent(payload, pkt_len);
         conn.qlog.packetSent(.one_rtt, conn.app_pn - 1, pkt_len);
         if (has_fin) {
             dbg("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
@@ -5985,7 +6080,7 @@ pub const Server = struct {
             probe_buf[0] = 0x01;
             if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
             const pn = conn.app_pn;
-            conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+            conn.beginPlpmtuProbe(probe_size, pn, now_ms);
             self.send1Rtt(conn, probe_buf[0..target_payload], conn.peer);
         }
     }
@@ -8068,6 +8163,11 @@ pub const Client = struct {
         self.processPacket(buf);
     }
 
+    /// Return a snapshot of connection statistics (issue #186).
+    pub fn connStats(self: *const Client) connection_mod.Stats {
+        return self.conn.snapshotStats();
+    }
+
     /// Server leaf certificate (DER) from the TLS handshake, if the server sent a `Certificate` message.
     /// Populated after the handshake completes (same timing as `conn.phase == .connected`).
     pub fn peerLeafCertificateDer(self: *const Client) ?[]const u8 {
@@ -8584,7 +8684,7 @@ pub const Client = struct {
         probe_buf[0] = 0x01;
         if (target_payload > 1) @memset(probe_buf[1..target_payload], 0x00);
         const pn = self.conn.app_pn;
-        self.conn.plpmtu.beginProbe(probe_size, pn, now_ms);
+        self.conn.beginPlpmtuProbe(probe_size, pn, now_ms);
         _ = self.sendClient1Rtt(probe_buf[0..target_payload]);
     }
 
@@ -9883,6 +9983,7 @@ pub const Client = struct {
         // ECN: count this 1-RTT packet as ECT(0).
         self.conn.ecn_ect0_recv += 1;
         self.conn.last_recv_ms = compat.milliTimestamp();
+        self.conn.noteDatagramRecv(buf.len);
 
         // RFC 9000 §10.2.2: re-emit CONNECTION_CLOSE in response to peer packets.
         if (self.conn.draining) {
@@ -9912,6 +10013,7 @@ pub const Client = struct {
             const ft_r = varint.decode(plaintext[pos..]) catch return;
             const ft = ft_r.value;
             pos += ft_r.len;
+            self.conn.noteFrameReceived(ft);
 
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
@@ -9962,9 +10064,10 @@ pub const Client = struct {
                     continue;
                 };
                 if (ld_result.bytes_acked > 0) self.conn.cc.onAck(ld_result.bytes_acked, largest_ack);
+                self.conn.noteLossFromAck(ld_result.lost_count, ld_result.lost_bytes);
                 if (self.conn.plpmtu.probe_pn) |probe_pn| {
                     if (largest_ack >= probe_pn) {
-                        self.conn.plpmtu.onProbeAcked(probe_pn);
+                        self.conn.onPlpmtuProbeAcked(probe_pn);
                         self.conn.syncPathMtuFields();
                     }
                 }
@@ -10001,7 +10104,7 @@ pub const Client = struct {
                     const lp = lost_buf[li];
                     if (self.conn.plpmtu.probing) {
                         if (self.conn.plpmtu.probe_pn == lp.pn) {
-                            self.conn.plpmtu.onProbeLost();
+                            self.conn.onPlpmtuProbeLost();
                             self.conn.syncPathMtuFields();
                         }
                     }
@@ -10042,6 +10145,7 @@ pub const Client = struct {
                 dbg("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
                 abandonEarlyPnSpaces(&self.conn, self.allocator);
+                self.conn.captureHandshakeRtt();
                 if (self.config.keylog_path) |kpath| {
                     writeKeylog(kpath, self.tls.client_random, &self.tls.secrets);
                 }
@@ -10345,6 +10449,7 @@ pub const Client = struct {
         ) catch return;
         self.conn.app_pn += 1;
         self.conn.note1RttSent();
+        self.conn.note1RttPayloadSent(ack_buf[0..ack_len], pkt_len);
         _ = compat.sendto(
             self.sock,
             send_buf[0..pkt_len],
