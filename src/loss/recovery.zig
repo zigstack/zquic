@@ -197,6 +197,9 @@ pub const LossDetector = struct {
     /// vs. a low one distinguishes a retransmit/loss storm from a healthy
     /// transfer that simply stalled (peer went silent with data in flight).
     total_declared_lost: u64 = 0,
+    /// In-flight-tracking-cap warning throttle (see `onPacketSent`).
+    last_cap_warn_ms: u64 = 0,
+    cap_reached_total: u64 = 0,
 
     fn spaceIdx(space: PacketNumberSpace) usize {
         return @intFromEnum(space);
@@ -257,10 +260,20 @@ pub const LossDetector = struct {
             self.sent_count += 1;
             return true;
         }
-        log.warn(
-            "recovery: in-flight tracking cap ({d}) reached — packet pn={d} not tracked",
-            .{ max_tracked, pkt.pn },
-        );
+        // Rate-limit: at a 16384-deep cap a stalled conn hits this on EVERY
+        // ack-eliciting send (hundreds/sec observed live: 44k logs/3min). Each
+        // log.warn is a synchronous write on the QUIC drive thread, so the
+        // logging itself becomes a drive-loop bottleneck that delays ACKs to
+        // every other peer — feeding the very stall that fills the cap. Emit at
+        // most ~once/5s per detector; count the rest.
+        self.cap_reached_total += 1;
+        if (pkt.send_time_ms -| self.last_cap_warn_ms >= 5000) {
+            self.last_cap_warn_ms = pkt.send_time_ms;
+            log.warn(
+                "recovery: in-flight tracking cap ({d}) reached — packet pn={d} not tracked ({d} total, throttled 5s)",
+                .{ max_tracked, pkt.pn, self.cap_reached_total },
+            );
+        }
         return false;
     }
 
