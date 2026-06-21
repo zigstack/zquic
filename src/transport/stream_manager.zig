@@ -15,6 +15,59 @@ const flow_control = @import("flow_control.zig");
 const stream_frame = @import("../frames/stream.zig");
 const frames = @import("../frames/transport.zig");
 
+/// Small out-of-order buffer for classic streams (UDP reorder / loss recovery).
+const StreamReorderSlot = struct {
+    used: bool = false,
+    offset: u64 = 0,
+    len: usize = 0,
+    data: [stream_reorder_chunk_max]u8 = undefined,
+};
+
+const stream_reorder_slots: usize = 8;
+const stream_reorder_chunk_max: usize = 1450;
+
+const StreamReorderBuf = struct {
+    slots: [stream_reorder_slots]StreamReorderSlot = [_]StreamReorderSlot{.{}} ** stream_reorder_slots,
+
+    fn insert(self: *StreamReorderBuf, offset: u64, data: []const u8) void {
+        if (data.len > stream_reorder_chunk_max) return;
+        for (&self.slots) |*slot| {
+            if (slot.used and slot.offset == offset) return;
+        }
+        for (&self.slots) |*slot| {
+            if (!slot.used) {
+                slot.offset = offset;
+                slot.len = data.len;
+                slot.used = true;
+                @memcpy(slot.data[0..data.len], data);
+                return;
+            }
+        }
+        var oldest: usize = 0;
+        for (1..stream_reorder_slots) |i| {
+            if (self.slots[i].used and self.slots[i].offset < self.slots[oldest].offset) {
+                oldest = i;
+            }
+        }
+        self.slots[oldest].offset = offset;
+        self.slots[oldest].len = data.len;
+        self.slots[oldest].used = true;
+        @memcpy(self.slots[oldest].data[0..data.len], data);
+    }
+
+    fn take(self: *StreamReorderBuf, next_offset: u64, out: []u8) usize {
+        for (&self.slots) |*slot| {
+            if (slot.used and slot.offset == next_offset) {
+                const n = @min(slot.len, out.len);
+                @memcpy(out[0..n], slot.data[0..n]);
+                slot.used = false;
+                return n;
+            }
+        }
+        return 0;
+    }
+};
+
 pub const StreamId = types.StreamId;
 pub const FlowControl = flow_control.StreamFlowControl;
 
@@ -42,6 +95,8 @@ pub const Stream = struct {
     recv_buf_end: usize = 0,
     /// Highest contiguous offset received.
     recv_offset: u64 = 0,
+    /// Out-of-order STREAM segments waiting for `recv_offset` to advance.
+    recv_reorder: StreamReorderBuf = .{},
     /// Offset at which we've consumed (app has read).
     read_offset: u64 = 0,
     /// Send offset (next byte to send).
@@ -85,33 +140,87 @@ pub const Stream = struct {
         self.state = next;
     }
 
+    fn appendContiguous(self: *Stream, data: []const u8) bool {
+        const avail = self.recv_buf.len - self.recv_buf_end;
+        if (data.len > avail) return false;
+        @memcpy(self.recv_buf[self.recv_buf_end .. self.recv_buf_end + data.len], data);
+        self.recv_buf_end += data.len;
+        self.recv_offset += @intCast(data.len);
+        return true;
+    }
+
+    fn flushReorder(self: *Stream) void {
+        var drain_buf: [stream_reorder_chunk_max]u8 = undefined;
+        while (true) {
+            const n = self.recv_reorder.take(self.recv_offset, &drain_buf);
+            if (n == 0) break;
+            if (!self.appendContiguous(drain_buf[0..n])) break;
+        }
+    }
+
+    /// True when `[off, off+len)` partially overlaps a buffered out-of-order segment.
+    fn overlapsPending(self: *const Stream, off: u64, len: usize) bool {
+        if (len == 0) return false;
+        const end = off + len;
+        for (self.recv_reorder.slots) |slot| {
+            if (!slot.used) continue;
+            const slot_end = slot.offset + slot.len;
+            if (off < slot_end and end > slot.offset) {
+                if (off == slot.offset and len == slot.len) return false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn applyFin(self: *Stream, fin: bool, frame_offset: u64, frame_len: usize) bool {
+        if (!fin) return true;
+        const new_fin_size = frame_offset + frame_len;
+        if (self.fin_received and new_fin_size != self.fin_size) return false;
+        self.fin_received = true;
+        self.fin_size = new_fin_size;
+        const next: StreamState = if (self.state == .half_closed_local) .closed else .half_closed_remote;
+        self.setState(next) catch return false;
+        return true;
+    }
+
     /// Write `data` into the receive buffer. Returns false on flow control
-    /// violation, invalid state, or out-of-order data that doesn't fit in the buffer.
+    /// violation, invalid state, overlapping out-of-order data, or buffer full.
     pub fn onRecvData(self: *Stream, offset: u64, data: []const u8, fin: bool) bool {
         if (self.state == .closed or self.state == .reset_received or self.state == .reset_sent)
             return false;
 
         if (!self.fc.onReceive(offset, data.len)) return false;
 
-        // Accept only in-order data for simplicity.
-        if (offset == self.recv_offset) {
-            const avail = self.recv_buf.len - self.recv_buf_end;
-            if (data.len > avail) return false; // buffer full
-            @memcpy(self.recv_buf[self.recv_buf_end .. self.recv_buf_end + data.len], data);
-            self.recv_buf_end += data.len;
-            self.recv_offset += data.len;
+        var off = offset;
+        var payload = data;
+        const frame_end = offset + data.len;
+
+        // Wholly duplicate retransmit.
+        if (frame_end <= self.recv_offset) {
+            return self.applyFin(fin, offset, data.len);
         }
 
-        if (fin) {
-            const new_fin_size = offset + data.len;
-            // RFC 9000 §3.5 / §19.4: final size must match across STREAM and RESET_STREAM.
-            if (self.fin_received and new_fin_size != self.fin_size) return false;
-            self.fin_received = true;
-            self.fin_size = new_fin_size;
-            const next: StreamState = if (self.state == .half_closed_local) .closed else .half_closed_remote;
-            self.setState(next) catch return false;
+        // Trim bytes already contiguously received (common on loss recovery).
+        if (off < self.recv_offset) {
+            const skip = @as(usize, @intCast(self.recv_offset - off));
+            if (skip >= payload.len) return self.applyFin(fin, offset, data.len);
+            payload = payload[skip..];
+            off = self.recv_offset;
         }
-        return true;
+
+        if (self.overlapsPending(off, payload.len)) return false;
+
+        if (off == self.recv_offset) {
+            if (!self.appendContiguous(payload)) return false;
+            self.flushReorder();
+        } else if (off > self.recv_offset) {
+            if (payload.len > stream_reorder_chunk_max) return false;
+            self.recv_reorder.insert(off, payload);
+            self.flushReorder();
+        }
+
+        return self.applyFin(fin, offset, data.len);
     }
 
     /// Remote RESET_STREAM (RFC 9000 §19.4). `final_size` must match any prior FIN.
@@ -357,4 +466,43 @@ test "flow_control: stream flow control violation" {
 
     try testing.expect(s.onRecvData(0, "hello", false)); // 5 bytes OK
     try testing.expect(!s.onRecvData(5, " world!", false)); // 7 more = 12 total > 10
+}
+
+test "stream: out-of-order gap fill" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+
+    try testing.expect(s.onRecvData(0, "abc", false));
+    try testing.expect(s.onRecvData(6, "ghi", false));
+    try testing.expectEqual(@as(u64, 3), s.recv_offset);
+
+    try testing.expect(s.onRecvData(3, "def", false));
+    try testing.expectEqual(@as(u64, 9), s.recv_offset);
+
+    var out: [16]u8 = undefined;
+    const n = s.read(&out);
+    try testing.expectEqualSlices(u8, "abcdefghi", out[0..n]);
+}
+
+test "stream: duplicate retransmit is ignored" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+
+    try testing.expect(s.onRecvData(0, "hello", false));
+    try testing.expect(s.onRecvData(0, "hello", false));
+    try testing.expectEqual(@as(u64, 5), s.recv_offset);
+}
+
+test "stream: overlapping out-of-order segment rejected" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+
+    try testing.expect(s.onRecvData(5, "tail", false));
+    try testing.expect(!s.onRecvData(6, "x", false));
 }
