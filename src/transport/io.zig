@@ -1294,7 +1294,13 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     const pace_bytes = @min(head_bytes, congestion.mss);
     const block = connTransmitBlock(conn, pace_bytes) orelse return;
     conn.pending_stream_stall_warn_ms = now_ms;
-    log.debug(
+    // NOTE: promoted debug→info to surface the backpressure/CC state on the
+    // release devnet build (rate-limited 5s/conn, only fires when a conn's
+    // pending-send queue is non-empty AND blocked — i.e. the few peers whose
+    // gossip outbox is overflowing). Distinguishes cwnd-collapse-from-loss
+    // (cong_events climbing) from ACK-clock starvation (acked flat) from
+    // local-send-drop spurious loss (local_send_drops climbing).
+    log.info(
         "io: {s} pending-stream-send drain stalled: {} entries, {} bytes, blocked_by={s}, cc_bif={}, cwnd={}, ld={}/{}, fc_sent={} fc_max={}",
         .{
             side,
@@ -1314,7 +1320,7 @@ fn maybeLogPendingStreamStall(conn: *ConnState, side: []const u8) void {
     // (`acked` flat / few ACKs).  `state` shows whether we are stuck in
     // congestion-avoidance; RTT (ms) shows whether the path RTT is being
     // measured at all on a sub-ms localhost link.
-    log.debug(
+    log.info(
         "io: {s} CC trace blocked_by={s} cwnd={} ssthresh={} state={s} bif={} cong_events={} acked={} srtt_ms={} min_rtt_ms={} latest_rtt_ms={} local_send_drops={}",
         .{
             side,
