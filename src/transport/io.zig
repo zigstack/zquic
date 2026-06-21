@@ -1076,9 +1076,27 @@ fn enqueuePendingStreamSend(
                 i -= 1;
                 if (conn.pending_stream_sends.items[i].stream_id == stream_id) {
                     conn.pending_stream_sends.items[i].fin = true;
-                    break;
+                    return true;
                 }
             }
+            // No queued frame to carry the FIN: this stream's payload already
+            // went straight to the wire, leaving the queue empty for it. The
+            // half-close must still be delivered, so append a dedicated
+            // FIN-only entry that `drainPendingStreamSends` emits as a bare FIN
+            // once the congestion/pacer gate reopens. Its `data` is the empty
+            // slice (never duped or freed — that would hand the allocator its
+            // zero-length sentinel and corrupt the heap; `drainPendingStreamSends`
+            // and `freePendingStreamSends` both skip the free on len==0).
+            // Dropping the FIN here instead silently half-closed the stream and
+            // hung req/resp until timeout — the ~1-2% empty-FIN-on-blocked-gate
+            // flake on the req/resp-over-inbound reverse direction.
+            if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
+            conn.pending_stream_sends.append(allocator, .{
+                .stream_id = stream_id,
+                .offset = offset,
+                .fin = true,
+                .data = &.{},
+            }) catch return false;
         }
         return true;
     }
@@ -3271,7 +3289,7 @@ pub const Server = struct {
                 if (p.sent_in_buf == p.data.len) {
                     const buf = p.data;
                     _ = conn.pending_stream_sends.orderedRemove(i);
-                    self.allocator.free(buf);
+                    if (buf.len > 0) self.allocator.free(buf);
                 } else {
                     i += 1;
                 }
@@ -3283,14 +3301,19 @@ pub const Server = struct {
                 i += 1;
                 continue;
             }
-            const rtx_buf = self.allocator.dupe(u8, chunk) catch {
+            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
+            // Never dupe an empty chunk: that yields the allocator's zero-length
+            // sentinel slice, which freeing on ack/loss corrupts the heap. Track
+            // with no stream_data; a lost bare FIN is re-emitted by the FIN-only
+            // loss-recovery arm.
+            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
                 i += 1;
                 continue;
-            };
+            });
             if (last.stream_data) |old| {
-                if (old.ptr != rtx_buf.ptr) self.allocator.free(old);
+                if (rtx_buf == null or old.ptr != rtx_buf.?.ptr) self.allocator.free(old);
             }
-            last.has_stream_data = true;
+            last.has_stream_data = rtx_buf != null;
             last.stream_id = stream_id;
             last.stream_offset = offset;
             last.stream_data = rtx_buf;
@@ -3302,7 +3325,7 @@ pub const Server = struct {
             if (p.sent_in_buf == p.data.len) {
                 const buf = p.data;
                 _ = conn.pending_stream_sends.orderedRemove(i);
-                self.allocator.free(buf);
+                if (buf.len > 0) self.allocator.free(buf);
             } else {
                 i += 1;
             }
@@ -8507,17 +8530,22 @@ pub const Client = struct {
             _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
             self.conn.fc_bytes_sent +|= chunk_len;
             self.conn.note1RttSent();
-            const rtx_buf = self.allocator.dupe(u8, chunk) catch {
+            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
+            // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
+            // allocator's zero-length sentinel slice, which freeing on ack/loss
+            // corrupts the heap. Track with no stream_data; a lost bare FIN is
+            // re-emitted by the FIN-only loss-recovery arm.
+            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
                 i += 1;
                 continue;
-            };
+            });
             const recorded = self.conn.ld.onPacketSent(.{
                 .pn = pn,
                 .send_time_ms = @intCast(compat.milliTimestamp()),
                 .size = pkt_len,
                 .ack_eliciting = true,
                 .in_flight = true,
-                .has_stream_data = true,
+                .has_stream_data = rtx_buf != null,
                 .stream_id = stream_id,
                 .stream_offset = offset,
                 .stream_data = rtx_buf,
@@ -8527,8 +8555,8 @@ pub const Client = struct {
             if (recorded) {
                 self.conn.cc.onPacketSent(@intCast(pkt_len));
                 self.conn.pacerConsume(@intCast(pkt_len));
-            } else {
-                self.allocator.free(rtx_buf);
+            } else if (rtx_buf) |b| {
+                self.allocator.free(b);
             }
             p.sent_in_buf += chunk_len;
             p.offset += chunk_len;
@@ -8536,7 +8564,7 @@ pub const Client = struct {
             if (p.sent_in_buf == p.data.len) {
                 const buf = p.data;
                 _ = self.conn.pending_stream_sends.orderedRemove(i);
-                self.allocator.free(buf);
+                if (buf.len > 0) self.allocator.free(buf);
             } else {
                 i += 1;
             }
@@ -12330,4 +12358,207 @@ test "stateless reset: short unknown-DCID probe below 41 bytes does not bump sen
     const sent_before = lb.server.stateless_reset_sent;
     _ = lb.server.processOneServer1RttPacket(&buf, lb.client.conn.peer);
     try std.testing.expectEqual(sent_before, lb.server.stateless_reset_sent);
+}
+
+test "raw-app server-initiated bidi: CLIENT separate empty-FIN survives a pacer-blocked submit" {
+    // DETERMINISTIC regression for the residual ~1-2%-per-attempt flake on the
+    // req/resp-over-inbound reverse direction (zig-libp2p v0.2.10): a QUIC
+    // *client* writes a length-framed response with fin=FALSE and then a
+    // SEPARATE empty STREAM frame with fin=TRUE at the next offset. When the
+    // congestion/pacer gate (`connCanTransmitAppData`) happens to be blocked at
+    // the instant the empty FIN is submitted — which under real RTT/cwnd
+    // pressure occurs ~1-2% of the time but never on a quiet loopback — the FIN
+    // is routed to `clientEnqueueFreshStream` → `enqueuePendingStreamSend`.
+    // There the empty-FIN-only path tried to ride the FIN out on an existing
+    // queued frame for the stream, but the data frame had already gone straight
+    // to the wire (queue empty), so the FIN was silently dropped and the server
+    // never reached `rawAppStreamFullyReceived` (signature: saw_chunk=true
+    // saw_end=false).
+    //
+    // We force the exact condition deterministically by draining the client's
+    // pacing tokens right before the empty FIN is submitted (a 0-byte frame
+    // still requires >=1 pacing token via `pacerHasCredit`'s `@max(bytes, 1)`).
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+    var drop = RawDrop{};
+
+    // 1. Server sends request WITH FIN; client receives the whole request.
+    {
+        var sent = false;
+        var got = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent) {
+                if (lb.server.sendRawStreamData(conn, sid, 0, "REQ", true) > 0) sent = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                if (b.len == 3 and lb.client.rawAppStreamFinReceived(sid)) {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        try std.testing.expect(got);
+    }
+
+    // 2. Client sends the length-framed response with fin=FALSE and pumps until
+    //    the server has the chunk (saw_chunk=true) but not yet the FIN.
+    const response = "RESPONSE-ON-SERVER-INITIATED-STREAM";
+    {
+        var sent_data = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent_data) {
+                if (lb.client.sendRawStreamData(sid, 0, response, false) > 0) sent_data = true;
+            }
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (rawAppRecvBuffer(conn, sid)) |b| {
+                if (b.len == response.len) break;
+            }
+        }
+        const b = rawAppRecvBuffer(conn, sid) orelse return error.ChunkNotDelivered;
+        try std.testing.expectEqual(response.len, b.len);
+        try std.testing.expect(!rawAppStreamFullyReceived(conn, sid)); // FIN not sent yet
+    }
+
+    // 3. Submit the SEPARATE empty FIN while the pacer is drained — this is the
+    //    flake window. The data frame already went on the wire, so
+    //    `pending_stream_sends` is empty for this stream.
+    try std.testing.expectEqual(@as(usize, 0), lb.client.conn.pending_stream_sends.items.len);
+    lb.client.conn.pacing_tokens = 0;
+    lb.client.conn.pacing_last_ms = compat.milliTimestamp();
+    _ = lb.client.sendRawStreamData(sid, response.len, &[_]u8{}, true);
+
+    // 4. The FIN must still reach the server. Before the fix the FIN was
+    //    silently dropped here and this loop times out.
+    {
+        var done = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (rawAppStreamFullyReceived(conn, sid)) {
+                done = true;
+                break;
+            }
+        }
+        if (!done) {
+            std.debug.print(
+                "FAIL: empty FIN dropped on pacer-blocked submit (saw_chunk={} saw_end={})\n",
+                .{ rawAppRecvBuffer(conn, sid) != null, rawAppStreamFinReceived(conn, sid) },
+            );
+            return error.FinDroppedOnPacerBlock;
+        }
+    }
+    const got = rawAppRecvBuffer(conn, sid).?;
+    try std.testing.expectEqualSlices(u8, response, got);
+
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+}
+
+test "raw-app server-initiated bidi: CLIENT reply with SEPARATE empty-FIN frame is reliable (no flake)" {
+    // Faithful happy-path loop of the req/resp-over-inbound reverse direction:
+    // server opens a bidi stream + sends a request WITH FIN, client replies with
+    // a length-framed response (fin=FALSE) followed by a SEPARATE empty STREAM
+    // frame (fin=TRUE), and the server must reassemble the response AND see
+    // `rawAppStreamFullyReceived`. Loops many times on one long-lived connection
+    // (libp2p multiplexes streams) to catch any timing-dependent drop. The
+    // deterministic pacer-blocked case is covered by the test above.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    const request = "REQ-FROM-SERVER";
+    const response = "RESPONSE-FROM-CLIENT-ON-SERVER-INITIATED-STREAM";
+
+    const iterations: usize = 600;
+    var iter: usize = 0;
+    while (iter < iterations) : (iter += 1) {
+        const sid = try lb.server.openRawAppStream(conn);
+        var drop = RawDrop{};
+
+        // 1. Server sends the request WITH FIN (single frame — the passing
+        //    pattern). Client must receive the whole request + FIN.
+        {
+            var sent = false;
+            var got = false;
+            const deadline = compat.milliTimestamp() + 5_000;
+            while (compat.milliTimestamp() < deadline) {
+                if (!sent) {
+                    if (lb.server.sendRawStreamData(conn, sid, 0, request, true) > 0) sent = true;
+                }
+                rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+                if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                    if (b.len == request.len and lb.client.rawAppStreamFinReceived(sid)) {
+                        got = true;
+                        break;
+                    }
+                }
+            }
+            if (!got) {
+                std.debug.print(
+                    "FAIL iter={}: request never fully received by client (saw_chunk={} saw_end={})\n",
+                    .{ iter, lb.client.rawAppRecvBuffer(sid) != null, lb.client.rawAppStreamFinReceived(sid) },
+                );
+                return error.RequestNotDelivered;
+            }
+        }
+
+        // 2. Client replies: length-framed response with fin=FALSE, THEN a
+        //    SEPARATE empty STREAM frame with fin=TRUE at the next offset.
+        //    This is the real req/resp-over-inbound byte pattern that flakes.
+        {
+            var sent_data = false;
+            var sent_fin = false;
+            var done = false;
+            const deadline = compat.milliTimestamp() + 5_000;
+            while (compat.milliTimestamp() < deadline) {
+                if (!sent_data) {
+                    if (lb.client.sendRawStreamData(sid, 0, response, false) > 0) sent_data = true;
+                } else if (!sent_fin) {
+                    // Empty FIN-only frame at the next offset. Returns 0 (no
+                    // payload bytes) on both success and queue-full, so it is
+                    // issued exactly once and reliability must come from the
+                    // stack, not a caller retry — mirroring libp2p usage.
+                    _ = lb.client.sendRawStreamData(sid, response.len, &[_]u8{}, true);
+                    sent_fin = true;
+                }
+                rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+                if (rawAppRecvBuffer(conn, sid)) |b| {
+                    if (b.len == response.len and rawAppStreamFullyReceived(conn, sid)) {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if (!done) {
+                const b = rawAppRecvBuffer(conn, sid);
+                std.debug.print(
+                    "FAIL iter={}: response not fully received by server (saw_chunk={} saw_end={} bytes={})\n",
+                    .{ iter, b != null, rawAppStreamFinReceived(conn, sid), if (b) |x| x.len else 0 },
+                );
+                return error.ResponseNotDelivered;
+            }
+            const got = rawAppRecvBuffer(conn, sid).?;
+            try std.testing.expectEqualSlices(u8, response, got);
+        }
+
+        try std.testing.expect(lb.client.releaseRawAppStream(sid));
+        try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+    }
 }
