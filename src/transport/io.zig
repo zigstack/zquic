@@ -6228,13 +6228,20 @@ pub const Server = struct {
                     conn.ld.sent_count >= recovery.LossDetector.max_tracked_packets / 4 or
                     conn.pending_stream_sends.items.len > 0;
                 if (elapsed_since_ack_lost >= lost_threshold_ms and has_substantial_data_stuck) {
-                    log.warn("io: server declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); marking draining", .{
+                    log.warn("io: server declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); sent={} acked={} lost={} cong_events={} cwnd={} ssthresh={} srtt_ms={} marking draining", .{
                         elapsed_since_ack_lost,
                         lost_threshold_ms,
                         conn.cc.getBytesInFlight(),
                         conn.ld.sent_count,
                         recovery.LossDetector.max_tracked_packets,
                         conn.pending_stream_sends.items.len,
+                        conn.app_pn,
+                        conn.cc.getTotalBytesAcked(),
+                        conn.ld.total_declared_lost,
+                        conn.cc.getCongestionEvents(),
+                        conn.cc.getCwnd(),
+                        conn.cc.getSsthresh(),
+                        conn.rtt.srtt_ms,
                     });
                     conn.draining = true;
                     const pto: u64 = conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, 0);
@@ -8845,13 +8852,20 @@ pub const Client = struct {
         if (self.conn.phase == .connected and
             elapsed_since_ack >= lost_threshold_ms and has_substantial_data_stuck)
         {
-            log.warn("io: client declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); marking draining", .{
+            log.warn("io: client declaring connection lost (no ACK for {}ms >= {}ms, bif={}, ld={}/{}, pending={}); sent={} acked={} lost={} cong_events={} cwnd={} ssthresh={} srtt_ms={} marking draining", .{
                 elapsed_since_ack,
                 lost_threshold_ms,
                 self.conn.cc.getBytesInFlight(),
                 self.conn.ld.sent_count,
                 recovery.LossDetector.max_tracked_packets,
                 self.conn.pending_stream_sends.items.len,
+                self.conn.app_pn,
+                self.conn.cc.getTotalBytesAcked(),
+                self.conn.ld.total_declared_lost,
+                self.conn.cc.getCongestionEvents(),
+                self.conn.cc.getCwnd(),
+                self.conn.cc.getSsthresh(),
+                self.conn.rtt.srtt_ms,
             });
             self.conn.draining = true;
             const pto: u64 = self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, 0);

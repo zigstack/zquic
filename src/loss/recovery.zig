@@ -192,6 +192,11 @@ pub const LossDetector = struct {
     sent_count: usize = 0,
     largest_acked: [pn_space_count]u64 = [_]u64{0} ** pn_space_count,
     loss_time_ms: [pn_space_count]?u64 = .{null} ** pn_space_count,
+    /// Cumulative count of packets this detector has declared lost over the
+    /// connection's lifetime (diagnostic). A high value at connection-lost time
+    /// vs. a low one distinguishes a retransmit/loss storm from a healthy
+    /// transfer that simply stalled (peer went silent with data in flight).
+    total_declared_lost: u64 = 0,
 
     fn spaceIdx(space: PacketNumberSpace) usize {
         return @intFromEnum(space);
@@ -453,6 +458,7 @@ pub const LossDetector = struct {
             }
         }
 
+        self.total_declared_lost += lost_count;
         return OnAckResult{
             .lost_count = lost_count,
             .rtt_updated = rtt_updated,
