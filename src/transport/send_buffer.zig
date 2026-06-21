@@ -103,23 +103,29 @@ pub const SendBuffer = struct {
 
     fn mergeLost(self: *SendBuffer, allocator: std.mem.Allocator, offset: u64, len: usize) !void {
         if (len == 0) return;
-        const end = offset + len;
+        // Walk once, absorbing every overlapping / adjacent range into a single
+        // accumulator. The previous version recursed with the ORIGINAL
+        // (offset, len) after each merge — since the merged range still overlaps
+        // with those args, the recursion never terminated (release builds TCO'd
+        // it into a CPU spin, which is exactly the symptom the post-rebase
+        // interop hit: transfer stalled with `pending_stream_sends` drained but
+        // CC stuck in recovery and bif > cwnd).
+        var new_off = offset;
+        var new_end = offset + len;
         var i: usize = 0;
         while (i < self.lost.items.len) {
-            const r = &self.lost.items[i];
+            const r = self.lost.items[i];
             const r_end = r.offset + r.len;
-            if (end < r.offset or offset > r_end) {
+            if (new_end < r.offset or new_off > r_end) {
                 i += 1;
                 continue;
             }
-            const new_off = @min(offset, r.offset);
-            const new_end = @max(end, r_end);
-            r.offset = new_off;
-            r.len = @intCast(new_end - new_off);
-            try self.mergeLost(allocator, offset, len);
-            return;
+            new_off = @min(new_off, r.offset);
+            new_end = @max(new_end, r_end);
+            _ = self.lost.orderedRemove(i);
+            // Don't increment i — the shifted-down entry takes this slot.
         }
-        try self.lost.append(allocator, .{ .offset = offset, .len = len });
+        try self.lost.append(allocator, .{ .offset = new_off, .len = @intCast(new_end - new_off) });
     }
 
     /// Mark `[offset, offset+len)` as ACKed by the peer.
@@ -373,4 +379,30 @@ test "send_buffer: fin only" {
     const p = buf.pollTransmit(64).?;
     try testing.expect(p.fin);
     try testing.expectEqual(@as(u64, 100), p.offset);
+}
+
+test "send_buffer: overlapping onLoss calls coalesce (regression for infinite-recurse mergeLost)" {
+    const testing = std.testing;
+    var buf: SendBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    try buf.append(testing.allocator, 0, "abcdefghij", false);
+    _ = buf.pollTransmit(10);
+    buf.onSent(0, 10);
+
+    // First lost range; alone, append-only path is exercised.
+    try buf.onLoss(testing.allocator, 0, 4);
+    try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
+
+    // Second lost range overlapping the first — previously triggered
+    // mergeLost's terminal-recurse-with-original-args spin.
+    try buf.onLoss(testing.allocator, 2, 4);
+    try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
+    try testing.expectEqual(@as(u64, 0), buf.lost.items[0].offset);
+    try testing.expectEqual(@as(usize, 6), buf.lost.items[0].len);
+
+    // Third lost range adjacent to the merged range — also merges.
+    try buf.onLoss(testing.allocator, 6, 2);
+    try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
+    try testing.expectEqual(@as(usize, 8), buf.lost.items[0].len);
 }
