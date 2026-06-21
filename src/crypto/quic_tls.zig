@@ -171,6 +171,8 @@ pub const TransportParamsOpts = struct {
     /// interop images that mishandle 0x2ab2 still complete handshakes; opt in
     /// explicitly when the peer is known to support RFC 9287.
     grease_quic_bit: bool = false,
+    /// RFC 9221 `max_datagram_frame_size` (0x20).  Omitted when zero (disabled).
+    max_datagram_frame_size: u64 = 0,
 };
 
 /// Preset transport-parameter profiles for common embedders.
@@ -317,6 +319,10 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     if (opts.grease_quic_bit) {
         pos = try writeParamBytes(out, pos, 0x2ab2, &[_]u8{});
     }
+    // RFC 9221: max_datagram_frame_size (0x20).
+    if (opts.max_datagram_frame_size > 0) {
+        pos = try writeParamVarint(out, pos, 0x20, opts.max_datagram_frame_size);
+    }
     return pos;
 }
 
@@ -377,6 +383,8 @@ pub const PeerTransportParams = struct {
     preferred_address: ?PreferredAddressTp = null,
     /// RFC 9287 `grease_quic_bit` (0x2ab2): peer tolerates greased QUIC bit.
     grease_quic_bit: bool = false,
+    /// 0x20 — RFC 9221 max DATAGRAM frame payload size.  Zero when absent.
+    max_datagram_frame_size: u64 = 0,
 };
 
 /// On-wire layout of the preferred_address transport parameter (RFC 9000
@@ -472,6 +480,7 @@ pub fn parseTransportParams(bytes: []const u8) varint.DecodeError!PeerTransportP
             0x0d => out.preferred_address = parsePreferredAddress(value),
             0x0e => out.active_connection_id_limit = readVarintField(value) catch continue,
             0x2ab2 => out.grease_quic_bit = (value_len == 0),
+            0x20 => out.max_datagram_frame_size = readVarintField(value) catch continue,
             else => {}, // unknown / reserved / connection-id params are not surfaced here
         }
     }
@@ -505,6 +514,18 @@ test "transport params: round-trip varint fields" {
     try testing.expectEqual(@as(u64, 4), parsed.active_connection_id_limit);
     // We don't emit `disable_active_migration`; check the default here.
     try testing.expectEqual(false, parsed.disable_active_migration);
+}
+
+test "transport params: max_datagram_frame_size round-trip" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const n = try buildTransportParams(&buf, .{
+        .initial_source_cid = &cid,
+        .max_datagram_frame_size = 1200,
+    });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expectEqual(@as(u64, 1200), parsed.max_datagram_frame_size);
 }
 
 test "transport params: unknown ids are skipped" {

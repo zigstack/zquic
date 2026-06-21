@@ -42,10 +42,12 @@ pub const transport = struct {
     pub const migration = @import("transport/migration.zig");
     pub const io = @import("transport/io.zig");
     pub const path_mtu = @import("transport/path_mtu.zig");
+    pub const datagrams = @import("transport/datagrams.zig");
 };
 pub const http3 = struct {
     pub const frame = @import("http3/frame.zig");
     pub const qpack = @import("http3/qpack.zig");
+    pub const connect = @import("http3/connect.zig");
 };
 pub const http09 = struct {
     pub const server = @import("http09/server.zig");
@@ -60,6 +62,7 @@ pub const frames = struct {
     pub const crypto_frame = @import("frames/crypto_frame.zig");
     pub const stream = @import("frames/stream.zig");
     pub const transport = @import("frames/transport.zig");
+    pub const datagram = @import("frames/datagram.zig");
 };
 
 test {
@@ -92,6 +95,7 @@ test {
     _ = @import("transport/path_mtu.zig");
     _ = @import("http3/frame.zig");
     _ = @import("http3/qpack.zig");
+    _ = @import("http3/connect.zig");
     _ = @import("http09/server.zig");
     _ = @import("http09/client.zig");
     _ = @import("frames/frame.zig");
@@ -99,5 +103,7 @@ test {
     _ = @import("frames/crypto_frame.zig");
     _ = @import("frames/stream.zig");
     _ = @import("frames/transport.zig");
+    _ = @import("frames/datagram.zig");
+    _ = @import("transport/datagrams.zig");
     _ = @import("qlog/writer.zig");
 }
