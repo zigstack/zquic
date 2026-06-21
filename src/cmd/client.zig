@@ -150,7 +150,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .qlog_dir = cfg.qlog_dir,
     };
 
-    var client = io_mod.Client.init(allocator, client_config) catch |err| {
+    // `Client` is ~4 MB (ConnState + the new client-side `send_batch` from
+    // 72bfda3). `Client.init` returns by value, which the docker interop
+    // container's default stack cannot safely accommodate — `client = init(...)`
+    // segfaults inside `runEventLoop` shortly after the qlog
+    // `connection_started` event. Allocate on the heap via `initInPlace`.
+    const client = allocator.create(io_mod.Client) catch |err| {
+        std.debug.print("client allocation failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.destroy(client);
+
+    io_mod.Client.initInPlace(allocator, client_config, client) catch |err| {
         std.debug.print("client init failed: {}\n", .{err});
         std.process.exit(1);
     };
