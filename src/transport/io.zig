@@ -1045,6 +1045,15 @@ const pending_stream_send_bytes_cap: usize = 32 * 1024 * 1024;
 /// worst-case STREAM-frame + 1-RTT packet header overhead.
 const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 
+/// Fairness bound: max pending-stream-send entries flushed per drain call. The
+/// drain loops below previously emptied the whole pending queue in one call, so
+/// a connection recovering from a stall (large `pending_stream_sends` backlog +
+/// open cwnd) monopolized the single drive thread for >1s — starving ACKs to
+/// every other peer (the residual drive-loop stall after the recv-drain bound).
+/// Cap per call; the remainder drains on subsequent iterations. Well above the
+/// steady-state per-conn send rate, so it only bounds post-stall catch-up bursts.
+const max_pending_drain_per_call: usize = 1024;
+
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
 /// Returns false when the per-connection caps are exhausted; callers must
@@ -3122,11 +3131,11 @@ pub const Server = struct {
     }
 
     fn drainPendingStreamSendsUntilStalled(self: *Server, conn: *ConnState) void {
-        while (true) {
-            const before = conn.pending_stream_sends.items.len;
-            self.drainPendingStreamSends(conn);
-            if (conn.pending_stream_sends.items.len == before) break;
-        }
+        // Single bounded drain (drainPendingStreamSends caps at
+        // max_pending_drain_per_call); the remainder flushes on the next drive
+        // iteration. Previously looped until empty, monopolizing the drive
+        // thread on a large post-stall backlog and starving every peer's ACKs.
+        self.drainPendingStreamSends(conn);
     }
 
     /// Enqueue a fresh stream send when flow-control or congestion blocks the
@@ -3339,7 +3348,9 @@ pub const Server = struct {
         if (conn.draining or conn.phase != .connected or !conn.has_app_keys) return;
         if (conn.pending_stream_sends.items.len == 0) return;
         var i: usize = 0;
+        var drained: usize = 0;
         while (i < conn.pending_stream_sends.items.len) {
+            if (drained >= max_pending_drain_per_call) return; // fairness bound
             const p = &conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
@@ -3378,6 +3389,7 @@ pub const Server = struct {
             self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
             if (conn.app_pn == pn_before) return;
             conn.fc_bytes_sent +|= chunk_len;
+            drained += 1;
             if (conn.ld.sent_count == 0) {
                 p.sent_in_buf += chunk_len;
                 p.offset += chunk_len;
@@ -8401,11 +8413,10 @@ pub const Client = struct {
     /// wire path.  Returns bytes accepted (data.len) or 0 on queue overflow.
     /// Drain the pending queue until a pass makes no progress (CC/FC blocked).
     fn drainPendingStreamSendsUntilStalled(self: *Client) void {
-        while (true) {
-            const before = self.conn.pending_stream_sends.items.len;
-            self.drainPendingStreamSends();
-            if (self.conn.pending_stream_sends.items.len == before) break;
-        }
+        // Single bounded drain (see Server.drainPendingStreamSendsUntilStalled);
+        // remainder flushes next drive iteration. Avoids monopolizing the drive
+        // thread on a large post-stall backlog.
+        self.drainPendingStreamSends();
     }
 
     fn clientEnqueueFreshStream(
@@ -8617,7 +8628,9 @@ pub const Client = struct {
         if (self.conn.draining or self.conn.phase != .connected or !self.conn.has_app_keys) return;
         if (self.conn.pending_stream_sends.items.len == 0) return;
         var i: usize = 0;
+        var drained: usize = 0;
         while (i < self.conn.pending_stream_sends.items.len) {
+            if (drained >= max_pending_drain_per_call) return; // fairness bound
             const p = &self.conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
@@ -8678,6 +8691,7 @@ pub const Client = struct {
             self.batchSend(send_buf[0..pkt_len]);
             self.conn.fc_bytes_sent +|= chunk_len;
             self.conn.note1RttSent();
+            drained += 1;
             // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
             // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
             // allocator's zero-length sentinel slice, which freeing on ack/loss
