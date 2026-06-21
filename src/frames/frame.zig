@@ -31,6 +31,7 @@ const types = @import("../types.zig");
 
 pub const ack = @import("ack.zig");
 pub const crypto_frame = @import("crypto_frame.zig");
+pub const datagram_mod = @import("datagram.zig");
 pub const stream = @import("stream.zig");
 pub const transport = @import("transport.zig");
 
@@ -86,6 +87,7 @@ pub const Frame = union(enum) {
     path_response: transport.PathResponse,
     connection_close: transport.ConnectionClose,
     handshake_done: transport.HandshakeDone,
+    datagram: datagram_mod.DatagramFrame,
 
     /// Returns true if this frame type is allowed in Initial packets.
     pub fn allowedInInitial(self: Frame) bool {
@@ -211,6 +213,10 @@ pub fn parseOne(buf: []const u8) ParseError!struct { frame: Frame, consumed: usi
             return .{ .frame = .{ .connection_close = r.frame }, .consumed = pos + r.consumed };
         },
         0x1e => return .{ .frame = .{ .handshake_done = .{} }, .consumed = pos },
+        0x30, 0x31 => {
+            const r = try datagram_mod.DatagramFrame.parse(buf[pos..], ft);
+            return .{ .frame = .{ .datagram = r.frame }, .consumed = pos + r.consumed };
+        },
         else => return error.UnknownFrameType,
     }
 }

@@ -32,6 +32,9 @@ const retry_mod = @import("../packet/retry.zig");
 const session_mod = @import("../crypto/session.zig");
 const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
+const h3_connect = @import("../http3/connect.zig");
+const datagram_mod = @import("../frames/datagram.zig");
+const datagrams_mod = @import("datagrams.zig");
 const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
 const ack_frame_mod = @import("../frames/ack.zig");
@@ -1483,6 +1486,43 @@ const Http3OutSlot = struct {
     }
 };
 
+/// RFC 9220 Extended CONNECT session tracked per request stream.
+const ExtendedConnectSlot = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    protocol_len: usize = 0,
+    protocol: [h3_connect.max_protocol_len]u8 = undefined,
+};
+
+const max_extended_connect_slots: usize = 16;
+
+fn configMaxDatagramFrameSize(http3: bool, explicit: u64) u64 {
+    if (explicit > 0) return explicit;
+    if (http3) return datagrams_mod.max_payload;
+    return 0;
+}
+
+fn connReceiveDatagram(conn: *ConnState, payload: []const u8) void {
+    if (!conn.datagramsEnabled()) return;
+    const max = conn.maxDatagramPayload() orelse return;
+    if (payload.len > max) return;
+    conn.datagram_recv.push(payload);
+}
+
+fn writeH3EndpointSettings(out: []u8, http3: bool, extended_connect: bool) usize {
+    var settings: [4]h3_frame.Setting = undefined;
+    var n: usize = 0;
+    settings[n] = .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY };
+    n += 1;
+    settings[n] = .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = QPACK_BLOCKED_STREAMS_MAX };
+    n += 1;
+    if (http3 and extended_connect) {
+        settings[n] = .{ .id = h3_connect.SETTINGS_ENABLE_CONNECT_PROTOCOL, .value = 1 };
+        n += 1;
+    }
+    return h3_frame.writeSettings(out, settings[0..n]) catch 0;
+}
+
 /// Receive buffer for one QUIC stream when `ServerConfig.raw_application_streams` /
 /// `ClientConfig.raw_application_streams` is enabled (opaque bytes, no HTTP parsing).
 pub const RawAppStreamSlot = raw_app_stream.RawAppStreamSlot;
@@ -1704,6 +1744,14 @@ pub const ConnState = struct {
 
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
+    /// Peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220).
+    peer_h3_connect_enabled: bool = false,
+    /// RFC 9221 local/peer max DATAGRAM payload (transport param 0x20).
+    local_max_datagram_frame_size: u64 = 0,
+    peer_max_datagram_frame_size: u64 = 0,
+    datagram_recv: datagrams_mod.RecvQueue = .{},
+    extended_connect_slots: [max_extended_connect_slots]ExtendedConnectSlot =
+        [_]ExtendedConnectSlot{.{}} ** max_extended_connect_slots,
 
     // QPACK per-connection decoder state (RFC 9204 §3.2).
     // Populated by instructions arriving on the peer's QPACK encoder stream
@@ -2290,6 +2338,49 @@ pub const ConnState = struct {
             dbg("io: peer advertised preferred_address (v4_port={} v6_port={} cid_len={})\n", .{ pa.ipv4_port, pa.ipv6_port, pa.connection_id_len });
         }
         self.peer_grease_quic_bit = parsed.grease_quic_bit;
+        self.peer_max_datagram_frame_size = parsed.max_datagram_frame_size;
+    }
+
+    /// True when both endpoints advertised a non-zero max_datagram_frame_size.
+    pub fn datagramsEnabled(self: *const ConnState) bool {
+        return self.local_max_datagram_frame_size > 0 and self.peer_max_datagram_frame_size > 0;
+    }
+
+    /// Largest DATAGRAM payload we may send or accept, or null when disabled.
+    pub fn maxDatagramPayload(self: *const ConnState) ?usize {
+        if (!self.datagramsEnabled()) return null;
+        const cap = @min(self.local_max_datagram_frame_size, self.peer_max_datagram_frame_size);
+        if (cap == 0) return null;
+        return @intCast(cap);
+    }
+
+    /// Dequeue one received application datagram (RFC 9221), oldest first.
+    pub fn readDatagram(self: *ConnState) ?[]const u8 {
+        return self.datagram_recv.pop();
+    }
+
+    pub fn hasDatagram(self: *const ConnState) bool {
+        return self.datagram_recv.hasPending();
+    }
+
+    pub fn registerExtendedConnect(self: *ConnState, stream_id: u64, protocol: []const u8) void {
+        for (&self.extended_connect_slots) |*slot| {
+            if (!slot.active) {
+                const n = @min(protocol.len, slot.protocol.len);
+                @memcpy(slot.protocol[0..n], protocol[0..n]);
+                slot.protocol_len = n;
+                slot.stream_id = stream_id;
+                slot.active = true;
+                return;
+            }
+        }
+    }
+
+    pub fn extendedConnectActive(self: *const ConnState, stream_id: u64) bool {
+        for (self.extended_connect_slots) |slot| {
+            if (slot.active and slot.stream_id == stream_id) return true;
+        }
+        return false;
     }
 
     /// Match an incoming DCID against the alternative-CID pool.
@@ -2838,6 +2929,10 @@ pub const ServerConfig = struct {
     preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
     /// QUIC transport-parameter profile advertised during the TLS handshake.
     transport_params_preset: quic_tls_mod.TransportParamsPreset = .default,
+    /// RFC 9221: max DATAGRAM frame size to advertise (0 = use HTTP/3 default).
+    max_datagram_frame_size: u64 = 0,
+    /// RFC 9220: SETTINGS_ENABLE_CONNECT_PROTOCOL on the HTTP/3 control stream.
+    h3_extended_connect: bool = true,
 };
 
 /// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
@@ -3104,6 +3199,18 @@ pub const Server = struct {
         fin: bool,
     ) usize {
         return self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
+    }
+
+    /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
+    /// disabled or `data` exceeds the negotiated max payload.
+    pub fn sendDatagram(self: *Server, conn: *ConnState, data: []const u8) bool {
+        const max = conn.maxDatagramPayload() orelse return false;
+        if (data.len > max) return false;
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const dg = datagram_mod.DatagramFrame{ .data = data };
+        const frame_len = dg.serializeWithLength(&frame_buf) catch return false;
+        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
+        return true;
     }
 
     /// Open a **server-initiated** bidirectional raw-app stream (RFC 9000 §2.1:
@@ -4385,6 +4492,9 @@ pub const Server = struct {
         tp_opts.original_destination_cid = odcid;
         tp_opts.stateless_reset_token = conn.stateless_reset_token;
         tp_opts.preferred_address = self.config.preferred_address;
+        const datagram_tp = configMaxDatagramFrameSize(self.config.http3, self.config.max_datagram_frame_size);
+        tp_opts.max_datagram_frame_size = datagram_tp;
+        conn.local_max_datagram_frame_size = datagram_tp;
         // Mirror the windows we are about to advertise so our MAX_DATA /
         // MAX_STREAM_DATA extension thresholds match what the peer will obey.
         conn.seedLocalRecvWindows(self.config.transport_params_preset);
@@ -5812,6 +5922,16 @@ pub const Server = struct {
                 pos += tlen;
                 continue;
             }
+            if (ft == 0x30 or ft == 0x31) {
+                const r = datagram_mod.DatagramFrame.parse(frames[pos..], ft) catch break;
+                connReceiveDatagram(conn, r.frame.data);
+                if (ft == 0x31) {
+                    pos = frames.len;
+                } else {
+                    pos += r.consumed;
+                }
+                continue;
+            }
             // Unknown frame type — cannot safely skip without knowing the length.
             break;
         }
@@ -6982,8 +7102,10 @@ pub const Server = struct {
         var pos: usize = 0;
         var method_buf: [8]u8 = undefined;
         var path_buf: [512]u8 = undefined;
+        var protocol_buf: [h3_connect.max_protocol_len]u8 = undefined;
         var method: []const u8 = "GET";
         var path: []const u8 = "/";
+        var protocol: []const u8 = "";
 
         while (pos < sf.data.len) {
             const pr = h3_frame.parseFrame(sf.data[pos..]) catch break;
@@ -7015,6 +7137,10 @@ pub const Server = struct {
                             const pl = @min(fld.value.len, path_buf.len);
                             @memcpy(path_buf[0..pl], fld.value[0..pl]);
                             path = path_buf[0..pl];
+                        } else if (std.mem.eql(u8, fld.name, ":protocol")) {
+                            const pl = @min(fld.value.len, protocol_buf.len);
+                            @memcpy(protocol_buf[0..pl], fld.value[0..pl]);
+                            protocol = protocol_buf[0..pl];
                         }
                     }
                 },
@@ -7028,6 +7154,21 @@ pub const Server = struct {
         }
 
         dbg("io: http3 request stream_id={} method={s} path={s}\n", .{ sf.stream_id, method, path });
+
+        if (std.mem.eql(u8, method, "CONNECT")) {
+            if (!conn.peer_h3_connect_enabled) {
+                self.sendH3Response(conn, sf.stream_id, 405, &.{}, src);
+                return;
+            }
+            if (protocol.len == 0) {
+                self.sendH3Response(conn, sf.stream_id, 400, &.{}, src);
+                return;
+            }
+            self.sendH3ConnectAccepted(conn, sf.stream_id, src);
+            conn.registerExtendedConnect(sf.stream_id, protocol);
+            dbg("io: http3 extended CONNECT stream_id={} protocol={s}\n", .{ sf.stream_id, protocol });
+            return;
+        }
 
         if (!std.mem.eql(u8, method, "GET")) return;
 
@@ -7124,6 +7265,9 @@ pub const Server = struct {
                             // Client is done sending requests — we may finish in-flight work.
                             dbg("io: h3 GOAWAY received from client stream_id={}\n", .{stream_id});
                             conn.draining = true;
+                        },
+                        .settings => |sv| {
+                            h3_connect.applySettings(sv.settings[0..sv.count], &conn.peer_h3_connect_enabled);
                         },
                         else => {},
                     }
@@ -7300,10 +7444,8 @@ pub const Server = struct {
         // knows it may insert entries into our dynamic table (RFC 9204 §3.2.3).
         // Advertise QPACK_BLOCKED_STREAMS so the peer knows we can tolerate
         // up to QPACK_BLOCKED_STREAMS_MAX streams blocked on table insertions.
-        const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
-            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
-            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = QPACK_BLOCKED_STREAMS_MAX },
-        }) catch return;
+        const settings_len = writeH3EndpointSettings(buf[pos..], self.config.http3, self.config.h3_extended_connect);
+        if (settings_len == 0) return;
         pos += settings_len;
 
         const sf = stream_frame_mod.StreamFrame{
@@ -7402,6 +7544,14 @@ pub const Server = struct {
         conn.qpack_enc_tbl.insert(name, value) catch {}; // non-critical: dynamic table full
         conn.qpack_enc_stream_off += ins_len;
         dbg("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
+    }
+
+    fn sendH3ConnectAccepted(self: *Server, conn: *ConnState, stream_id: u64, src: compat.Address) void {
+        var header_block: [256]u8 = undefined;
+        const hb_len = h3_connect.encodeConnectResponse200(&header_block, &conn.qpack_enc_tbl) catch return;
+        var out: [300]u8 = undefined;
+        const out_len = h3_frame.writeFrame(&out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
+        self.sendStreamDataH3(conn, stream_id, 0, out[0..out_len], true, src);
     }
 
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: compat.Address) void {
@@ -7660,6 +7810,10 @@ pub const ClientConfig = struct {
     client_key_pem: ?[]const u8 = null,
     /// QUIC transport-parameter profile advertised during the TLS handshake.
     transport_params_preset: quic_tls_mod.TransportParamsPreset = .default,
+    /// RFC 9221: max DATAGRAM frame size to advertise (0 = use HTTP/3 default).
+    max_datagram_frame_size: u64 = 0,
+    /// RFC 9220: SETTINGS_ENABLE_CONNECT_PROTOCOL on the HTTP/3 control stream.
+    h3_extended_connect: bool = true,
 };
 
 /// TLS ALPN value for `ClientConfig`.
@@ -8261,9 +8415,47 @@ pub const Client = struct {
         return self.sendRawStreamDataInner(stream_id, offset, data, fin, null);
     }
 
-    /// Send one ack-eliciting 1-RTT packet with `payload` frames.  Updates
-    /// LD+CC like `Server.send1Rtt`.  Returns the packet number sent, or
-    /// null if not connected or wire I/O fails.
+    /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
+    /// disabled or `data` exceeds the negotiated max payload.
+    pub fn sendDatagram(self: *Client, data: []const u8) bool {
+        const max = self.conn.maxDatagramPayload() orelse return false;
+        if (data.len > max) return false;
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const dg = datagram_mod.DatagramFrame{ .data = data };
+        const frame_len = dg.serializeWithLength(&frame_buf) catch return false;
+        return self.sendClient1Rtt(frame_buf[0..frame_len]) != null;
+    }
+
+    /// RFC 9220 Extended CONNECT: open a bidirectional stream and send CONNECT
+    /// with the given `:protocol` pseudo-header.
+    pub fn sendH3ExtendedConnect(self: *Client, path: []const u8, protocol: []const u8) OpenLocalStreamError!u64 {
+        if (!self.config.http3 or self.conn.phase != .connected) return error.StreamLimitExceeded;
+        const stream_id = try rawAllocateNextLocalBidiStream(&self.conn);
+        if (!self.h3_client_control_sent) {
+            self.sendH3ClientControlStream(self.conn.peer);
+            self.h3_client_control_sent = true;
+        }
+        var header_block: [512]u8 = undefined;
+        const hb_len = h3_connect.encodeConnectRequest(.{
+            .path = path,
+            .authority = self.config.host,
+            .protocol = protocol,
+        }, &header_block, &self.conn.qpack_enc_tbl) catch return error.StreamLimitExceeded;
+        var h3_out: [600]u8 = undefined;
+        const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return error.StreamLimitExceeded;
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = stream_id,
+            .offset = 0,
+            .data = h3_out[0..h3_len],
+            .fin = true,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return error.StreamLimitExceeded;
+        if (self.sendClient1Rtt(frame_buf[0..frame_len]) == null) return error.StreamLimitExceeded;
+        return stream_id;
+    }
+
     /// Extend the peer's stream credit (MAX_STREAMS, RFC 9000 §19.11) for a
     /// peer-initiated stream.  From a client's perspective the peer (server)
     /// initiates streams with `stream_id & 3 == 1` (bidi) or `== 3` (uni).
@@ -9330,12 +9522,15 @@ pub const Client = struct {
             // First send: build the ClientHello and save it for any future rebuild.
             const alpn = clientTlsAlpn(&self.config);
             var quic_tp_buf: [128]u8 = undefined;
+            const datagram_tp = configMaxDatagramFrameSize(self.config.http3, self.config.max_datagram_frame_size);
+            self.conn.local_max_datagram_frame_size = datagram_tp;
             const quic_tp = try buildEndpointTransportParams(
                 &quic_tp_buf,
                 self.conn.local_cid.slice(),
                 // Omit max_udp_payload_size — peer assumes RFC §18.2 default (65527).
                 0,
                 self.config.transport_params_preset,
+                datagram_tp,
             );
             // Mirror the windows we advertise so our receive-side MAX_DATA /
             // MAX_STREAM_DATA extension thresholds match the peer's view.
@@ -10466,6 +10661,16 @@ pub const Client = struct {
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
             }
+            if (ft == 0x30 or ft == 0x31) {
+                const r = datagram_mod.DatagramFrame.parse(plaintext[pos..pt_len], ft) catch return;
+                connReceiveDatagram(&self.conn, r.frame.data);
+                if (ft == 0x31) {
+                    pos = pt_len;
+                } else {
+                    pos += r.consumed;
+                }
+                continue;
+            }
             // Unknown frame type — cannot safely skip without knowing the length.
             return;
         }
@@ -10832,6 +11037,9 @@ pub const Client = struct {
                             dbg("io: GOAWAY received from server last_stream_id={}\n", .{stream_id});
                             self.conn.draining = true;
                         },
+                        .settings => |sv| {
+                            h3_connect.applySettings(sv.settings[0..sv.count], &self.conn.peer_h3_connect_enabled);
+                        },
                         else => {},
                     }
                 }
@@ -11026,10 +11234,8 @@ pub const Client = struct {
         var buf: [128]u8 = undefined;
         buf[0] = 0x00; // stream type = control
         var pos: usize = 1;
-        const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
-            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
-            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = QPACK_BLOCKED_STREAMS_MAX },
-        }) catch return;
+        const settings_len = writeH3EndpointSettings(buf[pos..], self.config.http3, self.config.h3_extended_connect);
+        if (settings_len == 0) return;
         pos += settings_len;
 
         const sf = stream_frame_mod.StreamFrame{
@@ -11380,8 +11586,12 @@ fn buildEndpointTransportParams(
     initial_source_cid: []const u8,
     max_udp_payload_size: u64,
     preset: quic_tls_mod.TransportParamsPreset,
+    max_datagram_frame_size: u64,
 ) (varint.EncodeError || varint.DecodeError)![]const u8 {
-    const opts = quic_tls_mod.transportParamsForPreset(preset, initial_source_cid, max_udp_payload_size);
+    var opts = quic_tls_mod.transportParamsForPreset(preset, initial_source_cid, max_udp_payload_size);
+    if (max_datagram_frame_size > 0) {
+        opts.max_datagram_frame_size = max_datagram_frame_size;
+    }
     const n = try quic_tls_mod.buildTransportParams(buf, opts);
     return buf[0..n];
 }
