@@ -7860,6 +7860,15 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     config: ClientConfig,
     sock: std.posix.socket_t,
+    /// Coalesces outbound 1-RTT datagrams (ACKs + stream frames) into one
+    /// sendmmsg(2) per drive iteration instead of one sendto(2) per packet —
+    /// mirrors `Server.send_batch`. The outbound (client) leg carries the bulk
+    /// of gossip forwarding on a busy mesh; one-syscall-per-packet there was a
+    /// drive-loop throughput limit under live subnet-attestation load. Flushed
+    /// at every Client entry point the embedder drives (feedPacket /
+    /// processPendingWork / drainDeferredStreamSends) and via `flushSendBatch`,
+    /// so a datagram is never buffered longer than one iteration.
+    send_batch: batch_io.SendBatch = .{},
     tls: ClientHandshake,
     conn: ConnState,
     streams: [MAX_STREAMS]StreamDownload = [_]StreamDownload{.{ .stream_id = 0, .file = undefined, .active = false }} ** MAX_STREAMS,
@@ -8161,6 +8170,8 @@ pub const Client = struct {
     /// Inject a UDP payload as if it had been received on `recvfrom`.
     pub fn feedPacket(self: *Client, buf: []const u8) void {
         self.processPacket(buf);
+        // Flush any ACK / response datagrams that processing this packet queued.
+        self.flushSendBatch();
     }
 
     /// Return a snapshot of connection statistics (issue #186).
@@ -8184,6 +8195,7 @@ pub const Client = struct {
     /// Try to put all deferred STREAM bytes on the wire (quinn `poll_transmit`).
     pub fn drainDeferredStreamSends(self: *Client) void {
         self.drainPendingStreamSendsUntilStalled();
+        self.flushSendBatch();
     }
 
     /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
@@ -8207,6 +8219,8 @@ pub const Client = struct {
             self.flushClientHandshakeTailPacketsTo(server_addr);
             self.conn.finished_sent_ms = now;
         }
+        // Flush 1-RTT datagrams (ACKs + drained stream frames) batched above.
+        self.flushSendBatch();
     }
 
     /// Send one raw STREAM frame on 1-RTT (embedder tracks per-stream offsets).
@@ -8258,6 +8272,24 @@ pub const Client = struct {
         dbg("io: client sent MAX_STREAMS bidi={} new_limit={}\n", .{ bidi, new_limit });
     }
 
+    /// Enqueue one outbound datagram into the send batch, flushing via
+    /// sendmmsg(2) the moment it fills. Every hot-path 1-RTT send (ACKs +
+    /// stream frames) routes through here; the `if (enqueue) flush` pattern
+    /// keeps `count <= BATCH_SIZE` so a datagram is never silently dropped on a
+    /// full batch (mirrors `Server.send1Rtt`).
+    fn batchSend(self: *Client, buf: []const u8) void {
+        if (self.send_batch.enqueue(buf, self.conn.peer)) {
+            self.send_batch.flush(self.sock);
+        }
+    }
+
+    /// Flush datagrams buffered in the send batch. Idempotent (no-op when
+    /// empty). Called at the end of every Client drive entry point, and exposed
+    /// so an external reactor can flush after a burst of `sendRawStreamData`.
+    pub fn flushSendBatch(self: *Client) void {
+        self.send_batch.flush(self.sock);
+    }
+
     fn sendClient1Rtt(self: *Client, payload: []const u8) ?u64 {
         if (self.conn.phase != .connected or !self.conn.has_app_keys) return null;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -8274,7 +8306,7 @@ pub const Client = struct {
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
         self.conn.note1RttSent();
-        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch return null;
+        self.batchSend(send_buf[0..pkt_len]);
         const tracked = self.conn.ld.onPacketSent(.{
             .pn = pn,
             .send_time_ms = @intCast(compat.milliTimestamp()),
@@ -8515,10 +8547,10 @@ pub const Client = struct {
         }
         const pn = self.conn.app_pn;
         self.conn.app_pn += 1;
-        _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {
-            if (owned_buf) |b| self.allocator.free(b);
-            return 0;
-        };
+        // Batched send (sendmmsg at the next flush); the datagram is copied into
+        // the batch so `send_buf` may be reused immediately. Loss recovery still
+        // tracks the packet for retransmit exactly as the immediate-send path did.
+        self.batchSend(send_buf[0..pkt_len]);
         // Charge fresh-send bytes against the connection-level limit.
         if (is_fresh) self.conn.fc_bytes_sent +|= data.len;
 
@@ -8627,7 +8659,10 @@ pub const Client = struct {
             };
             const pn = self.conn.app_pn;
             self.conn.app_pn += 1;
-            _ = compat.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+            // Batched 1-RTT send (sendmmsg at the next flush). This is the
+            // deferred-stream / retransmit drain — the hottest client send path
+            // when forwarding gossip under backpressure.
+            self.batchSend(send_buf[0..pkt_len]);
             self.conn.fc_bytes_sent +|= chunk_len;
             self.conn.note1RttSent();
             // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
