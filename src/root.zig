@@ -37,6 +37,7 @@ pub const transport = struct {
     pub const endpoint = @import("transport/endpoint.zig");
     pub const flow_control = @import("transport/flow_control.zig");
     pub const stream_manager = @import("transport/stream_manager.zig");
+    pub const session_token = @import("transport/session_token.zig");
     pub const migration = @import("transport/migration.zig");
     pub const io = @import("transport/io.zig");
     pub const path_mtu = @import("transport/path_mtu.zig");
@@ -82,6 +83,7 @@ test {
     _ = @import("transport/endpoint.zig");
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
+    _ = @import("transport/session_token.zig");
     _ = @import("transport/migration.zig");
     _ = @import("transport/raw_app_stream.zig");
     _ = @import("transport/io.zig");

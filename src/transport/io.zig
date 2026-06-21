@@ -43,6 +43,7 @@ const batch_io = @import("batch_io.zig");
 const path_mtu_mod = @import("path_mtu.zig");
 const migration_mod = @import("migration.zig");
 const raw_app_stream = @import("raw_app_stream.zig");
+const session_token_mod = @import("session_token.zig");
 const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
 
 /// Locally-initiate a key update after this many 1-RTT packets (RFC 9001 §6).
@@ -1757,6 +1758,8 @@ pub const ConnState = struct {
     // Retry token (set when server sends Retry; included in next Initial)
     retry_token: [64]u8 = [_]u8{0} ** 64,
     retry_token_len: usize = 0,
+    /// Server: whether a NEW_TOKEN frame was sent post-handshake (RFC 9000 §8.1).
+    new_token_sent: bool = false,
 
     // original_destination_connection_id (RFC 9000 §7.3): set on the server
     // when a valid Retry token is accepted.  Included in server transport params
@@ -2771,6 +2774,8 @@ pub const Server = struct {
     retry_secret_prev: [32]u8 = [_]u8{0} ** 32,
     retry_secret_prev_valid: bool = false,
     retry_secret_last_rotate_ms: i64 = 0,
+    /// Replay detection for NEW_TOKEN address-validation tokens (RFC 9000 §8.1.3).
+    token_replay_log: session_token_mod.ReplayLog = .{},
     /// (Removed: was a 50ms pacing gate. CC-based rate-limiting is now sufficient.)
     /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
     http09_retransmit_last_ms: i64 = 0,
@@ -3677,14 +3682,34 @@ pub const Server = struct {
 
         // Retry mode: if enabled and no valid token, send Retry and drop.
         // An empty token means this is the first Initial (pre-Retry); a non-empty
-        // token must pass HMAC verification before the handshake proceeds.
+        // token must pass Retry HMAC or NEW_TOKEN verification before proceeding.
         var verified_odcid: ?[]const u8 = null;
+        var session_token_valid = false;
+        const prev_secret: ?*const [32]u8 = if (self.retry_secret_prev_valid) &self.retry_secret_prev else null;
         if (self.config.retry_enabled) {
             verified_odcid = self.verifyRetryToken(ip.token);
             if (verified_odcid == null) {
-                self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src, pkt_version);
-                return;
+                if (ip.token.len > 0) {
+                    session_token_valid = session_token_mod.verifyAndRecord(
+                        &self.token_replay_log,
+                        ip.token,
+                        &self.retry_secret,
+                        prev_secret,
+                    );
+                }
+                if (!session_token_valid) {
+                    self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src, pkt_version);
+                    return;
+                }
             }
+        } else if (ip.token.len > 0) {
+            session_token_valid = session_token_mod.verifyAndRecord(
+                &self.token_replay_log,
+                ip.token,
+                &self.retry_secret,
+                prev_secret,
+            );
+            // RFC 9000 §8.1.3: an invalid token is ignored; handshake continues.
         }
 
         // Find or create connection.
@@ -3724,8 +3749,8 @@ pub const Server = struct {
 
         // Anti-amplification (RFC 9000 §8.1): track received bytes.
         conn.migration.anti_amp.onRecv(buf.len);
-        // If Retry was accepted, the address is already validated.
-        if (verified_odcid != null) conn.address_validated = true;
+        // Retry or NEW_TOKEN accepted → address already validated.
+        if (verified_odcid != null or session_token_valid) conn.address_validated = true;
         self.tryFlushDeferredServerSend(conn, src);
 
         if (conn.init_keys == null) conn.deriveInitialKeys(ip.dcid);
@@ -4687,6 +4712,7 @@ pub const Server = struct {
         // HANDSHAKE_DONE so quinn sees stream credit before opening ~2000 streams.
         self.sendHandshakeAck(conn, src);
         self.sendHandshakeDone(conn, src);
+        self.sendNewToken(conn, src);
         self.send_batch.flush(self.sock);
 
         // Initiate a key update immediately after the handshake if enabled.
@@ -4827,6 +4853,18 @@ pub const Server = struct {
         }
 
         self.send1Rtt(conn, frames_buf[0..fp], src);
+    }
+
+    /// Issue one NEW_TOKEN frame after the handshake (RFC 9000 §8.1).
+    fn sendNewToken(self: *Server, conn: *ConnState, dst: compat.Address) void {
+        if (conn.new_token_sent or !conn.has_app_keys) return;
+        self.maybeRotateRetrySecret();
+        var token: [session_token_mod.token_len]u8 = undefined;
+        session_token_mod.mint(&token, &self.retry_secret);
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = session_token_mod.serializeFrame(&token, &frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], dst);
+        conn.new_token_sent = true;
     }
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: compat.Address) void {
@@ -9984,6 +10022,15 @@ pub const Client = struct {
                 if (self.config.key_update) {
                     self.initiateClientKeyUpdate();
                 }
+                continue;
+            }
+            if (ft == 0x07) {
+                const r = transport_frames.NewToken.parse(plaintext[pos..pt_len]) catch return;
+                pos += r.consumed;
+                const tlen = @min(r.frame.token.len, self.conn.retry_token.len);
+                @memcpy(self.conn.retry_token[0..tlen], r.frame.token[0..tlen]);
+                self.conn.retry_token_len = tlen;
+                dbg("io: client stored NEW_TOKEN len={}\n", .{tlen});
                 continue;
             }
             if (ft == 0x06) {
