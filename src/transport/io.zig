@@ -2965,6 +2965,15 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     config: ServerConfig,
     sock: std.posix.socket_t,
+    /// Multi-shard drive loop (connection sharding): the index of the drive-loop
+    /// shard that owns this `Server` instance, and the mask (`shard_count - 1`).
+    /// Every CID this Server mints (`local_cid` + NEW_CONNECTION_ID pool entries)
+    /// carries `shard_index` in the low `shard_mask` bits of byte 0 so the
+    /// listener/demux can route inbound 1-RTT packets here by `dcid[0] & mask`.
+    /// Default {0,0} = single shard, untagged CIDs — behaviorally identical to
+    /// the pre-sharding path. Set via `setShard` before accepting connections.
+    shard_index: u8 = 0,
+    shard_mask: u8 = 0,
     /// Raw UDP socket for diagnostics — receives all incoming UDP datagrams
     /// at the IP level (before UDP dispatch).  Lets us detect packets that
     /// arrive at the NIC but never reach the main socket on port 443.
@@ -3006,6 +3015,17 @@ pub const Server = struct {
     /// When false, `deinit` does not `close(self.sock)` (caller owns the UDP fd).
     owns_socket: bool = true,
     /// Initialize server: load cert/key and create UDP socket.
+    /// Assign this Server to a drive-loop shard. `index` is the shard's id and
+    /// `mask` is `shard_count - 1` (shard_count a power of two). After this, all
+    /// CIDs the Server mints carry `index` in their low `mask` bits of byte 0 so
+    /// the demux can route inbound packets here. Call before accepting traffic.
+    /// `index & mask == index` must hold (asserted) so issued CIDs route back.
+    pub fn setShard(self: *Server, index: u8, mask: u8) void {
+        std.debug.assert(index & mask == index);
+        self.shard_index = index;
+        self.shard_mask = mask;
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
         // Heap-allocate the Server to avoid blowing the stack: the conns array
         // (16 × ConnState, each ≈220 KB) totals ~3.5 MB — too large for a stack
@@ -3863,7 +3883,7 @@ pub const Server = struct {
     fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: compat.Address, is_v2: bool) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.* == null) {
-                const local_cid = ConnectionId.random(compat.random, 8);
+                const local_cid = ConnectionId.randomTagged(compat.random, 8, self.shard_index, self.shard_mask);
                 const conn = self.allocator.create(ConnState) catch return null;
                 conn.* = ConnState{
                     .local_cid = local_cid,
@@ -5062,7 +5082,7 @@ pub const Server = struct {
                 }
             }
             if (!has_free) break;
-            const new_cid = ConnectionId.random(compat.random, 8);
+            const new_cid = ConnectionId.randomTagged(compat.random, 8, self.shard_index, self.shard_mask);
             var token: [16]u8 = undefined;
             compat.random.bytes(&token);
             const seq = conn.cidPoolReserve(new_cid, token) orelse break;
@@ -6566,7 +6586,7 @@ pub const Server = struct {
     /// mirror. No-op when the pool is already full.
     fn sendNewConnectionId(self: *Server, conn: *ConnState, dst: compat.Address) void {
         if (conn.localCidCount() >= conn.peer_active_cid_limit) return;
-        const new_cid = ConnectionId.random(compat.random, 8);
+        const new_cid = ConnectionId.randomTagged(compat.random, 8, self.shard_index, self.shard_mask);
         var token: [16]u8 = undefined;
         compat.random.bytes(&token);
         const seq = conn.cidPoolReserve(new_cid, token) orelse return;

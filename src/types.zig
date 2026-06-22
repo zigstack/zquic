@@ -46,6 +46,31 @@ pub const ConnectionId = struct {
         return cid;
     }
 
+    /// Random CID whose first byte encodes a shard index in its low
+    /// `shard_mask` bits. With a multi-threaded (sharded) drive loop, the server
+    /// issues the CID that the peer echoes as the DCID on every 1-RTT packet, so
+    /// embedding the owning shard's index lets the listener/demux route inbound
+    /// packets to the right shard by `dcid[0] & shard_mask` — O(1), lock-free,
+    /// no per-conn scan. `shard_mask` is `shard_count - 1` (shard_count a power
+    /// of two). `shard_mask == 0` means a single shard: byte 0 stays fully
+    /// random, identical to `random` (behavioral no-op for the default config).
+    /// The non-index bits of byte 0 remain random so CIDs stay unpredictable.
+    pub fn randomTagged(rng: std.Random, len: u5, shard: u8, shard_mask: u8) ConnectionId {
+        var cid = ConnectionId{ .len = len };
+        rng.bytes(cid.bytes[0..len]);
+        if (shard_mask != 0 and len > 0) {
+            cid.bytes[0] = (cid.bytes[0] & ~shard_mask) | (shard & shard_mask);
+        }
+        return cid;
+    }
+
+    /// Shard index carried in the CID's first byte (see `randomTagged`). Returns
+    /// 0 for an empty CID or a zero mask.
+    pub fn shardIndex(self: *const ConnectionId, shard_mask: u8) u8 {
+        if (shard_mask == 0 or self.len == 0) return 0;
+        return self.bytes[0] & shard_mask;
+    }
+
     pub fn format(
         self: ConnectionId,
         comptime _: []const u8,
@@ -174,4 +199,53 @@ test "Version: reserved" {
     try std.testing.expect(Version.isReserved(0x0a0a0a0a));
     try std.testing.expect(Version.isReserved(0x1a2a3a4a));
     try std.testing.expect(!Version.isReserved(0x00000001));
+}
+
+test "ConnectionId: randomTagged embeds shard index, shardIndex round-trips" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0xC1D5);
+    const rng = prng.random();
+    // 4 shards → mask 0b11. Every minted CID must route back to its shard.
+    const mask: u8 = 0b11;
+    var shard: u8 = 0;
+    while (shard < 4) : (shard += 1) {
+        var i: usize = 0;
+        while (i < 64) : (i += 1) {
+            const cid = ConnectionId.randomTagged(rng, 8, shard, mask);
+            try testing.expectEqual(@as(u5, 8), cid.len);
+            try testing.expectEqual(shard, cid.shardIndex(mask));
+            try testing.expectEqual(shard, cid.bytes[0] & mask);
+        }
+    }
+}
+
+test "ConnectionId: randomTagged with mask 0 is untagged (single-shard no-op)" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const rng = prng.random();
+    // mask 0 ⇒ no index bits ⇒ shardIndex always 0, byte 0 left fully random.
+    // Confirm byte 0 varies across draws (not forced to a constant).
+    var seen_nonzero_low_bits = false;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const cid = ConnectionId.randomTagged(rng, 8, 3, 0);
+        try testing.expectEqual(@as(u8, 0), cid.shardIndex(0));
+        if (cid.bytes[0] & 0b11 != 0) seen_nonzero_low_bits = true;
+    }
+    try testing.expect(seen_nonzero_low_bits); // low bits weren't pinned by tagging
+}
+
+test "ConnectionId: high bits of byte 0 stay random under tagging" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x5A5A);
+    const rng = prng.random();
+    const mask: u8 = 0b11;
+    var high_bits_seen: u8 = 0;
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        const cid = ConnectionId.randomTagged(rng, 8, 1, mask);
+        try testing.expectEqual(@as(u8, 1), cid.bytes[0] & mask); // index pinned
+        high_bits_seen |= cid.bytes[0] & ~mask; // accumulate non-index bits
+    }
+    try testing.expect(high_bits_seen != 0); // non-index bits remain unpredictable
 }
