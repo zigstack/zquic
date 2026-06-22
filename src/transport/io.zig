@@ -3392,7 +3392,7 @@ pub const Server = struct {
             return data.len;
         }
         const sent_pn = conn.app_pn - 1;
-        const last = &conn.ld.sent[conn.ld.sent_count - 1];
+        const last = conn.ld.lastSentPtr().?;
         if (last.pn != sent_pn) {
             if (owned_buf) |b| self.allocator.free(b);
             if (is_fresh) conn.pacerConsume(@intCast(data.len));
@@ -3511,7 +3511,7 @@ pub const Server = struct {
                 continue;
             }
             const sent_pn = conn.app_pn - 1;
-            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            const last = conn.ld.lastSentPtr().?;
             if (last.pn != sent_pn) {
                 i += 1;
                 continue;
@@ -7711,7 +7711,7 @@ pub const Server = struct {
         // Store the QUIC stream offset so the retransmit handler can rewind both
         // stream_offset and file_offset (file_offset is derived from stream_offset_base).
         if (conn.ld.sent_count > 0) {
-            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            const last = conn.ld.lastSentPtr().?;
             last.has_stream_data = true;
             last.stream_id = slot.stream_id;
             last.stream_offset = old_stream_offset; // QUIC stream offset before this chunk
