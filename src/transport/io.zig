@@ -1081,6 +1081,17 @@ fn applyStreamAcks(
             buf.onAck(allocator, a.offset, a.len);
         }
     }
+    // Reap fully-completed slots — every byte appended has been acked AND a
+    // FIN was set + acked.  Without this, the bounded `stream_send_slots`
+    // table accumulates dead entries from each completed HTTP/0.9 response
+    // (the path does not have an embedder release call), and the interop
+    // `multiplexing` test wedges with `queue full (… 0 bytes)`.
+    for (&conn.stream_send_slots) |*slot| {
+        if (slot.active and slot.buf.isComplete()) {
+            slot.buf.deinit(allocator);
+            slot.* = .{};
+        }
+    }
     conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
 }
 
@@ -1118,6 +1129,7 @@ fn enqueuePendingStreamSend(
             } else {
                 sbuf.fin_at = fa;
             }
+            sbuf.fin_was_set = true;
         }
         conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
         return true;
@@ -1157,6 +1169,7 @@ fn enqueuePendingStreamSendOwned(
             } else {
                 sbuf.fin_at = fa;
             }
+            sbuf.fin_was_set = true;
         }
         conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
         return true;
