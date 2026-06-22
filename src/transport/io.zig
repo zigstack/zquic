@@ -1108,6 +1108,11 @@ fn enqueuePendingStreamSend(
 ) bool {
     const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
     if (data.len == 0 and !fin) return true;
+    if (data.len > 0 and sbuf.coversRange(offset, data.len)) {
+        if (fin) sbuf.append(allocator, offset, &.{}, fin) catch return false;
+        conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
+        return true;
+    }
     const projected = streamSendQueuedBytes(conn) + data.len;
     if (projected > pending_stream_send_bytes_cap) return false;
     sbuf.append(allocator, offset, data, fin) catch return false;
@@ -1134,6 +1139,11 @@ fn enqueuePendingStreamSendOwned(
 ) bool {
     if (owned.len == 0) return true;
     const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
+    if (sbuf.coversRange(offset, owned.len)) {
+        allocator.free(owned);
+        conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
+        return true;
+    }
     if (streamSendQueuedBytes(conn) + owned.len > pending_stream_send_bytes_cap) return false;
     sbuf.append(allocator, offset, owned, fin) catch return false;
     allocator.free(owned);
@@ -5852,7 +5862,6 @@ pub const Server = struct {
             .has_length = true,
         };
         const old_offset = slot.stream_offset;
-        slot.stream_offset += @intCast(n);
         var frame_buf: [path_mtu_mod.max_app_stream_chunk_cap + 64]u8 = undefined;
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
             dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
@@ -5863,15 +5872,14 @@ pub const Server = struct {
         };
         dbg("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
         const fc_before = conn.fc_bytes_sent;
-        _ = self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null);
-        if (conn.fc_bytes_sent <= fc_before) {
-            // FC blocked (DATA_BLOCKED) or send failed — rewind and retry later.
-            slot.stream_offset -= @intCast(n);
-            slot.file.seekTo(slot.stream_offset) catch |err| {
-                dbg("io: http09 seekTo rewind failed stream_id={}: {}\n", .{ slot.stream_id, err });
-            };
+        const enqueued = self.sendRawStreamDataInner(conn, slot.stream_id, old_offset, file_buf[0..n], fin, null);
+        if (enqueued == 0) return;
+        if (fin and conn.fc_bytes_sent <= fc_before) {
+            // FIN chunk buffered but not on the wire yet — retry without advancing
+            // the file cursor (SendBuffer already holds these bytes).
             return;
         }
+        slot.stream_offset += @intCast(n);
         if (fin) {
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.file.close();
