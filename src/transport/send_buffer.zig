@@ -232,8 +232,11 @@ pub const SendBuffer = struct {
     /// Mark `[offset, offset+len)` as ACKed by the peer.
     pub fn onAck(self: *SendBuffer, allocator: std.mem.Allocator, offset: u64, len: usize) void {
         if (len == 0) {
-            if (self.fin_at == offset) self.fin_sent = false;
-            self.fin_at = null;
+            if (self.fin_at) |fa| {
+                if (offset != fa) return;
+                self.fin_sent = false;
+                self.fin_at = null;
+            }
             return;
         }
         const end = offset + len;
@@ -411,7 +414,7 @@ pub const SendBuffer = struct {
     }
 };
 
-pub const stream_send_slot_max: usize = 64;
+pub const stream_send_slot_max: usize = 256;
 
 pub const StreamSendSlot = struct {
     active: bool = false,
@@ -452,7 +455,7 @@ pub fn releaseStreamSendSlot(slots: []StreamSendSlot, allocator: std.mem.Allocat
 
 /// Free per-stream send slots whose `SendBuffer` has no unsent or unacked work.
 /// HTTP/0.9 immediate responses (multiplexing / zerortt) only need a slot until
-/// the peer ACKs; without this the 64-slot table is exhausted after ~64 streams.
+/// the peer ACKs; without this the slot table is exhausted after ~slot_max streams.
 pub fn releaseIdleStreamSendSlots(slots: []StreamSendSlot, allocator: std.mem.Allocator) void {
     for (slots) |*slot| {
         if (!slot.active) continue;
@@ -624,4 +627,17 @@ test "send_buffer: releaseIdleStreamSendSlots frees acked slots" {
     releaseIdleStreamSendSlots(&slots, testing.allocator);
     try testing.expect(!slots[0].active);
     try testing.expect(getOrCreateStreamSendSlot(&slots, 4) != null);
+}
+
+test "send_buffer: onAck len=0 at wrong offset does not clear fin_at" {
+    const testing = std.testing;
+    var buf: SendBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    try buf.append(testing.allocator, 0, "data", true);
+    const p = buf.pollTransmit(4).?;
+    buf.onSent(p.offset, p.data.len);
+    try testing.expectEqual(@as(?u64, 4), buf.fin_at);
+    buf.onAck(testing.allocator, 0, 0);
+    try testing.expectEqual(@as(?u64, 4), buf.fin_at);
 }
