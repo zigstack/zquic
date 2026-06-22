@@ -1109,7 +1109,16 @@ fn enqueuePendingStreamSend(
     const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
     if (data.len == 0 and !fin) return true;
     if (data.len > 0 and sbuf.coversRange(offset, data.len)) {
-        if (fin) sbuf.append(allocator, offset, &.{}, fin) catch return false;
+        // Bytes were recorded on the first enqueue — do not duplicate into
+        // queued_bytes.  Still record FIN if this retry carries it.
+        if (fin) {
+            const fa = offset + data.len;
+            if (sbuf.fin_at) |cur| {
+                sbuf.fin_at = @max(cur, fa);
+            } else {
+                sbuf.fin_at = fa;
+            }
+        }
         conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
         return true;
     }
@@ -3961,6 +3970,10 @@ pub const Server = struct {
             // Unknown or non-STREAM frame — stop parsing.
             break;
         }
+        if (conn.has_app_keys and conn.http09_pending_count > 0) {
+            self.drainHttp09Pending(conn);
+            self.flushSendBatch();
+        }
     }
 
     /// Retry token lifetime in milliseconds.  RFC 9000 §8.1.3 recommends
@@ -4705,6 +4718,16 @@ pub const Server = struct {
         conn.address_validated = true;
         conn.migration.trustActivePath();
         conn.captureHandshakeRtt();
+
+        // 0-RTT GETs are parsed in process0RttPacket before app keys exist and
+        // land in http09_pending.  Drain them now instead of waiting for the
+        // client's next datagram (zerortt would otherwise stall until a PING).
+        while (conn.http09_pending_count > 0) {
+            const before = conn.http09_pending_count;
+            self.drainHttp09Pending(conn);
+            if (conn.http09_pending_count == before) break;
+        }
+        self.flushSendBatch();
 
         const pending_n = conn.pending_1rtt_n;
         conn.pending_1rtt_n = 0;
@@ -8865,7 +8888,13 @@ pub const Client = struct {
             self.flushPendingStreamsBlocked();
             self.checkPto();
 
-            if (ready == 0) continue;
+            if (ready == 0) {
+                // Zerortt: up to 39 server responses can arrive during the
+                // handshake before downloadUrls runs; flush deferred ACKs on
+                // idle polls so the server is not stuck in a PTO/retransmit loop.
+                self.flushDeferredAck();
+                continue;
+            }
 
             // Drain a pending ICMP/socket error (e.g. port-unreachable when
             // the server is not yet bound) so the next poll() is not
@@ -8958,6 +8987,10 @@ pub const Client = struct {
                 if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
                     self.send0RttRequests(server_addr) catch {};
                 }
+                // ACK responses that arrived during the handshake (0-RTT → 1-RTT
+                // burst) before downloadUrls blocks in its recv loop.
+                self.flushDeferredAck();
+                self.flushSendBatch();
                 // downloadUrls blocks with its own recv loop; extend the outer
                 // deadline so post-batch retransmits can still complete.
                 deadline = compat.milliTimestamp() + 120_000;
@@ -8973,6 +9006,7 @@ pub const Client = struct {
                 break;
             }
 
+            self.flushDeferredAck();
             deadline = compat.milliTimestamp() + 30_000; // extend while packets still arrive
         }
 
@@ -10864,6 +10898,9 @@ pub const Client = struct {
             self.h3_client_control_sent = true;
         }
 
+        self.flushDeferredAck();
+        self.flushSendBatch();
+
         // Process downloads in batches to stay within NS3 network simulator limits.
         // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
         // once causes queue overflow and packet drops.  Using BATCH_SIZE=20 keeps
@@ -11017,11 +11054,14 @@ pub const Client = struct {
                 const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
                 const ready = std.posix.poll(&fds, poll_timeout) catch 0;
                 if (ready == 0) {
-                    // Poll timed out — no incoming data.  Send a PING so the
-                    // server can see our current source port.  This is critical
-                    // for the rebind-port test: after a NAT rebind the server's
-                    // FIN retransmits go to the old (dead) port.  Without this
-                    // PING the server never learns the new port and exhausts all
+                    // Poll timed out — no incoming data.  Flush any deferred ACKs
+                    // so the peer can retire in-flight data (zerortt 0-RTT burst).
+                    self.flushDeferredAck();
+                    self.flushSendBatch();
+                    // Send a PING so the server can see our current source port.
+                    // This is critical for the rebind-port test: after a NAT rebind
+                    // the server's FIN retransmits go to the old (dead) port.  Without
+                    // this PING the server never learns the new port and exhausts all
                     // retransmits, stalling the download.
                     if (self.conn.has_app_keys) {
                         // PING (0x01) + PADDING (0x00 × 7) — minimum 4 bytes of
@@ -11066,6 +11106,7 @@ pub const Client = struct {
                 // This replaces N individual ACKs with a single packet, reducing
                 // the combined burst (ACK + next GET batch) to ≤ 21 packets.
                 self.flushDeferredAck();
+                self.flushSendBatch();
             }
 
             batch_start = batch_end;
