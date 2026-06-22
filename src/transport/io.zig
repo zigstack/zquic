@@ -5186,6 +5186,14 @@ pub const Server = struct {
                     if (slot.awaiting_fin_ack and slot.fin_pkt_pn <= largest_ack) {
                         dbg("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
                         slot.awaiting_fin_ack = false;
+                        // The stream is fully delivered.  Release the
+                        // per-stream `SendBuffer` slot so the 64-slot
+                        // `stream_send_slots` table doesn't accumulate
+                        // dead entries (the interop `multiplexing` test
+                        // serves >64 files on the same connection and
+                        // otherwise wedges with `pending-stream-send
+                        // queue full (64 streams, 0 bytes)`).
+                        send_buffer_mod.releaseStreamSendSlot(conn.stream_send_slots[0..], self.allocator, slot.stream_id);
                     }
                 }
                 self.drainHttp09Pending(conn);
@@ -5481,6 +5489,7 @@ pub const Server = struct {
                     if (slot.active and slot.stream_id == r.frame.stream_id) {
                         if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
                         slot.close();
+                        send_buffer_mod.releaseStreamSendSlot(conn.stream_send_slots[0..], self.allocator, slot.stream_id);
                     }
                 }
                 for (&conn.http3_slots) |*slot| {
