@@ -1150,6 +1150,14 @@ fn enqueuePendingStreamSendOwned(
     const sbuf = send_buffer_mod.getOrCreateStreamSendSlot(conn.stream_send_slots[0..], stream_id) orelse return false;
     if (sbuf.coversRange(offset, owned.len)) {
         allocator.free(owned);
+        if (fin) {
+            const fa = offset + owned.len;
+            if (sbuf.fin_at) |cur| {
+                sbuf.fin_at = @max(cur, fa);
+            } else {
+                sbuf.fin_at = fa;
+            }
+        }
         conn.pending_stream_send_bytes = streamSendQueuedBytes(conn);
         return true;
     }
@@ -5427,6 +5435,7 @@ pub const Server = struct {
                         }
                     }
                 }
+                send_buffer_mod.releaseIdleStreamSendSlots(conn.stream_send_slots[0..], self.allocator);
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
                 noteConnAckInSpace(conn, .application, compat.milliTimestamp());
@@ -8947,6 +8956,13 @@ pub const Client = struct {
             }
             self.processPacket(recv_buf[0..n]);
 
+            // Send the next 0-RTT batch once the link has drained (batch 2 is
+            // normally triggered from processInitialPacket; this covers the case
+            // where the server Initial is delayed or already processed).
+            if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
+                self.send0RttRequests(server_addr) catch {};
+            }
+
             // Connection migration: after the handshake, rebind to a new local
             // UDP port.  Sending any 1-RTT packet from the new address causes
             // the server to detect the address change and send a PATH_CHALLENGE;
@@ -9950,6 +9966,7 @@ pub const Client = struct {
                         _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, &[_]u8{}, true, null);
                     }
                 }
+                send_buffer_mod.releaseIdleStreamSendSlots(self.conn.stream_send_slots[0..], self.allocator);
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
                 // Mirrors the server-side bookkeeping at the matching ACK arm.
@@ -10900,6 +10917,42 @@ pub const Client = struct {
 
         self.flushDeferredAck();
         self.flushSendBatch();
+
+        // All GETs were already sent as 0-RTT — only wait for responses.
+        if (self.zerortt_count >= self.active_urls.len and self.active_urls.len > 0) {
+            const dl_deadline = compat.milliTimestamp() + 120_000;
+            var dl_iter: u32 = 0;
+            while (self.streams_done < self.active_urls.len) {
+                dl_iter += 1;
+                const now = compat.milliTimestamp();
+                const remaining = dl_deadline - now;
+                if (remaining <= 0) {
+                    dbg("io: downloadUrls 0-RTT-only DEADLINE streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
+                    break;
+                }
+                if (dl_iter % 100 == 0) {
+                    dbg("io: downloadUrls 0-RTT-only iter {} streams_done={}/{}\n", .{ dl_iter, self.streams_done, self.active_urls.len });
+                }
+                var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
+                const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
+                const ready = std.posix.poll(&fds, poll_timeout) catch 0;
+                if (ready == 0) {
+                    self.flushDeferredAck();
+                    self.flushSendBatch();
+                    continue;
+                }
+                if (fds[0].revents & std.posix.POLL.IN == 0) continue;
+                var rb = batch_io.RecvBatch{};
+                const n_recv = rb.recv(self.sock, true);
+                for (rb.entries[0..n_recv]) |*e| {
+                    self.processPacket(e.buf[0..e.len]);
+                }
+                self.flushDeferredAck();
+                self.flushSendBatch();
+            }
+            dbg("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
+            return;
+        }
 
         // Process downloads in batches to stay within NS3 network simulator limits.
         // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
