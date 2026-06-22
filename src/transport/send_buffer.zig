@@ -12,14 +12,20 @@ pub const Range = struct {
     len: usize,
 };
 
+/// Byte range relative to the start of a segment's `data` buffer.
+const RelRange = struct {
+    off: usize,
+    len: usize,
+};
+
 const Segment = struct {
     offset: u64,
     data: []u8,
     /// Bytes from the start of this segment that have been put on the wire and
     /// are not yet ACKed (includes in-flight and lost ranges).
     sent: usize = 0,
-    /// Bytes from the start of this segment that the peer has ACKed.
-    acked: usize = 0,
+    /// Non-overlapping ACKed ranges relative to `offset` (quinn-style).
+    acked_ranges: std.ArrayList(RelRange) = .empty,
 };
 
 pub const PollResult = struct {
@@ -30,6 +36,67 @@ pub const PollResult = struct {
     retransmit: bool = false,
 };
 
+fn totalAckedBytes(ranges: []const RelRange) usize {
+    var sum: usize = 0;
+    for (ranges) |r| sum += r.len;
+    return sum;
+}
+
+/// Contiguous ACK prefix from the segment start (0).  Zero when the first
+/// acked range does not begin at 0 — gaps before it are still in flight.
+fn contiguousAckedEnd(ranges: []const RelRange) usize {
+    if (ranges.len == 0 or ranges[0].off != 0) return 0;
+    return ranges[0].len;
+}
+
+fn mergeAckedRange(
+    ranges: *std.ArrayList(RelRange),
+    allocator: std.mem.Allocator,
+    off: usize,
+    len: usize,
+) !usize {
+    if (len == 0) return 0;
+    const old_total = totalAckedBytes(ranges.items);
+    const end = off + len;
+
+    var new_off = off;
+    var new_end = end;
+    var i: usize = 0;
+    while (i < ranges.items.len) {
+        const r = ranges.items[i];
+        const r_end = r.off + r.len;
+        if (new_end <= r.off or new_off >= r_end) {
+            i += 1;
+            continue;
+        }
+        new_off = @min(new_off, r.off);
+        new_end = @max(new_end, r_end);
+        _ = ranges.orderedRemove(i);
+    }
+    try ranges.append(allocator, .{ .off = new_off, .len = new_end - new_off });
+
+    std.mem.sort(RelRange, ranges.items, {}, struct {
+        fn less(_: void, a: RelRange, b: RelRange) bool {
+            return a.off < b.off;
+        }
+    }.less);
+
+    i = 0;
+    while (i + 1 < ranges.items.len) {
+        const a = &ranges.items[i];
+        const b = &ranges.items[i + 1];
+        if (a.off + a.len >= b.off) {
+            const merged_end = @max(a.off + a.len, b.off + b.len);
+            a.len = merged_end - a.off;
+            _ = ranges.orderedRemove(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
+    return totalAckedBytes(ranges.items) - old_total;
+}
+
 pub const SendBuffer = struct {
     segments: std.ArrayList(Segment) = .empty,
     lost: std.ArrayList(Range) = .empty,
@@ -39,7 +106,10 @@ pub const SendBuffer = struct {
     queued_bytes: usize = 0,
 
     pub fn deinit(self: *SendBuffer, allocator: std.mem.Allocator) void {
-        for (self.segments.items) |seg| allocator.free(seg.data);
+        for (self.segments.items) |*seg| {
+            seg.acked_ranges.deinit(allocator);
+            allocator.free(seg.data);
+        }
         self.segments.deinit(allocator);
         self.lost.deinit(allocator);
         self.* = .{};
@@ -84,25 +154,21 @@ pub const SendBuffer = struct {
     fn pruneAcked(self: *SendBuffer, allocator: std.mem.Allocator) void {
         while (self.segments.items.len > 0) {
             const seg = &self.segments.items[0];
-            if (seg.acked < seg.data.len) break;
+            if (contiguousAckedEnd(seg.acked_ranges.items) < seg.data.len) break;
+            seg.acked_ranges.deinit(allocator);
             allocator.free(seg.data);
             _ = self.segments.orderedRemove(0);
         }
-        // Drop lost ranges that no longer have a backing segment.  When ALL
-        // segments are pruned (entire stream fully acked), every remaining
-        // lost range is orphaned and `pollTransmit` will return null
-        // forever for it — `hasWork()` stays true → drain stalls in an
-        // infinite no-op loop.  The previous loop's `if (.. == 0) break`
-        // exited without clearing those orphans; clear them explicitly.
         if (self.segments.items.len == 0) {
             self.lost.clearRetainingCapacity();
             return;
         }
         const head = self.segments.items[0];
+        const head_cont = contiguousAckedEnd(head.acked_ranges.items);
         var i: usize = 0;
         while (i < self.lost.items.len) {
             const r = self.lost.items[i];
-            if (r.offset + r.len <= head.offset + head.acked) {
+            if (r.offset + r.len <= head.offset + head_cont) {
                 _ = self.lost.orderedRemove(i);
                 continue;
             }
@@ -112,13 +178,6 @@ pub const SendBuffer = struct {
 
     fn mergeLost(self: *SendBuffer, allocator: std.mem.Allocator, offset: u64, len: usize) !void {
         if (len == 0) return;
-        // Walk once, absorbing every overlapping / adjacent range into a single
-        // accumulator. The previous version recursed with the ORIGINAL
-        // (offset, len) after each merge — since the merged range still overlaps
-        // with those args, the recursion never terminated (release builds TCO'd
-        // it into a CPU spin, which is exactly the symptom the post-rebase
-        // interop hit: transfer stalled with `pending_stream_sends` drained but
-        // CC stuck in recovery and bif > cwnd).
         var new_off = offset;
         var new_end = offset + len;
         var i: usize = 0;
@@ -132,7 +191,6 @@ pub const SendBuffer = struct {
             new_off = @min(new_off, r.offset);
             new_end = @max(new_end, r_end);
             _ = self.lost.orderedRemove(i);
-            // Don't increment i — the shifted-down entry takes this slot.
         }
         try self.lost.append(allocator, .{ .offset = new_off, .len = @intCast(new_end - new_off) });
     }
@@ -161,12 +219,13 @@ pub const SendBuffer = struct {
         for (self.segments.items) |*seg| {
             const seg_end = seg.offset + seg.data.len;
             if (end <= seg.offset or offset >= seg_end) continue;
-            const rel_end: usize = @intCast(@min(end, seg_end) - seg.offset);
-            if (rel_end > seg.acked) {
-                const delta = rel_end - seg.acked;
-                seg.acked = rel_end;
-                self.queued_bytes -|= delta;
-            }
+            const ix_start = @max(offset, seg.offset);
+            const ix_end = @min(end, seg_end);
+            const rel_off: usize = @intCast(ix_start - seg.offset);
+            const rel_len: usize = @intCast(ix_end - ix_start);
+            const delta = mergeAckedRange(&seg.acked_ranges, allocator, rel_off, rel_len) catch continue;
+            self.queued_bytes -|= delta;
+            const rel_end = rel_off + rel_len;
             if (rel_end > seg.sent) seg.sent = rel_end;
         }
         self.pruneAcked(allocator);
@@ -175,11 +234,6 @@ pub const SendBuffer = struct {
     /// Mark `[offset, offset+len)` as lost — eligible for `pollTransmit`.
     pub fn onLoss(self: *SendBuffer, allocator: std.mem.Allocator, offset: u64, len: usize) !void {
         if (len == 0) return;
-        // If no segment backs any byte of this range — typically a spurious
-        // loss declared after every byte was acked + the segment pruned —
-        // don't create a phantom lost range that `pollTransmit` will never be
-        // able to serve.  Without this gate, `hasWork()` returns true forever
-        // for the orphan and the drain spins.
         const end = offset + len;
         var has_backing = false;
         for (self.segments.items) |seg| {
@@ -284,17 +338,6 @@ pub const SendBuffer = struct {
             const rel_end: usize = @intCast(offset + len - seg.offset);
             if (rel_end > seg.sent) seg.sent = rel_end;
         }
-        // Data + FIN piggyback: `pollTransmit` attaches `fin=true` to the last
-        // unsent data frame when it ends exactly at `fin_at`.  Without marking
-        // `fin_sent` here, `hasWork()` keeps returning true → drain emits an
-        // EXTRA empty-FIN frame at the same offset.  If the data frame is then
-        // lost but the empty-FIN reaches the peer, the peer ACKs the empty FIN
-        // → `onAck(fin_at, 0)` clears `fin_at` → the data retransmit's lost-
-        // branch sees `fin_at == null` and re-emits the data without FIN.
-        // Receiver still has the empty FIN sitting in out-of-order and never
-        // delivers the (still missing) tail data.  Net effect: a permanent
-        // stall at the very end of large transfers (the post-rebase #219
-        // interop `transfer` / `zerortt` symptom).
         if (self.fin_at) |fa| {
             if (offset + len >= fa) self.fin_sent = true;
         }
@@ -428,19 +471,54 @@ test "send_buffer: overlapping onLoss calls coalesce (regression for infinite-re
     _ = buf.pollTransmit(10);
     buf.onSent(0, 10);
 
-    // First lost range; alone, append-only path is exercised.
     try buf.onLoss(testing.allocator, 0, 4);
     try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
 
-    // Second lost range overlapping the first — previously triggered
-    // mergeLost's terminal-recurse-with-original-args spin.
     try buf.onLoss(testing.allocator, 2, 4);
     try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
     try testing.expectEqual(@as(u64, 0), buf.lost.items[0].offset);
     try testing.expectEqual(@as(usize, 6), buf.lost.items[0].len);
 
-    // Third lost range adjacent to the merged range — also merges.
     try buf.onLoss(testing.allocator, 6, 2);
     try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
     try testing.expectEqual(@as(usize, 8), buf.lost.items[0].len);
+}
+
+test "send_buffer: non-contiguous ack retains gap for retransmit (#221)" {
+    const testing = std.testing;
+    var buf: SendBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    var data: [1632]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i % 256);
+
+    try buf.append(testing.allocator, 0, &data, false);
+    try testing.expectEqual(@as(usize, 1632), buf.queued_bytes);
+
+    const p1 = buf.pollTransmit(1436).?;
+    try testing.expectEqual(@as(u64, 0), p1.offset);
+    try testing.expectEqual(@as(usize, 1436), p1.data.len);
+    buf.onSent(p1.offset, p1.data.len);
+
+    const p2 = buf.pollTransmit(196).?;
+    try testing.expectEqual(@as(u64, 1436), p2.offset);
+    try testing.expectEqual(@as(usize, 196), p2.data.len);
+    buf.onSent(p2.offset, p2.data.len);
+
+    // ACK only the tail packet — must not treat the leading gap as acked.
+    buf.onAck(testing.allocator, 1436, 196);
+    try testing.expectEqual(@as(usize, 1), buf.segments.items.len);
+    try testing.expectEqual(@as(usize, 1436), buf.queued_bytes);
+    try testing.expectEqual(@as(usize, 0), contiguousAckedEnd(buf.segments.items[0].acked_ranges.items));
+
+    try buf.onLoss(testing.allocator, 0, 1436);
+    const rtx = buf.pollTransmit(1436).?;
+    try testing.expectEqual(@as(u64, 0), rtx.offset);
+    try testing.expectEqual(@as(usize, 1436), rtx.data.len);
+    try testing.expectEqualSlices(u8, data[0..1436], rtx.data);
+
+    buf.onSent(rtx.offset, rtx.data.len);
+    buf.onAck(testing.allocator, 0, 1436);
+    try testing.expectEqual(@as(usize, 0), buf.segments.items.len);
+    try testing.expectEqual(@as(usize, 0), buf.queued_bytes);
 }
