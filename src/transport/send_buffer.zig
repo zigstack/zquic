@@ -414,7 +414,7 @@ pub const SendBuffer = struct {
     }
 };
 
-pub const stream_send_slot_max: usize = 256;
+pub const stream_send_slot_max: usize = 512;
 
 pub const StreamSendSlot = struct {
     active: bool = false,
