@@ -36,6 +36,10 @@ pub const SendBuffer = struct {
     /// Stream end offset when FIN was queued (exclusive).
     fin_at: ?u64 = null,
     fin_sent: bool = false,
+    /// True from the moment the app calls `append(.., fin=true)`.  Stays true
+    /// even after `fin_at` is cleared on FIN ACK — needed by `isComplete()`
+    /// to distinguish "FIN-obligation acked" from "no FIN obligation set yet".
+    fin_was_set: bool = false,
     queued_bytes: usize = 0,
 
     pub fn deinit(self: *SendBuffer, allocator: std.mem.Allocator) void {
@@ -68,7 +72,10 @@ pub const SendBuffer = struct {
                     @memcpy(grown[last.data.len..][0..data.len], data);
                     last.data = grown;
                     self.queued_bytes += data.len;
-                    if (fin) self.fin_at = offset + data.len;
+                    if (fin) {
+                        self.fin_at = offset + data.len;
+                        self.fin_was_set = true;
+                    }
                     return;
                 }
             }
@@ -78,7 +85,34 @@ pub const SendBuffer = struct {
         }
         if (fin) {
             self.fin_at = if (data.len > 0) offset + data.len else offset;
+            self.fin_was_set = true;
         }
+    }
+
+    /// True once every byte the app has appended has been acked AND a FIN
+    /// has been set + delivered.  Stays false for streams the app hasn't
+    /// FIN'd (those are still legitimately open and may receive more
+    /// `append`s).  Also stays false for the brief window between
+    /// `append(_, empty, fin=true)` and the wire emit — segments is empty
+    /// there too but the FIN obligation hasn't been discharged yet.
+    ///
+    /// The caller (`applyStreamAcks` in io.zig) checks this after every
+    /// ACK-processing cycle and releases the slot when true so the bounded
+    /// `stream_send_slots` table doesn't accumulate completed streams.
+    pub fn isComplete(self: *const SendBuffer) bool {
+        if (!self.fin_was_set) return false;
+        if (self.segments.items.len != 0) return false;
+        if (self.lost.items.len != 0) return false;
+        // FIN must have been transmitted.  Two completion paths:
+        //   - piggyback: `onSent` set `fin_sent=true` when a non-zero send
+        //     reached `fin_at`; the data ACK then pruned the segment.
+        //   - separate-empty-FIN: `onAck(fin_at, 0)` cleared `fin_at` to
+        //     null and reset `fin_sent` to false.
+        // The remaining state — `fin_at != null AND !fin_sent` — is the
+        // post-`append(., empty, fin=true)` / pre-wire-emit window; do NOT
+        // release there or the FIN frame is never put on the wire.
+        if (self.fin_at != null and !self.fin_sent) return false;
+        return true;
     }
 
     fn pruneAcked(self: *SendBuffer, allocator: std.mem.Allocator) void {
