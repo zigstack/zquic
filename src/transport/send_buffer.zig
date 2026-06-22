@@ -119,6 +119,18 @@ pub const SendBuffer = struct {
         return self.queued_bytes;
     }
 
+    /// True when `[offset, offset+len)` is already held in a segment (embedder
+    /// retry after backpressure must not duplicate into `queued_bytes`).
+    pub fn coversRange(self: *const SendBuffer, offset: u64, len: usize) bool {
+        if (len == 0) return false;
+        const end = offset + len;
+        for (self.segments.items) |seg| {
+            const seg_end = seg.offset + seg.data.len;
+            if (offset >= seg.offset and end <= seg_end) return true;
+        }
+        return false;
+    }
+
     /// Append `data` at `offset`.  Coalesces with the tail segment when contiguous.
     pub fn append(
         self: *SendBuffer,
@@ -482,6 +494,17 @@ test "send_buffer: overlapping onLoss calls coalesce (regression for infinite-re
     try buf.onLoss(testing.allocator, 6, 2);
     try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
     try testing.expectEqual(@as(usize, 8), buf.lost.items[0].len);
+}
+
+test "send_buffer: coversRange skips duplicate enqueue" {
+    const testing = std.testing;
+    var buf: SendBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    try buf.append(testing.allocator, 0, "hello", false);
+    try testing.expect(buf.coversRange(0, 5));
+    try testing.expect(!buf.coversRange(0, 6));
+    try testing.expect(!buf.coversRange(5, 1));
 }
 
 test "send_buffer: non-contiguous ack retains gap for retransmit (#221)" {
