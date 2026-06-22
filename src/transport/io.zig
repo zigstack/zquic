@@ -6051,6 +6051,18 @@ pub const Server = struct {
         }
     }
 
+    /// Send every connected conn's buffered app-space ACKs and flush them to the
+    /// wire NOW. Cheap and non-reaping (no pending-send drain, no PTO, no
+    /// connection reap) so it is safe for an embedder to call frequently —
+    /// e.g. interleaved inside a long drive-loop phase — to keep ACKs flowing to
+    /// peers that would otherwise hit the no-ACK idle teardown while the single
+    /// drive thread is busy elsewhere. `flushAllConnAppAcks` only queues the ACK
+    /// packets into the send batch; this also flushes the batch.
+    pub fn flushAppAcks(self: *Server) void {
+        self.flushAllConnAppAcks();
+        self.flushSendBatch();
+    }
+
     /// Flush all buffered outgoing packets via a single sendmmsg(2) call
     /// (Linux) or a tight sendto(2) loop (other OS).  Call this once per
     /// event-loop iteration after all sends for the current cycle are queued.
