@@ -88,11 +88,20 @@ pub const SendBuffer = struct {
             allocator.free(seg.data);
             _ = self.segments.orderedRemove(0);
         }
+        // Drop lost ranges that no longer have a backing segment.  When ALL
+        // segments are pruned (entire stream fully acked), every remaining
+        // lost range is orphaned and `pollTransmit` will return null
+        // forever for it — `hasWork()` stays true → drain stalls in an
+        // infinite no-op loop.  The previous loop's `if (.. == 0) break`
+        // exited without clearing those orphans; clear them explicitly.
+        if (self.segments.items.len == 0) {
+            self.lost.clearRetainingCapacity();
+            return;
+        }
+        const head = self.segments.items[0];
         var i: usize = 0;
         while (i < self.lost.items.len) {
             const r = self.lost.items[i];
-            if (self.segments.items.len == 0) break;
-            const head = self.segments.items[0];
             if (r.offset + r.len <= head.offset + head.acked) {
                 _ = self.lost.orderedRemove(i);
                 continue;
@@ -166,10 +175,25 @@ pub const SendBuffer = struct {
     /// Mark `[offset, offset+len)` as lost — eligible for `pollTransmit`.
     pub fn onLoss(self: *SendBuffer, allocator: std.mem.Allocator, offset: u64, len: usize) !void {
         if (len == 0) return;
+        // If no segment backs any byte of this range — typically a spurious
+        // loss declared after every byte was acked + the segment pruned —
+        // don't create a phantom lost range that `pollTransmit` will never be
+        // able to serve.  Without this gate, `hasWork()` returns true forever
+        // for the orphan and the drain spins.
+        const end = offset + len;
+        var has_backing = false;
+        for (self.segments.items) |seg| {
+            const seg_end = seg.offset + seg.data.len;
+            if (end > seg.offset and offset < seg_end) {
+                has_backing = true;
+                break;
+            }
+        }
+        if (!has_backing) return;
         try self.mergeLost(allocator, offset, len);
         for (self.segments.items) |*seg| {
             const seg_end = seg.offset + seg.data.len;
-            if (offset >= seg_end or offset + len <= seg.offset) continue;
+            if (offset >= seg_end or end <= seg.offset) continue;
             const rel_start: usize = @intCast(@max(offset, seg.offset) - seg.offset);
             if (rel_start < seg.sent) seg.sent = rel_start;
         }
@@ -259,6 +283,20 @@ pub const SendBuffer = struct {
             if (offset >= seg_end or offset + len <= seg.offset) continue;
             const rel_end: usize = @intCast(offset + len - seg.offset);
             if (rel_end > seg.sent) seg.sent = rel_end;
+        }
+        // Data + FIN piggyback: `pollTransmit` attaches `fin=true` to the last
+        // unsent data frame when it ends exactly at `fin_at`.  Without marking
+        // `fin_sent` here, `hasWork()` keeps returning true → drain emits an
+        // EXTRA empty-FIN frame at the same offset.  If the data frame is then
+        // lost but the empty-FIN reaches the peer, the peer ACKs the empty FIN
+        // → `onAck(fin_at, 0)` clears `fin_at` → the data retransmit's lost-
+        // branch sees `fin_at == null` and re-emits the data without FIN.
+        // Receiver still has the empty FIN sitting in out-of-order and never
+        // delivers the (still missing) tail data.  Net effect: a permanent
+        // stall at the very end of large transfers (the post-rebase #219
+        // interop `transfer` / `zerortt` symptom).
+        if (self.fin_at) |fa| {
+            if (offset + len >= fa) self.fin_sent = true;
         }
         if (self.lost.items.len > 0) {
             const end = offset + len;

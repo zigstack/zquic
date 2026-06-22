@@ -11779,6 +11779,15 @@ const RawDrop = struct {
     /// Only drop datagrams at least this large, so we target a STREAM-bearing
     /// data packet rather than a bare ACK.
     min_len: usize = 0,
+    /// When non-zero, drop the Nth eligible datagram (counting only those that
+    /// pass `min_len`).  Lets a test simulate periodic loss across a long
+    /// transfer (e.g. interop's NS3 1% drop pattern) without burning up
+    /// `remaining` on consecutive packets.
+    drop_every: usize = 0,
+    /// Total drops performed so far (test diagnostic).
+    drops_done: usize = 0,
+    /// Internal counter for `drop_every`.
+    seen: usize = 0,
 };
 
 /// Drive one pump iteration of the in-process loopback: wait briefly for I/O,
@@ -11802,9 +11811,19 @@ fn rawPumpOnce(server: *Server, client: *Client, server_addr: compat.Address, dr
 
     while (rawSockReadable(client.sock)) {
         const n = compat.recvfrom(client.sock, &buf, 0, null, null) catch break;
-        if (drop.remaining > 0 and n >= drop.min_len) {
-            drop.remaining -= 1;
-            continue;
+        if (n >= drop.min_len) {
+            if (drop.remaining > 0) {
+                drop.remaining -= 1;
+                drop.drops_done += 1;
+                continue;
+            }
+            if (drop.drop_every > 0) {
+                drop.seen += 1;
+                if (drop.seen % drop.drop_every == 0) {
+                    drop.drops_done += 1;
+                    continue;
+                }
+            }
         }
         client.feedPacket(buf[0..n]);
     }
