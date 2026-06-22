@@ -229,26 +229,26 @@ const AppAckTracker = struct {
         if (pn > self.largest) self.largest = pn;
         if (self.range_count > 0) {
             for (self.ranges[0..self.range_count]) |*r| {
-                if (pn >= r[0] and pn <= r[1]) return self.range_count >= 48;
+                if (pn >= r[0] and pn <= r[1]) return self.range_count >= 16;
                 if (pn + 1 == r[0]) {
                     r[0] = pn;
-                    return self.range_count >= 48;
+                    return self.range_count >= 16;
                 }
                 if (pn == r[1] + 1) {
                     r[1] = pn;
-                    return self.range_count >= 48;
+                    return self.range_count >= 16;
                 }
             }
         }
         if (self.range_count == 0) {
             self.ranges[0] = .{ pn, pn };
             self.range_count = 1;
-            return self.range_count >= 48;
+            return self.range_count >= 16;
         }
         if (self.range_count < self.ranges.len) {
             self.ranges[self.range_count] = .{ pn, pn };
             self.range_count += 1;
-            return self.range_count >= 48;
+            return self.range_count >= 16;
         }
         return true;
     }
@@ -5241,7 +5241,7 @@ pub const Server = struct {
                 // SendBuffer.onAck never pruned those ranges → drain re-emitted
                 // bytes that the peer already had → CC stuck in recovery,
                 // transfer timed out at 168 s on the post-fix interop run.
-                var acked_stream_buf: [1024]recovery.StreamAck = undefined;
+                var acked_stream_buf: [2048]recovery.StreamAck = undefined;
                 const ld_result = conn.ld.onAck(
                     .application,
                     largest_ack,
@@ -9874,7 +9874,7 @@ pub const Client = struct {
                 // SendBuffer.onAck never pruned those ranges → drain re-emitted
                 // bytes that the peer already had → CC stuck in recovery,
                 // transfer timed out at 168 s on the post-fix interop run.
-                var acked_stream_buf: [1024]recovery.StreamAck = undefined;
+                var acked_stream_buf: [2048]recovery.StreamAck = undefined;
                 const ld_result = self.conn.ld.onAck(
                     .application,
                     largest_ack,
@@ -10226,11 +10226,11 @@ pub const Client = struct {
             return;
         }
 
-        // Defer ACK until after the recv drain loop in downloadUrls.
-        if (self.app_ack.observe(decompressed_pn)) {
-            self.flushDeferredAck();
-            _ = self.app_ack.observe(decompressed_pn);
-        }
+        // Flush ACKs promptly so the server's CC window opens during 0-RTT
+        // response bursts (zerortt / multiplexing); deferring until 48 PNs
+        // stalled the peer when fewer than 48 responses were in flight.
+        _ = self.app_ack.observe(decompressed_pn);
+        self.flushDeferredAck();
     }
 
     /// Send a CONNECTION_CLOSE frame (QUIC layer, type 0x1c) and enter draining.
