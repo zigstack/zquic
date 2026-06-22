@@ -419,6 +419,16 @@ pub const LossDetector = struct {
                             .len = self.sent[i].stream_byte_len,
                         };
                         acked_stream_count += 1;
+                    } else {
+                        // Loud: silent overflow leaves `SendBuffer` ranges
+                        // un-pruned → CC stuck in recovery → transfer stalls
+                        // (the exact post-fix #219 interop symptom when the
+                        // cap was 64). Surface so future regressions are
+                        // obvious without re-bisecting.
+                        log.warn(
+                            "recovery: acked_stream_buf overflow (>{d} entries) — stream={d} offset={d} len={d} pruning skipped",
+                            .{ acked_stream_buf.len, self.sent[i].stream_id, self.sent[i].stream_offset, self.sent[i].stream_byte_len },
+                        );
                     }
                 }
                 self.sent[i] = self.sent[self.sent_count - 1];

@@ -5193,7 +5193,14 @@ pub const Server = struct {
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
                 var lost_buf: [32]recovery.SentPacket = undefined;
-                var acked_stream_buf: [64]recovery.StreamAck = undefined;
+                // 1024 covers the realistic per-ACK stream-range count for
+                // multi-MB transfers (bulk file download ~hundreds of packets
+                // in flight; tail-drop ACKs can confirm many at once). The
+                // previous 64-entry cap silently dropped overflow entries →
+                // SendBuffer.onAck never pruned those ranges → drain re-emitted
+                // bytes that the peer already had → CC stuck in recovery,
+                // transfer timed out at 168 s on the post-fix interop run.
+                var acked_stream_buf: [1024]recovery.StreamAck = undefined;
                 const ld_result = conn.ld.onAck(
                     .application,
                     largest_ack,
@@ -9802,7 +9809,14 @@ pub const Client = struct {
                 const first_ack_range = fst_r.value;
 
                 var lost_buf: [32]recovery.SentPacket = undefined;
-                var acked_stream_buf: [64]recovery.StreamAck = undefined;
+                // 1024 covers the realistic per-ACK stream-range count for
+                // multi-MB transfers (bulk file download ~hundreds of packets
+                // in flight; tail-drop ACKs can confirm many at once). The
+                // previous 64-entry cap silently dropped overflow entries →
+                // SendBuffer.onAck never pruned those ranges → drain re-emitted
+                // bytes that the peer already had → CC stuck in recovery,
+                // transfer timed out at 168 s on the post-fix interop run.
+                var acked_stream_buf: [1024]recovery.StreamAck = undefined;
                 const ld_result = self.conn.ld.onAck(
                     .application,
                     largest_ack,
