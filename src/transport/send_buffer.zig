@@ -159,7 +159,22 @@ pub const SendBuffer = struct {
             self.queued_bytes += data.len;
         }
         if (fin) {
-            self.fin_at = if (data.len > 0) offset + data.len else offset;
+            const fa: u64 = if (data.len > 0) offset + data.len else blk: {
+                var end = offset;
+                for (self.segments.items) |seg| {
+                    const seg_end = seg.offset + seg.data.len;
+                    if (offset >= seg.offset and offset < seg_end) {
+                        end = seg_end;
+                        break;
+                    }
+                }
+                break :blk end;
+            };
+            if (self.fin_at) |cur| {
+                self.fin_at = @max(cur, fa);
+            } else {
+                self.fin_at = fa;
+            }
         }
     }
 
@@ -494,6 +509,21 @@ test "send_buffer: overlapping onLoss calls coalesce (regression for infinite-re
     try buf.onLoss(testing.allocator, 6, 2);
     try testing.expectEqual(@as(usize, 1), buf.lost.items.len);
     try testing.expectEqual(@as(usize, 8), buf.lost.items[0].len);
+}
+
+test "send_buffer: duplicate fin enqueue does not clobber fin_at (#221)" {
+    const testing = std.testing;
+    var buf: SendBuffer = .{};
+    defer buf.deinit(testing.allocator);
+
+    var data: [32]u8 = undefined;
+    @memset(&data, 0xAB);
+    try buf.append(testing.allocator, 0, &data, true);
+    try testing.expectEqual(@as(?u64, 32), buf.fin_at);
+
+    // coversRange retry must not reset fin_at to offset 0.
+    try buf.append(testing.allocator, 0, &.{}, true);
+    try testing.expectEqual(@as(?u64, 32), buf.fin_at);
 }
 
 test "send_buffer: coversRange skips duplicate enqueue" {
