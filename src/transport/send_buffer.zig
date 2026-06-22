@@ -150,7 +150,14 @@ pub const SendBuffer = struct {
                     @memcpy(grown[last.data.len..][0..data.len], data);
                     last.data = grown;
                     self.queued_bytes += data.len;
-                    if (fin) self.fin_at = offset + data.len;
+                    if (fin) {
+                        const fa = offset + data.len;
+                        if (self.fin_at) |cur| {
+                            self.fin_at = @max(cur, fa);
+                        } else {
+                            self.fin_at = fa;
+                        }
+                    }
                     return;
                 }
             }
@@ -302,6 +309,19 @@ pub const SendBuffer = struct {
         return false;
     }
 
+    /// True when all enqueued bytes are sent and contiguously ACKed (safe to
+    /// drop the per-stream slot).  Stricter than `hasWork`: sent-but-unacked
+    /// data with a leading gap must not be released before loss recovery runs.
+    pub fn isSendComplete(self: *const SendBuffer) bool {
+        if (self.lost.items.len > 0) return false;
+        for (self.segments.items) |seg| {
+            if (seg.sent < seg.data.len) return false;
+            if (contiguousAckedEnd(seg.acked_ranges.items) < seg.data.len) return false;
+        }
+        if (self.fin_at != null and !self.fin_sent) return false;
+        return true;
+    }
+
     /// Next range to put on the wire (lost ranges first, then unsent tail).
     pub fn pollTransmit(self: *SendBuffer, max_len: usize) ?PollResult {
         if (max_len == 0) return null;
@@ -426,6 +446,19 @@ pub fn releaseStreamSendSlot(slots: []StreamSendSlot, allocator: std.mem.Allocat
             slot.buf.deinit(allocator);
             slot.* = .{};
             return;
+        }
+    }
+}
+
+/// Free per-stream send slots whose `SendBuffer` has no unsent or unacked work.
+/// HTTP/0.9 immediate responses (multiplexing / zerortt) only need a slot until
+/// the peer ACKs; without this the 64-slot table is exhausted after ~64 streams.
+pub fn releaseIdleStreamSendSlots(slots: []StreamSendSlot, allocator: std.mem.Allocator) void {
+    for (slots) |*slot| {
+        if (!slot.active) continue;
+        if (slot.buf.isSendComplete()) {
+            slot.buf.deinit(allocator);
+            slot.* = .{};
         }
     }
 }
@@ -574,4 +607,21 @@ test "send_buffer: non-contiguous ack retains gap for retransmit (#221)" {
     buf.onAck(testing.allocator, 0, 1436);
     try testing.expectEqual(@as(usize, 0), buf.segments.items.len);
     try testing.expectEqual(@as(usize, 0), buf.queued_bytes);
+}
+
+test "send_buffer: releaseIdleStreamSendSlots frees acked slots" {
+    const testing = std.testing;
+    var slots: [stream_send_slot_max]StreamSendSlot = [_]StreamSendSlot{.{}} ** stream_send_slot_max;
+
+    const s0 = getOrCreateStreamSendSlot(&slots, 0) orelse return error.TestUnexpectedNull;
+    try s0.append(testing.allocator, 0, "ok", true);
+    const p = s0.pollTransmit(2).?;
+    s0.onSent(p.offset, p.data.len);
+    s0.onAck(testing.allocator, 0, 2);
+    s0.onAck(testing.allocator, 2, 0);
+    try testing.expect(s0.isSendComplete());
+
+    releaseIdleStreamSendSlots(&slots, testing.allocator);
+    try testing.expect(!slots[0].active);
+    try testing.expect(getOrCreateStreamSendSlot(&slots, 4) != null);
 }
