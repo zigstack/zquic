@@ -12986,3 +12986,168 @@ test "raw-app server-initiated bidi: CLIENT reply with SEPARATE empty-FIN frame 
         try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     }
 }
+
+test "raw-app server-initiated bidi: REPEATED req/resp past stream-id 1024 (inbound-leg fallback repro)" {
+    // REPRODUCTION A (sequential, WITH release) for the req/resp-over-inbound
+    // timeout. Each iteration the SERVER opens a FRESH server-initiated bidi
+    // stream (id 1,5,9,…), writes a small request+FIN; the CLIENT surfaces +
+    // reads it and replies+FIN; the SERVER reads the full response. >256
+    // iterations pushes the server-initiated stream id past 1024 (id = 4*i+1),
+    // the exact regime where the zig-libp2p 256-stream tracking cap drops
+    // surfacing. Here at the zquic layer (no libp2p cap) every round-trip must
+    // still deliver. If this PASSES, factors 2 (64-slot) and 3 (response
+    // delivery) are NOT the zquic-layer defect when the slot is released each
+    // iteration, and the cap (factor 1) is purely a zig-libp2p concern.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    const request = "STATUS-REQ";
+    const response = "STATUS-RESP-PAYLOAD";
+
+    const iterations: usize = 400; // 4*400+1 = 1601 > 1024
+    var iter: usize = 0;
+    var last_sid: u64 = 0;
+    while (iter < iterations) : (iter += 1) {
+        const sid = lb.server.openRawAppStream(conn) catch |e| {
+            std.debug.print("FAIL iter={} (last_sid={}): openRawAppStream={s}\n", .{ iter, last_sid, @errorName(e) });
+            return e;
+        };
+        last_sid = sid;
+        var drop = RawDrop{};
+
+        // Server → request+FIN; client reads it.
+        {
+            var sent = false;
+            var got = false;
+            const deadline = compat.milliTimestamp() + 5_000;
+            while (compat.milliTimestamp() < deadline) {
+                if (!sent) {
+                    if (lb.server.sendRawStreamData(conn, sid, 0, request, true) > 0) sent = true;
+                }
+                rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+                if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                    if (b.len == request.len and lb.client.rawAppStreamFinReceived(sid)) {
+                        got = true;
+                        break;
+                    }
+                }
+            }
+            if (!got) {
+                std.debug.print("FAIL iter={} sid={}: request not delivered to client\n", .{ iter, sid });
+                return error.RequestNotDelivered;
+            }
+        }
+
+        // Client → response+FIN; server reads it.
+        {
+            var sent = false;
+            var done = false;
+            const deadline = compat.milliTimestamp() + 5_000;
+            while (compat.milliTimestamp() < deadline) {
+                if (!sent) {
+                    if (lb.client.sendRawStreamData(sid, 0, response, true) > 0) sent = true;
+                }
+                rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+                if (rawAppRecvBuffer(conn, sid)) |b| {
+                    if (b.len == response.len and rawAppStreamFullyReceived(conn, sid)) {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if (!done) {
+                const b = rawAppRecvBuffer(conn, sid);
+                std.debug.print(
+                    "FAIL iter={} sid={}: response not delivered to server (bytes={} fin={})\n",
+                    .{ iter, sid, if (b) |x| x.len else 0, rawAppStreamFinReceived(conn, sid) },
+                );
+                return error.ResponseNotDelivered;
+            }
+            try std.testing.expectEqualSlices(u8, response, rawAppRecvBuffer(conn, sid).?);
+        }
+
+        try std.testing.expect(lb.client.releaseRawAppStream(sid));
+        try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+    }
+    std.debug.print("OK: {} server-initiated round-trips, last sid={}\n", .{ iterations, last_sid });
+}
+
+test "raw-app server-initiated bidi: CONCURRENT ~80 streams probe 64-slot table" {
+    // REPRODUCTION A (concurrent, NO release) for factor 2 — the 64-slot
+    // raw_app_streams / raw_app_recv tables. Open many server-initiated streams
+    // WITHOUT releasing any, mimicking a status burst + gossip reopens piling up
+    // concurrent server-initiated streams on one inbound conn. The server-side
+    // table is 64 slots; the 65th open must surface the exhaustion (either
+    // RawAppStreamSlotsFull at open time, or — if open succeeds — a later
+    // round-trip that can't be reassembled because no recv slot is free).
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    const target: usize = 80;
+    var opened: usize = 0;
+    var sids: [target]u64 = undefined;
+    var open_err: ?anyerror = null;
+    while (opened < target) : (opened += 1) {
+        const sid = lb.server.openRawAppStream(conn) catch |e| {
+            open_err = e;
+            break;
+        };
+        sids[opened] = sid;
+    }
+    std.debug.print(
+        "CONCURRENT open: {}/{} server-initiated streams opened before {s}\n",
+        .{ opened, target, if (open_err) |e| @errorName(e) else "no error" },
+    );
+
+    // For every stream that DID open, drive request→FIN and confirm the client
+    // surfaces it — exhaustion on the CLIENT recv table (also 64) would show as
+    // streams beyond the 64th never reassembling.
+    const request = "Q";
+    var i: usize = 0;
+    var delivered: usize = 0;
+    while (i < opened) : (i += 1) {
+        _ = lb.server.sendRawStreamData(conn, sids[i], 0, request, true);
+    }
+    var drop = RawDrop{};
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (compat.milliTimestamp() < deadline) {
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        delivered = 0;
+        i = 0;
+        while (i < opened) : (i += 1) {
+            if (lb.client.rawAppRecvBuffer(sids[i])) |b| {
+                if (b.len == request.len and lb.client.rawAppStreamFinReceived(sids[i])) delivered += 1;
+            }
+        }
+        if (delivered == opened) break;
+    }
+    std.debug.print("CONCURRENT deliver: {}/{} requests surfaced+FIN on client\n", .{ delivered, opened });
+
+    // Clean up to avoid leaks regardless of outcome.
+    i = 0;
+    while (i < opened) : (i += 1) {
+        _ = lb.client.releaseRawAppStream(sids[i]);
+        _ = releaseRawAppStream(conn, sids[i], allocator);
+    }
+
+    // Assertions: the 64-slot table MUST cap concurrent opens at 64 (server
+    // side). This documents the limit precisely.
+    try std.testing.expect(opened <= 64);
+    try std.testing.expect(open_err != null);
+    try std.testing.expectEqual(@as(usize, 64), opened);
+    try std.testing.expectEqual(opened, delivered);
+}
