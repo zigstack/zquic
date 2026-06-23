@@ -192,6 +192,98 @@ pub const StreamAck = struct {
     len: u32,
 };
 
+/// Disposition of one in-flight packet against an incoming ACK.
+const AckDisp = enum { acked, lost, keep };
+
+/// Accumulators threaded through `classifyAck` across both onAck passes.
+const AckAccum = struct {
+    bytes_acked: u64 = 0,
+    lost_bytes: u64 = 0,
+    lost_count: usize = 0,
+    largest_lost_pn: ?u64 = null,
+    rtt_updated: bool = false,
+    earliest_acked_eliciting_send_time: ?u64 = null,
+    earliest_lost_eliciting_send_time: ?u64 = null,
+    latest_lost_eliciting_send_time: ?u64 = null,
+    acked_stream_count: usize = 0,
+};
+
+fn classifyAck(
+    p: *SentPacket,
+    space: PacketNumberSpace,
+    smallest_acked: u64,
+    largest_acked: u64,
+    largest_advanced: bool,
+    time_lost_before: u64,
+    now_ms: u64,
+    ack_delay_ms: u64,
+    rtt: *RttEstimator,
+    lost_buf: []SentPacket,
+    acked_stream_buf: []StreamAck,
+    allocator: std.mem.Allocator,
+    acc: *AckAccum,
+) AckDisp {
+    if (p.space != space) return .keep;
+    if (largest_advanced and p.pn == largest_acked and !acc.rtt_updated) {
+        rtt.update(now_ms -| p.send_time_ms, ack_delay_ms);
+        acc.rtt_updated = true;
+    }
+    if (p.pn >= smallest_acked and p.pn <= largest_acked) {
+        acc.bytes_acked += p.size;
+        if (p.ack_eliciting) {
+            if (acc.earliest_acked_eliciting_send_time) |t| {
+                if (p.send_time_ms < t) acc.earliest_acked_eliciting_send_time = p.send_time_ms;
+            } else acc.earliest_acked_eliciting_send_time = p.send_time_ms;
+        }
+        if (p.stream_data) |sd| {
+            _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
+            p.stream_data = null;
+        } else if (p.has_stream_data and p.stream_data == null) {
+            if (acc.acked_stream_count < acked_stream_buf.len) {
+                acked_stream_buf[acc.acked_stream_count] = .{
+                    .stream_id = p.stream_id,
+                    .offset = p.stream_offset,
+                    .len = p.stream_byte_len,
+                };
+                acc.acked_stream_count += 1;
+            } else {
+                log.warn(
+                    "recovery: acked_stream_buf overflow (>{d} entries) — stream={d} offset={d} len={d} pruning skipped",
+                    .{ acked_stream_buf.len, p.stream_id, p.stream_offset, p.stream_byte_len },
+                );
+            }
+        }
+        return .acked;
+    }
+    const packet_threshold_lost = (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold);
+    const time_threshold_lost = (p.pn < smallest_acked and p.send_time_ms <= time_lost_before);
+    if (packet_threshold_lost or time_threshold_lost) {
+        acc.lost_bytes += p.size;
+        if (acc.largest_lost_pn) |lpn| {
+            if (p.pn > lpn) acc.largest_lost_pn = p.pn;
+        } else acc.largest_lost_pn = p.pn;
+        if (p.ack_eliciting) {
+            if (acc.earliest_lost_eliciting_send_time) |t| {
+                if (p.send_time_ms < t) acc.earliest_lost_eliciting_send_time = p.send_time_ms;
+            } else acc.earliest_lost_eliciting_send_time = p.send_time_ms;
+            if (acc.latest_lost_eliciting_send_time) |t| {
+                if (p.send_time_ms > t) acc.latest_lost_eliciting_send_time = p.send_time_ms;
+            } else acc.latest_lost_eliciting_send_time = p.send_time_ms;
+        }
+        if (acc.lost_count < lost_buf.len) {
+            lost_buf[acc.lost_count] = p.*;
+            p.stream_data = null;
+            acc.lost_count += 1;
+        } else {
+            if (p.stream_data) |sd| {
+                _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
+                p.stream_data = null;
+            }
+        }
+        return .lost;
+    }
+    return .keep;
+}
 /// Loss detection state for one packet number space.
 pub const LossDetector = struct {
     /// High-BDP paths can hold thousands of in-flight packets; 16 KiB slots
@@ -199,8 +291,21 @@ pub const LossDetector = struct {
     pub const max_tracked_packets: usize = 16_384;
     const max_tracked = max_tracked_packets;
 
+    /// In-flight packets form a DEQUE inside `sent`: the logical packets are
+    /// `sent[head .. head + sent_count]`, oldest (lowest pn per space) first.
+    /// `onPacketSent` pushes to the back; `onAck` pops acked/lost packets off
+    /// the FRONT (advancing `head`, O(acked)) and never touches the untouched
+    /// higher-pn suffix. Every mutation (push-back, front-pop, the compaction
+    /// fallback, `abandonSpace`) preserves send order, so within each PN space
+    /// the packets stay ascending by pn — the invariant the front-pop relies on.
+    /// This replaced an unsorted flat array + swap-remove whose onAck rescanned
+    /// ALL in-flight packets (O(sent_count), up to the 16384 cap) on every ACK —
+    /// the per-packet cost that saturated the single drive thread under a full
+    /// 31-peer mesh (#184 / drive-loop stall).
     sent: [max_tracked]SentPacket = undefined,
     sent_count: usize = 0,
+    /// Physical index of the deque front (logical packet 0). See `sent`.
+    head: usize = 0,
     largest_acked: [pn_space_count]u64 = [_]u64{0} ** pn_space_count,
     loss_time_ms: [pn_space_count]?u64 = .{null} ** pn_space_count,
     /// Cumulative count of packets this detector has declared lost over the
@@ -218,27 +323,41 @@ pub const LossDetector = struct {
 
     /// True when this PN space still has ack-eliciting packets in flight.
     pub fn inflightInSpace(self: *const LossDetector, space: PacketNumberSpace) bool {
-        for (self.sent[0..self.sent_count]) |p| {
+        for (self.sent[self.head .. self.head + self.sent_count]) |p| {
             if (p.space == space and p.ack_eliciting and p.in_flight) return true;
         }
         return false;
     }
 
+    /// Pointer to the most-recently-sent (back-of-deque) tracked packet, or
+    /// null when nothing is tracked. Callers attach stream metadata to the
+    /// packet they just recorded via `onPacketSent`.
+    pub fn lastSentPtr(self: *LossDetector) ?*SentPacket {
+        if (self.sent_count == 0) return null;
+        return &self.sent[self.head + self.sent_count - 1];
+    }
+
     /// Stop tracking in-flight packets in a PN space (RFC 9001: Initial/Handshake
     /// keys are discarded once the handshake completes).
     pub fn abandonSpace(self: *LossDetector, space: PacketNumberSpace, allocator: std.mem.Allocator) void {
-        var i: usize = 0;
-        while (i < self.sent_count) {
-            if (self.sent[i].space == space) {
-                if (self.sent[i].stream_data) |sd| {
-                    _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
+        // Order-preserving compaction (keeps the per-space pn ordering intact).
+        const base = self.head;
+        var w: usize = 0;
+        var r: usize = 0;
+        while (r < self.sent_count) : (r += 1) {
+            const p = &self.sent[base + r];
+            if (p.space == space) {
+                if (p.stream_data) |sd| {
+                    _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
+                    p.stream_data = null;
                 }
-                self.sent[i] = self.sent[self.sent_count - 1];
-                self.sent_count -= 1;
+                // drop — do not advance the write cursor
             } else {
-                i += 1;
+                if (w != r) self.sent[base + w] = self.sent[base + r];
+                w += 1;
             }
         }
+        self.sent_count = w;
         const sidx = spaceIdx(space);
         self.largest_acked[sidx] = 0;
         self.loss_time_ms[sidx] = null;
@@ -247,11 +366,12 @@ pub const LossDetector = struct {
     /// Free any heap-owned retransmit buffers attached to in-flight packets.
     /// Caller passes the same allocator used when populating `stream_data`.
     pub fn deinit(self: *LossDetector, allocator: std.mem.Allocator) void {
-        for (self.sent[0..self.sent_count]) |*p| {
+        for (self.sent[self.head .. self.head + self.sent_count]) |*p| {
             if (p.stream_data) |sd| _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
             p.stream_data = null;
         }
         self.sent_count = 0;
+        self.head = 0;
     }
 
     /// True when another in-flight packet can be tracked (quinn always
@@ -267,7 +387,18 @@ pub const LossDetector = struct {
     /// otherwise it would leak.  Returns true when the packet was stored.
     pub fn onPacketSent(self: *LossDetector, pkt: SentPacket) bool {
         if (self.sent_count < max_tracked) {
-            self.sent[self.sent_count] = pkt;
+            // Push to the back of the deque. If front-pops have walked `head`
+            // to the end of the storage, slide the live window back to index 0
+            // first — O(sent_count), amortized across `max_tracked` sends.
+            if (self.head + self.sent_count >= max_tracked) {
+                std.mem.copyForwards(
+                    SentPacket,
+                    self.sent[0..self.sent_count],
+                    self.sent[self.head .. self.head + self.sent_count],
+                );
+                self.head = 0;
+            }
+            self.sent[self.head + self.sent_count] = pkt;
             self.sent_count += 1;
             return true;
         }
@@ -347,134 +478,63 @@ pub const LossDetector = struct {
         if (first_ack_range > largest_acked) return error.FrameEncodingError;
 
         const sidx = spaceIdx(space);
-        var rtt_updated = false;
-
-        // Update RTT sample for the largest acknowledged packet in this space.
-        if (largest_acked > self.largest_acked[sidx]) {
-            self.largest_acked[sidx] = largest_acked;
-            for (self.sent[0..self.sent_count]) |p| {
-                if (p.space != space) continue;
-                if (p.pn == largest_acked) {
-                    const sample = now_ms -| p.send_time_ms;
-                    rtt.update(sample, ack_delay_ms);
-                    rtt_updated = true;
-                    break;
-                }
-            }
-        }
+        const largest_advanced = largest_acked > self.largest_acked[sidx];
+        if (largest_advanced) self.largest_acked[sidx] = largest_acked;
 
         // The first ACK range covers [smallest_acked .. largest_acked].
-        // Packets in this range are definitively acknowledged.
-        // Packets below smallest_acked may be in a gap (possibly lost).
+        // Packets in this range are definitively acknowledged. Packets below
+        // smallest_acked may be in a gap (possibly lost).
         const smallest_acked = largest_acked - first_ack_range;
 
-        var lost_count: usize = 0;
-        var bytes_acked: u64 = 0;
-        var lost_bytes: u64 = 0;
-        var largest_lost_pn: ?u64 = null;
-        // Track the earliest send_time of any ack-eliciting packet acked by
-        // this ACK.  Per RFC 9002 §7.6.2 the persistent congestion window
-        // must start at or before this time — otherwise we'd have direct
-        // evidence the path delivered something in the interval and the
-        // contiguity precondition is violated.
-        var earliest_acked_eliciting_send_time: ?u64 = null;
-        // Track the bounds of ack-eliciting packets declared lost so we can
-        // evaluate the persistent-congestion duration (RFC 9002 §7.6.1).
-        var earliest_lost_eliciting_send_time: ?u64 = null;
-        var latest_lost_eliciting_send_time: ?u64 = null;
-        var acked_stream_count: usize = 0;
-
-        // Compute the time-threshold loss bound once per ACK (RFC 9002
-        // §6.1.2).  A packet older than this is declared lost even if fewer
-        // than k_packet_threshold later PNs have been acked — this handles
-        // reordering windows beyond k_packet_threshold and tail drops where
-        // the gap from largest_acked back to the lost packet is large.
+        // Time-threshold loss bound, computed once (RFC 9002 §6.1.2). A packet
+        // older than this is lost even if < k_packet_threshold later PNs acked.
         const loss_delay = rtt.loss_delay_ms();
         const time_lost_before = now_ms -| loss_delay;
 
-        var i: usize = 0;
-        while (i < self.sent_count) {
-            const p = self.sent[i];
-            if (p.space != space) {
-                i += 1;
-                continue;
-            }
+        var acc: AckAccum = .{};
 
-            // Packet is definitively acked: within [smallest_acked .. largest_acked].
-            if (p.pn >= smallest_acked and p.pn <= largest_acked) {
-                bytes_acked += p.size;
-                if (p.ack_eliciting) {
-                    if (earliest_acked_eliciting_send_time) |t| {
-                        if (p.send_time_ms < t) earliest_acked_eliciting_send_time = p.send_time_ms;
-                    } else earliest_acked_eliciting_send_time = p.send_time_ms;
-                }
-                if (self.sent[i].stream_data) |sd| {
-                    _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
-                    self.sent[i].stream_data = null;
-                } else if (self.sent[i].has_stream_data and self.sent[i].stream_data == null) {
-                    if (acked_stream_count < acked_stream_buf.len) {
-                        acked_stream_buf[acked_stream_count] = .{
-                            .stream_id = self.sent[i].stream_id,
-                            .offset = self.sent[i].stream_offset,
-                            .len = self.sent[i].stream_byte_len,
-                        };
-                        acked_stream_count += 1;
-                    } else {
-                        // Loud: silent overflow leaves `SendBuffer` ranges
-                        // un-pruned → CC stuck in recovery → transfer stalls
-                        // (the exact post-fix #219 interop symptom when the
-                        // cap was 64). Surface so future regressions are
-                        // obvious without re-bisecting.
-                        log.warn(
-                            "recovery: acked_stream_buf overflow (>{d} entries) — stream={d} offset={d} len={d} pruning skipped",
-                            .{ acked_stream_buf.len, self.sent[i].stream_id, self.sent[i].stream_offset, self.sent[i].stream_byte_len },
-                        );
-                    }
-                }
-                self.sent[i] = self.sent[self.sent_count - 1];
-                self.sent_count -= 1;
-                continue;
+        // ---- Fast path: pop acked/lost packets off the deque FRONT. The deque
+        // is send-ordered (ascending pn per space), so once a front packet of
+        // THIS space has pn > largest_acked, every remaining packet of this
+        // space does too — nothing more to process. O(acked + lost), and the
+        // unacked higher-pn suffix (the bulk under load) is never scanned. This
+        // is the whole point of the deque: at the 16384 in-flight cap the old
+        // flat-array rescan was O(16384) per ACK and saturated the drive thread.
+        var done_front = false;
+        while (self.sent_count > 0) {
+            const p = &self.sent[self.head];
+            if (p.space != space) break; // other-space packet blocks the front
+            if (p.pn > largest_acked) {
+                done_front = true; // sorted ⇒ all remaining of this space are keeps
+                break;
             }
-
-            // Packet is below the acked range — apply RFC 9002 §6.1 loss
-            // detection for true gaps (p.pn < smallest_acked).  A packet is
-            // declared lost if EITHER:
-            //   - packet threshold: k_packet_threshold or more later PNs are
-            //     acked (RFC 9002 §6.1.1), OR
-            //   - time threshold:   it was sent before now - loss_delay
-            //     (RFC 9002 §6.1.2).
-            const packet_threshold_lost = (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold);
-            const time_threshold_lost = (p.pn < smallest_acked and p.send_time_ms <= time_lost_before);
-            if (packet_threshold_lost or time_threshold_lost) {
-                lost_bytes += p.size;
-                if (largest_lost_pn) |lpn| {
-                    if (p.pn > lpn) largest_lost_pn = p.pn;
-                } else largest_lost_pn = p.pn;
-                if (p.ack_eliciting) {
-                    if (earliest_lost_eliciting_send_time) |t| {
-                        if (p.send_time_ms < t) earliest_lost_eliciting_send_time = p.send_time_ms;
-                    } else earliest_lost_eliciting_send_time = p.send_time_ms;
-                    if (latest_lost_eliciting_send_time) |t| {
-                        if (p.send_time_ms > t) latest_lost_eliciting_send_time = p.send_time_ms;
-                    } else latest_lost_eliciting_send_time = p.send_time_ms;
-                }
-                if (lost_count < lost_buf.len) {
-                    lost_buf[lost_count] = p;
-                    self.sent[i].stream_data = null;
-                    lost_count += 1;
-                } else {
-                    if (self.sent[i].stream_data) |sd| {
-                        _ = freeStreamDataChecked(allocator, sd, self.sent[i].pn, self.sent[i].stream_id);
-                        self.sent[i].stream_data = null;
-                    }
-                }
-                self.sent[i] = self.sent[self.sent_count - 1];
-                self.sent_count -= 1;
-                continue;
+            switch (classifyAck(p, space, smallest_acked, largest_acked, largest_advanced, time_lost_before, now_ms, ack_delay_ms, rtt, lost_buf, acked_stream_buf, allocator, &acc)) {
+                .acked, .lost => {
+                    self.head += 1;
+                    self.sent_count -= 1;
+                },
+                .keep => break, // gap-keeper (pn < smallest, not yet lost) — finish via compaction
             }
-
-            i += 1;
         }
+
+        // ---- Fallback: order-preserving compaction over the remaining window.
+        // Runs only when the front stalled on an other-space packet or a
+        // gap-keeper (reordering / multi-space handshake) — rare on a healthy
+        // path, and bounded by the remaining (not total) in-flight count.
+        if (!done_front and self.sent_count > 0) {
+            const base = self.head;
+            var w: usize = 0;
+            var r: usize = 0;
+            while (r < self.sent_count) : (r += 1) {
+                const p = &self.sent[base + r];
+                if (classifyAck(p, space, smallest_acked, largest_acked, largest_advanced, time_lost_before, now_ms, ack_delay_ms, rtt, lost_buf, acked_stream_buf, allocator, &acc) == .keep) {
+                    if (w != r) self.sent[base + w] = self.sent[base + r];
+                    w += 1;
+                }
+            }
+            self.sent_count = w;
+        }
+        if (self.sent_count == 0) self.head = 0; // keep `head` small when idle
 
         // Persistent congestion (RFC 9002 §7.6.1): the duration between the
         // earliest and latest ack-eliciting packets declared lost spans the
@@ -485,8 +545,8 @@ pub const LossDetector = struct {
         // compute a meaningful threshold (RFC 9002 §7.6.2).
         var pc = false;
         if (rtt.first_rtt_sample) {
-            if (earliest_lost_eliciting_send_time) |t0| {
-                if (latest_lost_eliciting_send_time) |t1| {
+            if (acc.earliest_lost_eliciting_send_time) |t0| {
+                if (acc.latest_lost_eliciting_send_time) |t1| {
                     if (t1 > t0) {
                         const span = t1 - t0;
                         const pc_dur = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
@@ -495,7 +555,7 @@ pub const LossDetector = struct {
                             // ACK fell inside (t0, t1).  If one did, this ACK
                             // proves the path is delivering and PC does not
                             // apply.
-                            const overlap = if (earliest_acked_eliciting_send_time) |ea|
+                            const overlap = if (acc.earliest_acked_eliciting_send_time) |ea|
                                 (ea > t0 and ea < t1)
                             else
                                 false;
@@ -506,15 +566,15 @@ pub const LossDetector = struct {
             }
         }
 
-        self.total_declared_lost += lost_count;
+        self.total_declared_lost += acc.lost_count;
         return OnAckResult{
-            .lost_count = lost_count,
-            .rtt_updated = rtt_updated,
-            .bytes_acked = bytes_acked,
-            .lost_bytes = lost_bytes,
+            .lost_count = acc.lost_count,
+            .rtt_updated = acc.rtt_updated,
+            .bytes_acked = acc.bytes_acked,
+            .lost_bytes = acc.lost_bytes,
             .persistent_congestion = pc,
-            .largest_lost_pn = largest_lost_pn,
-            .acked_stream_count = acked_stream_count,
+            .largest_lost_pn = acc.largest_lost_pn,
+            .acked_stream_count = acc.acked_stream_count,
         };
     }
 };
@@ -891,4 +951,89 @@ test "loss: abandonSpace drops only the targeted PN space" {
     try testing.expect(!ld.inflightInSpace(.initial));
     try testing.expect(!ld.inflightInSpace(.handshake));
     try testing.expect(ld.inflightInSpace(.application));
+}
+
+test "deque: contiguous front ack pops front, higher-pn suffix preserved in order" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    var pn: u64 = 0;
+    while (pn < 10) : (pn += 1) {
+        _ = ld.onPacketSent(.{ .pn = pn, .send_time_ms = 100 + pn, .size = 100, .ack_eliciting = true, .in_flight = true });
+    }
+    try testing.expectEqual(@as(usize, 10), ld.sent_count);
+    // Ack [0..4]: largest=4, first_ack_range=4. Healthy contiguous front ack.
+    var lost_buf: [8]SentPacket = undefined;
+    const r = try ld.onAck(.application, 4, 4, 0, 200, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r.lost_count);
+    try testing.expectEqual(@as(u64, 500), r.bytes_acked);
+    // 5 remain (pns 5..9), popped off the front so head advanced past them.
+    try testing.expectEqual(@as(usize, 5), ld.sent_count);
+    try testing.expectEqual(@as(usize, 5), ld.head);
+    var i: usize = 0;
+    while (i < ld.sent_count) : (i += 1) {
+        try testing.expectEqual(@as(u64, 5) + i, ld.sent[ld.head + i].pn);
+    }
+    try testing.expectEqual(@as(u64, 9), ld.lastSentPtr().?.pn);
+}
+
+test "deque: fully acked resets head to 0 and stays usable" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    var pn: u64 = 0;
+    while (pn < 3) : (pn += 1) {
+        _ = ld.onPacketSent(.{ .pn = pn, .send_time_ms = 10, .size = 1, .ack_eliciting = true, .in_flight = true });
+    }
+    var lost_buf: [4]SentPacket = undefined;
+    _ = try ld.onAck(.application, 2, 2, 0, 20, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ld.sent_count);
+    try testing.expectEqual(@as(usize, 0), ld.head);
+    // Reusable: a fresh send lands at index 0.
+    try testing.expect(ld.onPacketSent(.{ .pn = 3, .send_time_ms = 30, .size = 1, .ack_eliciting = true, .in_flight = true }));
+    try testing.expectEqual(@as(u64, 3), ld.sent[ld.head].pn);
+}
+
+test "deque: reorder gap — front losses popped, gap-keepers retained, acked-behind processed via fallback" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    var pn: u64 = 0;
+    while (pn < 5) : (pn += 1) {
+        _ = ld.onPacketSent(.{ .pn = pn, .send_time_ms = 100, .size = 100, .ack_eliciting = true, .in_flight = true });
+    }
+    // Ack only pn 4 (largest=4, first_ack_range=0). now == send_time ⇒ no
+    // time-threshold loss. pn0,pn1 lost by packet threshold (4 >= pn+3); pn2,pn3
+    // are gap-keepers (retained); pn4 acked. The front-pop stops at pn2 (keep)
+    // and the fallback compaction handles pn4 behind it.
+    var lost_buf: [8]SentPacket = undefined;
+    const r = try ld.onAck(.application, 4, 0, 0, 100, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
+    try testing.expectEqual(@as(usize, 2), r.lost_count);
+    try testing.expectEqual(@as(u64, 100), r.bytes_acked);
+    try testing.expectEqual(@as(usize, 2), ld.sent_count);
+    try testing.expectEqual(@as(u64, 2), ld.sent[ld.head].pn);
+    try testing.expectEqual(@as(u64, 3), ld.sent[ld.head + 1].pn);
+}
+
+test "deque: head-wrap compaction preserves a sliding in-flight window" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    var lost_buf: [4]SentPacket = undefined;
+    const win: u64 = 4;
+    var pn: u64 = 0;
+    while (pn < win) : (pn += 1) {
+        _ = ld.onPacketSent(.{ .pn = pn, .send_time_ms = pn, .size = 1, .ack_eliciting = true, .in_flight = true });
+    }
+    // Slide a 4-deep window past the end of the backing array (≥1 compaction).
+    const stop = win + LossDetector.max_tracked_packets + 32;
+    while (pn < stop) : (pn += 1) {
+        try testing.expect(ld.onPacketSent(.{ .pn = pn, .send_time_ms = pn, .size = 1, .ack_eliciting = true, .in_flight = true }));
+        // Ack the oldest in-flight pn (front); now == newest send_time so the
+        // 4 higher-pn survivors are neither time- nor packet-threshold lost.
+        const r = try ld.onAck(.application, pn - win, 0, 0, pn + 1, &rtt, &lost_buf, &[_]StreamAck{}, testing.allocator);
+        try testing.expectEqual(@as(usize, 0), r.lost_count);
+        try testing.expectEqual(win, @as(u64, @intCast(ld.sent_count)));
+        try testing.expectEqual(pn - win + 1, ld.sent[ld.head].pn);
+    }
 }
