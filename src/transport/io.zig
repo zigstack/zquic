@@ -1834,6 +1834,17 @@ pub const ConnState = struct {
     /// Opaque application STREAM receive buffers (server: peer → us).
     raw_app_streams: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
+    /// Highest raw-app stream id the embedder has RELEASED, tracked per
+    /// stream-type (`stream_id & 3`: 0=client-bidi, 1=server-bidi, 2=client-uni,
+    /// 3=server-uni). Once a raw-app stream has been released (FIN'd + fully
+    /// read), a late/retransmitted STREAM frame for it must NOT re-register a
+    /// fresh slot — that zombie slot would never be released again and slowly
+    /// exhausts the 64-slot table, breaking the server-initiated req/resp
+    /// fallback (each retransmitted response FIN re-burned a slot). Stream ids
+    /// are monotonic per type, so a strictly-lower id of the same type that is
+    /// no longer active is always retired and safe to drop.
+    raw_app_released_max: [4]u64 = .{ 0, 0, 0, 0 },
+
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
     pending_1rtt_n: usize = 0,
@@ -6777,6 +6788,14 @@ pub const Server = struct {
             }
         }
         if (slot_ptr == null) {
+            // Drop frames for a stream the embedder already released: re-registering
+            // a fresh slot here would create a zombie that is never released again,
+            // exhausting the 64-slot table (see `raw_app_released_max`).
+            const t = sf.stream_id & 3;
+            if (sf.stream_id + 1 <= conn.raw_app_released_max[t]) {
+                dbg("io: raw app server frame for retired stream_id={} dropped\n", .{sf.stream_id});
+                return;
+            }
             for (&conn.raw_app_streams) |*slot| {
                 if (!slot.active) {
                     slot.* = .{
@@ -8012,6 +8031,11 @@ pub fn rawAppStreamFullyReceived(conn: *ConnState, stream_id: u64) bool {
 /// on that stream from being reassembled, so prefer to gate on
 /// `rawAppStreamFinReceived`.
 pub fn releaseRawAppStream(conn: *ConnState, stream_id: u64, allocator: std.mem.Allocator) bool {
+    // Record the retirement watermark for this stream-type so a late/retransmitted
+    // STREAM frame can't resurrect the slot (see `raw_app_released_max`). Stored as
+    // `stream_id + 1` so a value of 0 means "nothing retired yet".
+    const t = stream_id & 3;
+    if (stream_id + 1 > conn.raw_app_released_max[t]) conn.raw_app_released_max[t] = stream_id + 1;
     for (&conn.raw_app_streams) |*slot| {
         if (slot.active and slot.stream_id == stream_id) {
             slot.deinit(allocator);
@@ -9191,6 +9215,12 @@ pub const Client = struct {
 
     /// Mirror of the connection-level `releaseRawAppStream`.
     pub fn releaseRawAppStream(self: *Client, stream_id: u64) bool {
+        // Retirement watermark so a late/retransmitted frame can't resurrect the
+        // slot (see `ConnState.raw_app_released_max`). A Client's recv table only
+        // ever holds server-initiated streams (type 1/3), disjoint from a Server's
+        // client-initiated recv table, so sharing the per-conn array is safe.
+        const t = stream_id & 3;
+        if (stream_id + 1 > self.conn.raw_app_released_max[t]) self.conn.raw_app_released_max[t] = stream_id + 1;
         for (&self.raw_app_recv) |*slot| {
             if (slot.active and slot.stream_id == stream_id) {
                 slot.deinit(self.allocator);
@@ -10921,6 +10951,13 @@ pub const Client = struct {
             }
         }
         if (slot_ptr == null) {
+            // Drop frames for a stream the embedder already released; re-registering
+            // would create a never-released zombie slot (see `raw_app_released_max`).
+            const t = sf.stream_id & 3;
+            if (sf.stream_id + 1 <= self.conn.raw_app_released_max[t]) {
+                dbg("io: raw app client frame for retired stream_id={} dropped\n", .{sf.stream_id});
+                return;
+            }
             for (&self.raw_app_recv) |*slot| {
                 if (!slot.active) {
                     slot.* = .{
@@ -13150,4 +13187,102 @@ test "raw-app server-initiated bidi: CONCURRENT ~80 streams probe 64-slot table"
     try std.testing.expect(open_err != null);
     try std.testing.expectEqual(@as(usize, 64), opened);
     try std.testing.expectEqual(opened, delivered);
+}
+
+test "raw-app server-initiated bidi: retransmitted frame after release does NOT resurrect the slot" {
+    // FACTOR 3 (the dominant live defect): after the embedder releases a
+    // server-initiated stream's slot (FIN'd + fully read), a late/retransmitted
+    // STREAM frame for that same stream must be DROPPED — re-registering a fresh
+    // slot would create a zombie that is never released again, slowly exhausting
+    // the 64-slot table and breaking the inbound-leg req/resp fallback. Drive one
+    // full round-trip, release BOTH sides, then re-feed the original request+FIN
+    // frame (a retransmit the loss detector might emit) and assert neither side
+    // re-activates a slot.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const request = "STATUS-REQ";
+    const response = "STATUS-RESP";
+
+    const sid = try lb.server.openRawAppStream(conn);
+    var drop = RawDrop{};
+
+    // Request → client.
+    {
+        var sent = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent and lb.server.sendRawStreamData(conn, sid, 0, request, true) > 0) sent = true;
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (lb.client.rawAppRecvBuffer(sid)) |b| {
+                if (b.len == request.len and lb.client.rawAppStreamFinReceived(sid)) break;
+            }
+        }
+    }
+    // Response → server.
+    {
+        var sent = false;
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (compat.milliTimestamp() < deadline) {
+            if (!sent and lb.client.sendRawStreamData(sid, 0, response, true) > 0) sent = true;
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            if (rawAppRecvBuffer(conn, sid)) |b| {
+                if (b.len == response.len and rawAppStreamFullyReceived(conn, sid)) break;
+            }
+        }
+    }
+
+    // Release both sides — the slot is now retired.
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
+
+    const clientActive = struct {
+        fn f(c: *Client) usize {
+            var n: usize = 0;
+            for (&c.raw_app_recv) |*s| {
+                if (s.active) n += 1;
+            }
+            return n;
+        }
+    }.f;
+    const serverActive = struct {
+        fn f(cn: *ConnState) usize {
+            var n: usize = 0;
+            for (&cn.raw_app_streams) |*s| {
+                if (s.active) n += 1;
+            }
+            return n;
+        }
+    }.f;
+
+    try std.testing.expectEqual(@as(usize, 0), clientActive(lb.client));
+    try std.testing.expectEqual(@as(usize, 0), serverActive(conn));
+
+    // Re-feed a retransmit of the original request+FIN at the CLIENT (the
+    // direction that surfaced the request). Before the fix this re-registered a
+    // zombie client recv slot.
+    lb.client.handleRawApplicationStreamClient(&.{
+        .stream_id = sid,
+        .offset = 0,
+        .data = request,
+        .fin = true,
+        .has_length = false,
+    });
+    try std.testing.expectEqual(@as(usize, 0), clientActive(lb.client));
+
+    // And a retransmit of the response+FIN at the SERVER recv table.
+    lb.server.handleRawApplicationStreamServer(conn, &.{
+        .stream_id = sid,
+        .offset = 0,
+        .data = response,
+        .fin = true,
+        .has_length = false,
+    }, lb.server_addr);
+    try std.testing.expectEqual(@as(usize, 0), serverActive(conn));
 }
