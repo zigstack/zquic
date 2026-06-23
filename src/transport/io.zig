@@ -11931,31 +11931,31 @@ test "per-stream send max: table-full keeps existing tracked streams correct" {
 
 test "per-stream recv: no MAX_STREAM_DATA until 50% of window consumed" {
     var conn = makeConnForStreamTest();
-    conn.seedLocalRecvWindows(.libp2p); // 10 MB per-stream window
+    conn.seedLocalRecvWindows(.libp2p); // 16 MB per-stream window
     const sid: u64 = 0; // client-initiated bidi; server view: peer-initiated
-    // Below 50% — no extension.
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 4_000_000, true).send_max);
-    // Cross 50% (5 MB) — extend to recv_off + one window.
-    const a = conn.noteStreamRecv(sid, 5_000_000, true);
+    // Below 50% (8 MB) — no extension.
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 7_000_000, true).send_max);
+    // Cross 50% (8 MB) — extend to recv_off + one window.
+    const a = conn.noteStreamRecv(sid, 8_000_000, true);
     try std.testing.expect(!a.violation);
-    try std.testing.expectEqual(@as(?u64, 15_000_000), a.send_max);
+    try std.testing.expectEqual(@as(?u64, 24_000_000), a.send_max);
     // After extension the next small advance does not re-trigger.
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 5_100_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 8_100_000, true).send_max);
 }
 
 test "per-stream recv: exceeding the advertised window is a violation" {
     var conn = makeConnForStreamTest();
     conn.seedLocalRecvWindows(.libp2p);
     const sid: u64 = 0;
-    // Jump past the 10 MB advertised limit before any MAX_STREAM_DATA.
-    try std.testing.expect(conn.noteStreamRecv(sid, 10_000_001, true).violation);
+    // Jump past the 16 MB advertised limit before any MAX_STREAM_DATA.
+    try std.testing.expect(conn.noteStreamRecv(sid, 16_000_001, true).violation);
 }
 
 test "per-stream recv: window tracks each stream independently" {
     var conn = makeConnForStreamTest();
     conn.seedLocalRecvWindows(.libp2p);
-    // Stream 0 crosses 50%, stream 4 stays low — only 0 extends.
-    try std.testing.expectEqual(@as(?u64, 16_000_000), conn.noteStreamRecv(0, 6_000_000, true).send_max);
+    // Stream 0 crosses 50% (8 MB), stream 4 stays low — only 0 extends.
+    try std.testing.expectEqual(@as(?u64, 25_000_000), conn.noteStreamRecv(0, 9_000_000, true).send_max);
     try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(4, 1_000, true).send_max);
 }
 
@@ -11971,11 +11971,11 @@ test "per-stream recv: FIN/RESET clears the slot for reuse" {
 test "per-stream recv: bumpStreamRecvWindow answers STREAM_DATA_BLOCKED" {
     var conn = makeConnForStreamTest();
     conn.seedLocalRecvWindows(.libp2p);
-    // Peer is blocked at the initial 10 MB; we received up to there.
+    // Peer is blocked near the initial 16 MB; we received up to there.
     _ = conn.noteStreamRecv(0, 9_999_999, true);
     // bump grants one window above what we have received.
     const nm = conn.bumpStreamRecvWindow(0, true);
-    try std.testing.expectEqual(@as(u64, 9_999_999 + 10_000_000), nm);
+    try std.testing.expectEqual(@as(u64, 9_999_999 + 16_000_000), nm);
 }
 
 test "prepareConnStreamsBlocked: throttles repeat bidi emission" {
@@ -12009,8 +12009,8 @@ test "seedLocalRecvWindows: default preset" {
 test "seedLocalRecvWindows: libp2p preset" {
     var l = makeConnForStreamTest();
     l.seedLocalRecvWindows(.libp2p);
-    try std.testing.expectEqual(@as(u64, 10_000_000), l.local_initial_max_stream_data_bidi_remote);
-    try std.testing.expectEqual(@as(u64, 15_000_000), l.fc_recv_max);
+    try std.testing.expectEqual(@as(u64, 16_000_000), l.local_initial_max_stream_data_bidi_remote);
+    try std.testing.expectEqual(@as(u64, 24_000_000), l.fc_recv_max);
 }
 
 test "pending stream send: contiguous enqueues coalesce on same stream" {

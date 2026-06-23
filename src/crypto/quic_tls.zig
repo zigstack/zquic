@@ -196,12 +196,25 @@ pub fn transportParamsForPreset(
     switch (preset) {
         .default => {},
         .libp2p => {
-            // libp2p-quic Config::new defaults (quinn stream_receive_window = 10 MiB,
-            // receive_window = 15 MiB, max_concurrent_bidi_streams = 256).
-            opts.initial_max_data = 15_000_000;
-            opts.initial_max_stream_data_bidi_local = 10_000_000;
-            opts.initial_max_stream_data_bidi_remote = 10_000_000;
-            opts.initial_max_stream_data_uni = 10_000_000;
+            // libp2p-quic Config::new defaults are quinn stream_receive_window =
+            // 10 MiB / receive_window = 15 MiB. We advertise LARGER windows than
+            // that baseline because the long-lived persistent `/meshsub` gossip
+            // stream accumulates offset continuously: when a node's drive thread
+            // reads that stream slowly under a full-mesh load, the recv window
+            // stops extending and the *sender* stalls — which on the live devnet
+            // wedged the stream after 20s and dropped peers. A larger window
+            // (16 MiB/stream, 24 MiB/conn) absorbs more transient read-lag
+            // before the sender stalls. Advertising bigger limits is always
+            // interop-safe (the peer simply may send more); memory is a credit,
+            // bounded by the conn window and only allocated as bytes actually
+            // arrive (worst case ~24 MiB x peers, only if a drive thread is
+            // fully stalled). NOTE: this only widens the headroom — the real
+            // fix for a *sustained* slow reader is receiver throughput / lower
+            // gossip volume (e.g. mesh_n_low), not a bigger buffer.
+            opts.initial_max_data = 24_000_000;
+            opts.initial_max_stream_data_bidi_local = 16_000_000;
+            opts.initial_max_stream_data_bidi_remote = 16_000_000;
+            opts.initial_max_stream_data_uni = 16_000_000;
             opts.initial_max_streams_bidi = 256;
             opts.initial_max_streams_uni = 0;
         },
