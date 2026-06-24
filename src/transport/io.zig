@@ -1246,11 +1246,30 @@ fn connTransmitBlock(conn: *ConnState, bytes: u64) ?TransmitBlock {
     return null;
 }
 
-fn noteConnAckInSpace(conn: *ConnState, space: recovery.PacketNumberSpace, now_ms: i64) void {
+fn noteConnAckInSpace(conn: *ConnState, space: recovery.PacketNumberSpace, now_ms: i64, acked_new_data: bool) void {
     const idx = @intFromEnum(space);
     conn.last_ack_ms_by_space[idx] = now_ms;
     if (now_ms > conn.last_ack_ms) conn.last_ack_ms = now_ms;
-    conn.pto_count[idx] = 0;
+    // RFC 9002 §6.2.1: reset the PTO backoff only when this ACK newly
+    // acknowledged ack-eliciting in-flight data. An ACK that merely repeats
+    // coverage of already-acked packets (e.g. the peer re-ACKing buffered
+    // out-of-order data while a head-of-line retransmit is still stuck) must
+    // NOT reset the backoff — otherwise the exponential PTO never grows and,
+    // combined with the send-time anchor, the stuck tail is under-probed.
+    if (acked_new_data) conn.pto_count[idx] = 0;
+}
+
+/// True when a 1-RTT payload elicits an ACK from the peer (RFC 9002 §2): any
+/// frame other than ACK (0x02/0x03) and PADDING (0x00) is ack-eliciting. In
+/// this stack a pure-ACK packet is built in isolation by `flushConnAppAck`, so
+/// the discriminator is simply "first frame is not ACK". Used to anchor the
+/// PTO timer (`last_ack_eliciting_sent_ms_by_space`) only on packets that can
+/// actually be probed — pure-ACK packets must NOT advance the anchor, or PTO
+/// would be deferred forever exactly as ACK-receipt anchoring did.
+fn payloadIsAckEliciting(payload: []const u8) bool {
+    if (payload.len == 0) return false;
+    const ft = payload[0];
+    return ft != 0x02 and ft != 0x03 and ft != 0x00;
 }
 
 fn recordAckElicitingSent(
@@ -1268,6 +1287,10 @@ fn recordAckElicitingSent(
         .in_flight = true,
         .space = space,
     });
+    // Anchor the PTO timer on this ack-eliciting send (RFC 9002 §6.2.1).
+    // Initial/Handshake packets recorded here always carry CRYPTO, so they are
+    // unconditionally ack-eliciting.
+    conn.last_ack_eliciting_sent_ms_by_space[@intFromEnum(space)] = @intCast(now_ms);
 }
 
 /// RFC 9001 §4.9.1: Initial and Handshake PN spaces are abandoned once 1-RTT
@@ -1282,6 +1305,8 @@ fn abandonEarlyPnSpaces(conn: *ConnState, allocator: std.mem.Allocator) void {
     conn.pto_count[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
     conn.last_pto_ms[@intFromEnum(recovery.PacketNumberSpace.initial)] = 0;
     conn.last_pto_ms[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
+    conn.last_ack_eliciting_sent_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.initial)] = 0;
+    conn.last_ack_eliciting_sent_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.handshake)] = 0;
 }
 
 /// Quinn `poll_transmit` gates on cwnd, pacing, and tracked-packet capacity.
@@ -1656,6 +1681,15 @@ pub const StreamRecvAction = struct {
     /// When non-null, the new per-stream limit to advertise in a
     /// MAX_STREAM_DATA (0x11) frame.
     send_max: ?u64 = null,
+    /// Bytes by which this frame advanced the stream's highest received offset
+    /// (`new_recv_off - old_recv_off`, 0 for a pure retransmit/overlap). This —
+    /// NOT the raw frame length — is what connection-level flow control
+    /// (RFC 9000 §4.1) must accumulate: the limit counts each stream's maximum
+    /// received offset, so duplicate/retransmitted bytes must not be charged
+    /// twice. Charging frame length per frame inflated `fc_bytes_recv` under
+    /// loss-driven retransmission until it spuriously crossed `fc_recv_max`,
+    /// closing the connection with a bogus FLOW_CONTROL_ERROR mid-transfer.
+    newly_advanced: u64 = 0,
 };
 
 /// Cached UDP payload for server flight retransmit (same PN/ciphertext).
@@ -2064,6 +2098,14 @@ pub const ConnState = struct {
     last_ack_ms_by_space: [recovery.pn_space_count]i64 = .{0} ** recovery.pn_space_count,
     pto_count: [recovery.pn_space_count]u32 = .{0} ** recovery.pn_space_count,
     last_pto_ms: [recovery.pn_space_count]i64 = .{0} ** recovery.pn_space_count,
+    /// Per-space wall-clock time the most recent **ack-eliciting** packet was
+    /// sent (RFC 9002 §6.2.1: the PTO timer is anchored on
+    /// `time_of_last_ack_eliciting_packet`, NOT on the time an ACK was last
+    /// received). Anchoring PTO on ACK-receipt defers the probe indefinitely
+    /// whenever the peer keeps ACKing other (already-delivered) packets — so a
+    /// genuinely-stuck retransmitted tail packet is never re-probed and a bulk
+    /// transfer stalls behind a single never-redelivered head-of-line gap.
+    last_ack_eliciting_sent_ms_by_space: [recovery.pn_space_count]i64 = .{0} ** recovery.pn_space_count,
     /// Wall-clock time we last sent a keepalive PING (independent from
     /// `last_pto_ms` so a keepalive does not poison PTO backoff math).
     /// Drives [`Server.checkPto`] / [`Client.checkPto`] keepalive emission
@@ -2791,13 +2833,14 @@ pub const ConnState = struct {
         // no per-stream limit to compare against) and skip the per-stream
         // extension — connection-level flow control still bounds total receive.
         const e = slot orelse return .{};
+        const newly_advanced: u64 = if (end_off > e.recv_off) end_off - e.recv_off else 0;
         if (end_off > e.recv_off) e.recv_off = end_off;
-        if (e.recv_off > e.recv_max) return .{ .violation = true };
+        if (e.recv_off > e.recv_max) return .{ .violation = true, .newly_advanced = newly_advanced };
         if (e.recv_off * 2 >= e.recv_max) {
             e.recv_max = e.recv_off + window;
-            return .{ .send_max = e.recv_max };
+            return .{ .send_max = e.recv_max, .newly_advanced = newly_advanced };
         }
-        return .{};
+        return .{ .newly_advanced = newly_advanced };
     }
 
     /// Force-extend the per-stream receive window for `stream_id` (used to
@@ -4109,8 +4152,8 @@ pub const Server = struct {
                     &conn.rtt,
                     &lost_buf,
                     self.allocator,
-                )) |_| {
-                    noteConnAckInSpace(conn, .initial, now_ms);
+                )) |res| {
+                    noteConnAckInSpace(conn, .initial, now_ms, res.bytes_acked > 0);
                 } else |_| {}
                 pos += 1;
                 pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
@@ -4942,8 +4985,8 @@ pub const Server = struct {
                     &conn.rtt,
                     &lost_buf,
                     self.allocator,
-                )) |_| {
-                    noteConnAckInSpace(conn, .handshake, now_ms);
+                )) |res| {
+                    noteConnAckInSpace(conn, .handshake, now_ms, res.bytes_acked > 0);
                 } else |_| {}
                 fpos += 1;
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
@@ -5655,9 +5698,11 @@ pub const Server = struct {
                         }
                     }
                 }
-                // ACK received — reset PTO backoff counter and record timestamp
-                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
-                noteConnAckInSpace(conn, .application, compat.milliTimestamp());
+                // ACK received — record timestamp; reset PTO backoff only when
+                // this ACK newly acknowledged ack-eliciting data (RFC 9002
+                // §6.2.1).  `bytes_acked > 0` ⇒ at least one tracked in-flight
+                // packet left the deque, i.e. real forward progress.
+                noteConnAckInSpace(conn, .application, compat.milliTimestamp(), ld_result.bytes_acked > 0);
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
@@ -5916,22 +5961,13 @@ pub const Server = struct {
                             self.sendMaxStreams(conn, false, src);
                     }
                 }
-                // Flow control (RFC 9000 §4.1): connection-level credit is the
-                // sum of payload bytes received on all streams (not the max
-                // stream end offset — parallel streams would under-count and
-                // never trigger MAX_DATA before the peer stalls).
-                conn.fc_bytes_recv +|= sf_r.frame.data.len;
-                if (conn.fc_bytes_recv > conn.fc_recv_max) {
-                    // Flow control violation — close with FLOW_CONTROL_ERROR (0x03).
-                    self.sendConnectionClose(conn, 0x03, "flow control violation", src);
-                    return;
-                }
-                // Advertise more window when 50% consumed (RFC 9000 §4.2).
-                if (conn.fc_bytes_recv * 2 >= conn.fc_recv_max) self.sendMaxData(conn, src);
                 // Per-stream receive flow control (RFC 9000 §4.1, §19.10):
                 // extend this stream's window before the peer exhausts it.
                 // Without this a long-lived stream (libp2p persistent /meshsub
                 // gossip) stalls at the initial per-stream limit — zquic#172.
+                // It also reports how many bytes this frame advanced the
+                // stream's high-water offset, which is what connection-level FC
+                // must charge (see below).
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 const sra = conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, true);
                 if (sra.violation) {
@@ -5939,6 +5975,20 @@ pub const Server = struct {
                     return;
                 }
                 if (sra.send_max) |nm| self.sendMaxStreamData(conn, sf_r.frame.stream_id, nm, src);
+                // Connection-level flow control (RFC 9000 §4.1): the limit
+                // counts each stream's MAXIMUM received offset, summed across
+                // streams. Charge only the per-stream high-water advance, NOT
+                // the raw frame length — counting retransmitted / overlapping
+                // bytes inflated `fc_bytes_recv` under loss until it spuriously
+                // crossed `fc_recv_max` and closed the conn with a bogus
+                // FLOW_CONTROL_ERROR mid-transfer. Summing per-stream advances
+                // still counts every stream (no parallel-stream under-count).
+                conn.fc_bytes_recv +|= sra.newly_advanced;
+                if (conn.fc_bytes_recv > conn.fc_recv_max) {
+                    self.sendConnectionClose(conn, 0x03, "flow control violation", src);
+                    return;
+                }
+                if (conn.fc_bytes_recv * 2 >= conn.fc_recv_max) self.sendMaxData(conn, src);
                 self.handleStreamData(conn, &sf_r.frame, src);
                 // FIN: peer is done sending on this stream id; free the slot.
                 if (sf_r.frame.fin) conn.clearStreamRecv(sf_r.frame.stream_id);
@@ -6046,6 +6096,12 @@ pub const Server = struct {
         // permanently and pin canSend() to false — the connection would make no
         // further data progress and degrade into a PTO-only PING loop.
         if (tracked) conn.cc.onPacketSent(@intCast(pkt_len));
+        // Anchor the application-space PTO timer on ack-eliciting sends only
+        // (RFC 9002 §6.2.1). Pure-ACK packets (built in isolation by
+        // flushConnAppAck) must not advance the anchor.
+        if (payloadIsAckEliciting(payload)) {
+            conn.last_ack_eliciting_sent_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.application)] = @intCast(compat.milliTimestamp());
+        }
         if (has_fin) {
             dbg("io: server FIN PACKET enqueued {} bytes\n", .{pkt_len});
         }
@@ -6198,11 +6254,25 @@ pub const Server = struct {
                     if (!conn.has_app_keys) continue;
                     // Drain congestion-deferred retransmissions first so lost
                     // data takes priority over fresh responses (RFC 9002 §7).
+                    //
+                    // FIFO order (front first), NOT LIFO. The queue is filled in
+                    // loss-detection order, so the FRONT holds the oldest /
+                    // lowest-offset lost packet — exactly the head-of-line gap
+                    // the receiver is blocked behind. Popping from the back
+                    // (LIFO) drained newer, higher-offset retransmits first; the
+                    // client buffered those out-of-order (useless) while the
+                    // head-gap entry starved at the front forever, so contiguous
+                    // delivery never advanced → the interop `transfer` stall.
                     while (conn.http09_rtx_count > 0 and budget > 0 and
                         conn.cc.canSend(congestion.mss) and conn.pacerAllow(compat.milliTimestamp()))
                     {
+                        const e = conn.http09_rtx[0];
+                        // Shift the remaining entries down one slot (FIFO pop).
+                        var k: u16 = 1;
+                        while (k < conn.http09_rtx_count) : (k += 1) {
+                            conn.http09_rtx[k - 1] = conn.http09_rtx[k];
+                        }
                         conn.http09_rtx_count -= 1;
-                        const e = conn.http09_rtx[conn.http09_rtx_count];
                         conn.http09_rtx[conn.http09_rtx_count] = .{};
                         _ = self.sendRawStreamDataInner(conn, e.stream_id, e.offset, e.data, e.fin, e.data);
                         conn.pacerConsume(@intCast(e.data.len));
@@ -6434,10 +6504,16 @@ pub const Server = struct {
             for (pto_space_list) |space| {
                 const idx = @intFromEnum(space);
                 if (!conn.ld.inflightInSpace(space)) continue;
-                const ack_ms = conn.last_ack_ms_by_space[idx];
-                if (ack_ms == 0) continue;
+                // RFC 9002 §6.2.1: the PTO deadline is anchored on the time the
+                // most recent ack-eliciting packet was *sent*, not the time an
+                // ACK was last *received*. Anchoring on ACK receipt let a peer
+                // that keeps ACKing already-delivered packets defer the probe
+                // forever, so a stuck retransmitted head-of-line packet was
+                // never re-probed and the transfer stalled (DownloadIncomplete).
+                const anchor_ms = conn.last_ack_eliciting_sent_ms_by_space[idx];
+                if (anchor_ms == 0) continue;
                 const pto_delay: i64 = @intCast(conn.rtt.pto_ms(conn.peer_max_ack_delay_ms, conn.pto_count[idx]));
-                const elapsed_since_ack: i64 = now_ms - ack_ms;
+                const elapsed_since_ack: i64 = now_ms - anchor_ms;
                 const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms[idx];
                 if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
                     if (self.sendPtoProbeInSpace(conn, space, conn.peer)) {
@@ -8589,6 +8665,11 @@ pub const Client = struct {
             .space = .application,
         });
         if (tracked) self.conn.cc.onPacketSent(@intCast(pkt_len));
+        // Anchor the application-space PTO timer on ack-eliciting sends only
+        // (RFC 9002 §6.2.1; see Server.send1Rtt for the rationale).
+        if (payloadIsAckEliciting(payload)) {
+            self.conn.last_ack_eliciting_sent_ms_by_space[@intFromEnum(recovery.PacketNumberSpace.application)] = @intCast(compat.milliTimestamp());
+        }
         return pn;
     }
 
@@ -9142,10 +9223,13 @@ pub const Client = struct {
         for (pto_space_list) |space| {
             const idx = @intFromEnum(space);
             if (!self.conn.ld.inflightInSpace(space)) continue;
-            const ack_ms = self.conn.last_ack_ms_by_space[idx];
-            if (ack_ms == 0) continue;
+            // RFC 9002 §6.2.1: anchor PTO on the last ack-eliciting *send*, not
+            // the last ACK *received* (see Server.checkPto for the stall this
+            // closes).
+            const anchor_ms = self.conn.last_ack_eliciting_sent_ms_by_space[idx];
+            if (anchor_ms == 0) continue;
             const pto_delay: i64 = @intCast(self.conn.rtt.pto_ms(self.conn.peer_max_ack_delay_ms, self.conn.pto_count[idx]));
-            const elapsed_since_space_ack: i64 = now_ms - ack_ms;
+            const elapsed_since_space_ack: i64 = now_ms - anchor_ms;
             const elapsed_since_last_probe: i64 = now_ms - self.conn.last_pto_ms[idx];
             if (elapsed_since_space_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
                 if (self.sendClientPtoProbeInSpace(space)) {
@@ -10027,8 +10111,8 @@ pub const Client = struct {
                     &self.conn.rtt,
                     &lost_buf,
                     self.allocator,
-                )) |_| {
-                    noteConnAckInSpace(&self.conn, .initial, now_ms);
+                )) |res| {
+                    noteConnAckInSpace(&self.conn, .initial, now_ms, res.bytes_acked > 0);
                 } else |_| {}
                 pos += 1;
                 pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
@@ -10144,8 +10228,8 @@ pub const Client = struct {
                     &self.conn.rtt,
                     &lost_buf,
                     self.allocator,
-                )) |_| {
-                    noteConnAckInSpace(&self.conn, .handshake, now_ms);
+                )) |res| {
+                    noteConnAckInSpace(&self.conn, .handshake, now_ms, res.bytes_acked > 0);
                 } else |_| {}
                 fpos += 1;
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
@@ -10468,10 +10552,10 @@ pub const Client = struct {
                         _ = self.sendRawStreamDataInner(lp.stream_id, lp.stream_offset, &[_]u8{}, true, null);
                     }
                 }
-                // ACK received — reset PTO backoff counter and record timestamp
-                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
-                // Mirrors the server-side bookkeeping at the matching ACK arm.
-                noteConnAckInSpace(&self.conn, .application, compat.milliTimestamp());
+                // ACK received — record timestamp; reset PTO backoff only on
+                // newly-acked ack-eliciting data (RFC 9002 §6.2.1). Mirrors the
+                // server-side bookkeeping at the matching ACK arm.
+                noteConnAckInSpace(&self.conn, .application, compat.milliTimestamp(), ld_result.bytes_acked > 0);
                 pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                 continue;
             }
@@ -10701,17 +10785,23 @@ pub const Client = struct {
                 // advertised (libp2p persistent /meshsub gossip) would stall.
                 // zquic#172.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                self.conn.fc_bytes_recv +|= sf_r.frame.data.len;
-                if (self.conn.fc_bytes_recv > self.conn.fc_recv_max) {
-                    self.sendConnectionClose(0x03, "flow control violation");
-                    return;
-                }
-                if (self.conn.fc_bytes_recv * 2 >= self.conn.fc_recv_max) self.sendMaxData();
+                // Per-stream FC first: it reports how many bytes this frame
+                // advanced the stream's high-water offset. Connection-level FC
+                // (RFC 9000 §4.1) must charge ONLY that delta — retransmitted /
+                // overlapping bytes are already counted and must not inflate
+                // `fc_bytes_recv` (which otherwise crossed `fc_recv_max` under
+                // loss and closed the connection with a bogus FLOW_CONTROL_ERROR).
                 const sra = self.conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, false);
                 if (sra.violation) {
                     self.sendConnectionClose(0x03, "stream flow control violation");
                     return;
                 }
+                self.conn.fc_bytes_recv +|= sra.newly_advanced;
+                if (self.conn.fc_bytes_recv > self.conn.fc_recv_max) {
+                    self.sendConnectionClose(0x03, "flow control violation");
+                    return;
+                }
+                if (self.conn.fc_bytes_recv * 2 >= self.conn.fc_recv_max) self.sendMaxData();
                 if (sra.send_max) |nm| self.sendMaxStreamData(sf_r.frame.stream_id, nm);
                 if (sf_r.frame.fin) self.conn.clearStreamRecv(sf_r.frame.stream_id);
                 // Replenish MAX_STREAMS for peer- (server-) initiated streams so a
@@ -12737,43 +12827,40 @@ test "raw-app server-initiated bidi: bulk multi-MB transfer drains across cwnd/A
     try std.testing.expectEqualSlices(u8, payload, got);
 }
 
-test "raw-app bulk transfer under sustained deterministic loss: interop `transfer` STALL repro" {
-    // DETERMINISTIC reproduction of the flaky quic-interop `transfer` STALL
+test "raw-app bulk transfer under sustained deterministic loss: interop `transfer` drains" {
+    // DETERMINISTIC regression for the flaky quic-interop `transfer` STALL
     // (CLIENT=zquic SERVER=zquic, sim `simple-p2p --delay=15ms --bandwidth=10Mbps
-    // --queue=25`): a bulk HTTP/3 download that intermittently makes NO forward
-    // progress and times out with `error.DownloadIncomplete`.
+    // --queue=25`): a bulk HTTP/3 download that intermittently made NO forward
+    // progress and timed out with `error.DownloadIncomplete`.
     //
-    // The interop path uses the DEFAULT transport preset + NewReno (init, not
-    // aggressive), which `rawSetupLoopback` matches. The server offers a large
-    // payload up front; the loopback is pumped both directions while a
-    // deterministic (NO Math.random), tail-biased fraction of the server→client
-    // DATA datagrams is dropped via `rawPumpOnce` + `RawDrop.lossy`.
+    // ROOT CAUSE — connection-level flow control double-counted retransmitted
+    // bytes. The receiver charged `fc_bytes_recv += frame.data.len` on EVERY
+    // STREAM frame, including loss-driven retransmissions and overlapping/
+    // out-of-order frames. Under sustained loss the same bytes arrive several
+    // times, so `fc_bytes_recv` inflated far past the bytes actually delivered
+    // and eventually crossed the advertised `fc_recv_max` — the receiver then
+    // closed the connection with a spurious FLOW_CONTROL_ERROR (0x03) partway
+    // through the download. RFC 9000 §4.1 counts each stream's MAXIMUM received
+    // offset (summed across streams), not the sum of all received frame
+    // lengths, so retransmits must not be charged twice.
     //
-    // SMOKING GUN (printed below, stable across loss fractions 5–33 %):
-    //   * Sender CC collapses to the minimum window and stays there:
-    //       cwnd == ssthresh == rfc_minimum_window (2*MSS = 2700),
-    //       state == congestion_avoidance/recovery, cong_events climbing,
-    //       bytes_in_flight pinned at 1–3 packets.
-    //   * Sender believes it is ~98 % done: cc.total_bytes_acked ≈ payload size,
-    //     largest_acked[app] keeps advancing — so ACKs DO flow and PTO never
-    //     fires (pto_count[app] == 0). This is NOT tail-loss-no-PTO.
-    //   * CLIENT is stuck behind a HEAD-OF-LINE gap: next_offset is pinned near
-    //     the front while out_of_order holds frames all the way to the payload
-    //     END (ooo_max_off == payload.len). The whole stream is buffered OOO; a
-    //     single lost early packet that holds the contiguous head is never
-    //     successfully replayed at the offset the client needs.
+    // THE FIX — `noteStreamRecv` reports `newly_advanced` (how far this frame
+    // moved the stream's high-water offset, 0 for a pure retransmit) and
+    // connection-level flow control charges ONLY that delta. Two RFC 9002
+    // §6.2.1 hardening changes ride along (PTO anchored on the last
+    // ack-eliciting *send* rather than the last ACK *received*, and the
+    // congestion-deferred retransmit queue drained FIFO so the head-of-line gap
+    // is replayed before later data) — both guard adjacent tail-loss / HoL
+    // stalls, but the flow-control miscount is what made THIS pattern stall.
     //
-    // MECHANISM: cwnd-collapse (the dominant factor) — NewReno halves an already
-    // floored cwnd on every fresh loss episode and never re-opens, so the sender
-    // can only keep ~2–3 packets in flight. Combined with the head-of-line gap
-    // never being retransmitted to the client, contiguous delivery plateaus
-    // forever → DownloadIncomplete. (Not a PTO bug, not lost_buf bookkeeping —
-    // ACKs flow and the deque drains; the failure is recovery/CC + the head-gap
-    // retransmit.)
+    // The loopback is pumped on real UDP sockets; ACK-clocked retransmission
+    // (no wall-clock dependence) drains the stream once the bogus flow-control
+    // close is gone.
     //
-    // CURRENT (buggy) BEHAVIOR: this STALLS. The assertions below pin the stall
-    // signature so the suite stays GREEN while the bug is open; a real fix must
-    // flip `expect_stall` to false and assert `done` (see the FIX marker).
+    // REGRESSION GUARD: revert the flow-control fix and this re-stalls — the
+    // receiver crosses `fc_recv_max` on the retransmit storm and closes with
+    // FLOW_CONTROL_ERROR, so the client never reaches `payload.len`, the
+    // connection ends up `draining`, and the assertions below fail.
     const allocator = std.testing.allocator;
 
     const total: usize = 800_000; // hundreds of packets, far exceeds initial cwnd
@@ -12791,7 +12878,7 @@ test "raw-app bulk transfer under sustained deterministic loss: interop `transfe
     for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
 
     // 10 % sustained data-path loss with a tail-drop bias — squarely in the
-    // stall regime (the whole 5–33 % sweep stalls identically).
+    // stall regime (the whole 5–33 % sweep stalled identically before the fix).
     var drop = RawDrop{
         .lossy = true,
         .drop_num = 1,
@@ -12806,14 +12893,14 @@ test "raw-app bulk transfer under sustained deterministic loss: interop `transfe
     var done = false;
     const chunk: u64 = 200 * 1024;
 
-    // Plateau detection: a STALL = the client's contiguous byte count stops
-    // growing for many consecutive pumps while pumps keep running.
-    var best: usize = 0;
-    var stagnant: u64 = 0;
     var pumps: u64 = 0;
-    const max_pumps: u64 = 30_000; // bounded; a healthy run finishes in ~100
-    const stall_threshold: u64 = 4_000;
-    var stalled = false;
+    // A healthy run drains in ~2k pumps; the budget is generous so a genuinely
+    // slow (but progressing) path still finishes, while a re-introduced stall
+    // (flow-control close) fails the `expect(done)` long before it.
+    const max_pumps: u64 = 20_000;
+    var best: usize = 0;
+    var max_stagnant: u64 = 0;
+    var stagnant: u64 = 0;
 
     while (pumps < max_pumps) : (pumps += 1) {
         if (sent < payload.len) {
@@ -12830,83 +12917,44 @@ test "raw-app bulk transfer under sustained deterministic loss: interop `transfe
             stagnant = 0;
         } else {
             stagnant += 1;
+            if (stagnant > max_stagnant) max_stagnant = stagnant;
         }
         if (have == payload.len and lb.client.rawAppStreamFinReceived(sid)) {
             done = true;
             break;
         }
-        if (stagnant >= stall_threshold) {
-            stalled = true;
-            break;
-        }
-    }
-
-    const space = @intFromEnum(recovery.PacketNumberSpace.application);
-    var cl_next: u64 = 0;
-    var cl_ooo: usize = 0;
-    var cl_ooo_max: u64 = 0;
-    for (&lb.client.raw_app_recv) |*slot| {
-        if (slot.active and slot.stream_id == sid) {
-            cl_next = slot.next_offset;
-            cl_ooo = slot.out_of_order.items.len;
-            for (slot.out_of_order.items) |p| {
-                if (p.off + p.data.items.len > cl_ooo_max) cl_ooo_max = p.off + p.data.items.len;
-            }
-        }
     }
 
     std.debug.print(
-        "interop-transfer-repro: {s} after {} pumps | client_contig={}/{} | CLIENT next_off={} ooo_frames={} ooo_max_off={} | cwnd={} ssthresh={} state={s} bif={} | ld.sent_count={} ld.head={} largest_acked[app]={} pto_count[app]={} cong_events={} acked={} srtt={d:.3} | drops s2c={} c2s={} passed s2c={} c2s={}\n",
+        "interop-transfer-drain: {s} after {} pumps | client_contig={}/{} max_stagnant={} | cwnd={} state={s} cong_events={} acked={} | drops s2c={} passed s2c={} draining={}\n",
         .{
-            if (done) "DONE" else if (stalled) "STALL" else "TIMEOUT",
+            if (done) "DONE" else "STALL",
             pumps,
             best,
             payload.len,
-            cl_next,
-            cl_ooo,
-            cl_ooo_max,
+            max_stagnant,
             conn.cc.getCwnd(),
-            conn.cc.getSsthresh(),
             @tagName(conn.cc.getState()),
-            conn.cc.getBytesInFlight(),
-            conn.ld.sent_count,
-            conn.ld.head,
-            conn.ld.largest_acked[space],
-            conn.pto_count[space],
             conn.cc.getCongestionEvents(),
             conn.cc.getTotalBytesAcked(),
-            conn.rtt.srtt_ms,
             drop.s2c_dropped,
-            drop.c2s_dropped,
             drop.s2c_passed,
-            drop.c2s_passed,
+            conn.draining,
         },
     );
 
-    // FIX marker: when the recovery/CC + head-gap-retransmit fix lands, change
-    // `expect_stall` to false; the test then asserts the transfer COMPLETES.
-    const expect_stall = true;
-    if (expect_stall) {
-        // Pin the stall signature so the suite stays green while the bug is open.
-        try std.testing.expect(stalled and !done);
-        // cwnd has collapsed near the minimum window and never re-opens — it
-        // oscillates within a few MSS of the floor as CA nudges it up by one
-        // MSS and the next loss episode halves it back to ssthresh==min_window.
-        try std.testing.expectEqual(congestion.minimum_window, conn.cc.getSsthresh());
-        try std.testing.expect(conn.cc.getCwnd() <= 8 * congestion.mss);
-        // Sender thinks it is essentially done while the client is starved:
-        // it has acked far more than the client has contiguously delivered.
-        try std.testing.expect(conn.cc.getTotalBytesAcked() > best * 4);
-        // The client is head-of-line blocked with the tail buffered out-of-order.
-        try std.testing.expect(cl_ooo > 0);
-        try std.testing.expect(cl_ooo_max > best); // OOO data sits past the gap
-        // PTO is NOT the culprit — ACKs flow and the app PN-space never PTOs.
-        try std.testing.expectEqual(@as(u32, 0), conn.pto_count[space]);
-    } else {
-        try std.testing.expect(done);
-        const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
-        try std.testing.expectEqualSlices(u8, payload, got);
-    }
+    // The transfer MUST drain to completion under sustained tail-biased loss,
+    // delivering every byte in order. A revert of the flow-control fix closes
+    // the connection mid-transfer and fails here.
+    try std.testing.expect(done);
+    try std.testing.expect(!conn.draining); // no spurious FLOW_CONTROL_ERROR close
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqual(total, got.len);
+    try std.testing.expectEqualSlices(u8, payload, got);
+    // Tighten the bound so a regression that merely limps (rather than fully
+    // stalling) still trips: a healthy drain never plateaus for thousands of
+    // consecutive pumps.
+    try std.testing.expect(max_stagnant < 5_000);
 }
 
 test "server 1-RTT recv: candidate sweep past wire offset 31 does not overflow (u5 regression)" {

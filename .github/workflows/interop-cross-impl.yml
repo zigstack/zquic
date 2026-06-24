@@ -170,13 +170,19 @@ jobs:
         run: |
           mkdir -p interop-results
           cd quic-interop-runner
+          # run.py exits non-zero if ANY case fails (incl. the known #184
+          # zquic->quinn gaps). Do NOT let that fail the job here — the
+          # "Print result summary" step is the authoritative gate: it
+          # classifies KNOWN_FAILING / UNSUPPORTED and exits non-zero ONLY on a
+          # NEW/unexpected failure. Without `|| true` the job is red on the
+          # known gaps regardless of the summary classification.
           python3 run.py \
             --client zquic,quinn \
             --server zquic,quinn \
             --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results-cross-impl-full.json \
-            --debug
+            --debug || echo "run.py exited non-zero; deferring pass/fail to the result-summary gate"
 
       - name: Upload interop results
         if: always()
