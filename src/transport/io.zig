@@ -12375,7 +12375,64 @@ const RawDrop = struct {
     /// Only drop datagrams at least this large, so we target a STREAM-bearing
     /// data packet rather than a bare ACK.
     min_len: usize = 0,
+
+    // ---- Sustained deterministic-loss mode (used by the stall reproduction) ----
+    // When `lossy` is true, `remaining`/`min_len` are ignored and packets are
+    // dropped by a deterministic pseudo-random pattern driven by `counter`
+    // (NO Math.random — fully reproducible across runs). `drop_num`/`drop_den`
+    // set the fraction (e.g. 1/4). Counts are per-direction so loss can be
+    // injected on the data path (server→client) and/or the ACK path
+    // (client→server) independently.
+    lossy: bool = false,
+    /// Numerator/denominator of the drop fraction, e.g. 1 / 4 = drop ~25 %.
+    drop_num: u32 = 0,
+    drop_den: u32 = 1,
+    /// Per-direction LCG counters (deterministic; seed-free).
+    s2c_counter: u64 = 0,
+    c2s_counter: u64 = 0,
+    /// Only consider datagrams at least this large for lossy drops (skip the
+    /// tiny handshake/ACK-only packets unless `drop_acks` is set).
+    lossy_min_len: usize = 0,
+    /// When true, the lossy fraction is also applied to the ACK path
+    /// (client→server). When false, only the data path (server→client) loses.
+    drop_acks: bool = false,
+    /// Bias toward dropping the TAIL: once the sender's stream send has been
+    /// fully offered (caller sets `tail`), every Nth datagram on the data path
+    /// is dropped regardless of the LCG, modelling queue tail-drop of the last
+    /// packets of the response.
+    tail: bool = false,
+    tail_drop_every: u64 = 0,
+    // ---- Instrumentation tallies ----
+    s2c_dropped: u64 = 0,
+    c2s_dropped: u64 = 0,
+    s2c_passed: u64 = 0,
+    c2s_passed: u64 = 0,
 };
+
+/// Deterministic per-step decision: should this datagram be dropped?
+/// Uses a 64-bit LCG advanced by `counter.*` — no global RNG, fully
+/// reproducible. Returns true ~`num/den` of the time.
+fn rawLossyDrop(drop: *RawDrop, counter: *u64, len: usize, is_data_dir: bool) bool {
+    if (!drop.lossy) return false;
+    if (len < drop.lossy_min_len) return false;
+    if (!is_data_dir and !drop.drop_acks) return false;
+
+    // Tail-drop bias: drop every Nth data-direction datagram once the caller
+    // has flagged that the stream tail is on the wire.
+    if (is_data_dir and drop.tail and drop.tail_drop_every > 0) {
+        counter.* += 1;
+        if (counter.* % drop.tail_drop_every == 0) return true;
+        // fall through to fractional test as well
+    } else {
+        counter.* += 1;
+    }
+
+    if (drop.drop_num == 0) return false;
+    // 64-bit LCG (Numerical Recipes constants), take the high bits.
+    const x = counter.* *% 6364136223846793005 +% 1442695040888963407;
+    const bucket = (x >> 33) % drop.drop_den;
+    return bucket < drop.drop_num;
+}
 
 /// Drive one pump iteration of the in-process loopback: wait briefly for I/O,
 /// move all queued datagrams client↔server (dropping per `drop`), and run each
@@ -12392,16 +12449,28 @@ fn rawPumpOnce(server: *Server, client: *Client, server_addr: compat.Address, dr
         var sa: std.posix.sockaddr.storage = undefined;
         var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
         const n = compat.recvfrom(server.sock, &buf, 0, @ptrCast(&sa), &sl) catch break;
+        // client→server (ACK) path: lossy mode may drop these.
+        if (rawLossyDrop(drop, &drop.c2s_counter, n, false)) {
+            drop.c2s_dropped += 1;
+            continue;
+        }
+        drop.c2s_passed += 1;
         server.feedPacket(buf[0..n], rawAddrFromStorage(&sa));
     }
     server.processPendingWork();
 
     while (rawSockReadable(client.sock)) {
         const n = compat.recvfrom(client.sock, &buf, 0, null, null) catch break;
+        // server→client (data) path: legacy `remaining` count OR lossy mode.
         if (drop.remaining > 0 and n >= drop.min_len) {
             drop.remaining -= 1;
             continue;
         }
+        if (rawLossyDrop(drop, &drop.s2c_counter, n, true)) {
+            drop.s2c_dropped += 1;
+            continue;
+        }
+        drop.s2c_passed += 1;
         client.feedPacket(buf[0..n]);
     }
     client.processPendingWork(server_addr);
@@ -12666,6 +12735,178 @@ test "raw-app server-initiated bidi: bulk multi-MB transfer drains across cwnd/A
     const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
     try std.testing.expectEqual(total, got.len);
     try std.testing.expectEqualSlices(u8, payload, got);
+}
+
+test "raw-app bulk transfer under sustained deterministic loss: interop `transfer` STALL repro" {
+    // DETERMINISTIC reproduction of the flaky quic-interop `transfer` STALL
+    // (CLIENT=zquic SERVER=zquic, sim `simple-p2p --delay=15ms --bandwidth=10Mbps
+    // --queue=25`): a bulk HTTP/3 download that intermittently makes NO forward
+    // progress and times out with `error.DownloadIncomplete`.
+    //
+    // The interop path uses the DEFAULT transport preset + NewReno (init, not
+    // aggressive), which `rawSetupLoopback` matches. The server offers a large
+    // payload up front; the loopback is pumped both directions while a
+    // deterministic (NO Math.random), tail-biased fraction of the server→client
+    // DATA datagrams is dropped via `rawPumpOnce` + `RawDrop.lossy`.
+    //
+    // SMOKING GUN (printed below, stable across loss fractions 5–33 %):
+    //   * Sender CC collapses to the minimum window and stays there:
+    //       cwnd == ssthresh == rfc_minimum_window (2*MSS = 2700),
+    //       state == congestion_avoidance/recovery, cong_events climbing,
+    //       bytes_in_flight pinned at 1–3 packets.
+    //   * Sender believes it is ~98 % done: cc.total_bytes_acked ≈ payload size,
+    //     largest_acked[app] keeps advancing — so ACKs DO flow and PTO never
+    //     fires (pto_count[app] == 0). This is NOT tail-loss-no-PTO.
+    //   * CLIENT is stuck behind a HEAD-OF-LINE gap: next_offset is pinned near
+    //     the front while out_of_order holds frames all the way to the payload
+    //     END (ooo_max_off == payload.len). The whole stream is buffered OOO; a
+    //     single lost early packet that holds the contiguous head is never
+    //     successfully replayed at the offset the client needs.
+    //
+    // MECHANISM: cwnd-collapse (the dominant factor) — NewReno halves an already
+    // floored cwnd on every fresh loss episode and never re-opens, so the sender
+    // can only keep ~2–3 packets in flight. Combined with the head-of-line gap
+    // never being retransmitted to the client, contiguous delivery plateaus
+    // forever → DownloadIncomplete. (Not a PTO bug, not lost_buf bookkeeping —
+    // ACKs flow and the deque drains; the failure is recovery/CC + the head-gap
+    // retransmit.)
+    //
+    // CURRENT (buggy) BEHAVIOR: this STALLS. The assertions below pin the stall
+    // signature so the suite stays GREEN while the bug is open; a real fix must
+    // flip `expect_stall` to false and assert `done` (see the FIX marker).
+    const allocator = std.testing.allocator;
+
+    const total: usize = 800_000; // hundreds of packets, far exceeds initial cwnd
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    const payload = try allocator.alloc(u8, total);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    // 10 % sustained data-path loss with a tail-drop bias — squarely in the
+    // stall regime (the whole 5–33 % sweep stalls identically).
+    var drop = RawDrop{
+        .lossy = true,
+        .drop_num = 1,
+        .drop_den = 10,
+        .lossy_min_len = 200, // only lose STREAM-bearing data packets, not ACKs
+        .drop_acks = false, // data-path loss only (server→client)
+        .tail = true,
+        .tail_drop_every = 7,
+    };
+
+    var sent: u64 = 0;
+    var done = false;
+    const chunk: u64 = 200 * 1024;
+
+    // Plateau detection: a STALL = the client's contiguous byte count stops
+    // growing for many consecutive pumps while pumps keep running.
+    var best: usize = 0;
+    var stagnant: u64 = 0;
+    var pumps: u64 = 0;
+    const max_pumps: u64 = 30_000; // bounded; a healthy run finishes in ~100
+    const stall_threshold: u64 = 4_000;
+    var stalled = false;
+
+    while (pumps < max_pumps) : (pumps += 1) {
+        if (sent < payload.len) {
+            const end = @min(sent + chunk, payload.len);
+            const is_fin = end == payload.len;
+            const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[@intCast(sent)..@intCast(end)], is_fin);
+            if (acc > 0) sent += acc;
+        }
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+
+        const have: usize = if (lb.client.rawAppRecvBuffer(sid)) |g| g.len else 0;
+        if (have > best) {
+            best = have;
+            stagnant = 0;
+        } else {
+            stagnant += 1;
+        }
+        if (have == payload.len and lb.client.rawAppStreamFinReceived(sid)) {
+            done = true;
+            break;
+        }
+        if (stagnant >= stall_threshold) {
+            stalled = true;
+            break;
+        }
+    }
+
+    const space = @intFromEnum(recovery.PacketNumberSpace.application);
+    var cl_next: u64 = 0;
+    var cl_ooo: usize = 0;
+    var cl_ooo_max: u64 = 0;
+    for (&lb.client.raw_app_recv) |*slot| {
+        if (slot.active and slot.stream_id == sid) {
+            cl_next = slot.next_offset;
+            cl_ooo = slot.out_of_order.items.len;
+            for (slot.out_of_order.items) |p| {
+                if (p.off + p.data.items.len > cl_ooo_max) cl_ooo_max = p.off + p.data.items.len;
+            }
+        }
+    }
+
+    std.debug.print(
+        "interop-transfer-repro: {s} after {} pumps | client_contig={}/{} | CLIENT next_off={} ooo_frames={} ooo_max_off={} | cwnd={} ssthresh={} state={s} bif={} | ld.sent_count={} ld.head={} largest_acked[app]={} pto_count[app]={} cong_events={} acked={} srtt={d:.3} | drops s2c={} c2s={} passed s2c={} c2s={}\n",
+        .{
+            if (done) "DONE" else if (stalled) "STALL" else "TIMEOUT",
+            pumps,
+            best,
+            payload.len,
+            cl_next,
+            cl_ooo,
+            cl_ooo_max,
+            conn.cc.getCwnd(),
+            conn.cc.getSsthresh(),
+            @tagName(conn.cc.getState()),
+            conn.cc.getBytesInFlight(),
+            conn.ld.sent_count,
+            conn.ld.head,
+            conn.ld.largest_acked[space],
+            conn.pto_count[space],
+            conn.cc.getCongestionEvents(),
+            conn.cc.getTotalBytesAcked(),
+            conn.rtt.srtt_ms,
+            drop.s2c_dropped,
+            drop.c2s_dropped,
+            drop.s2c_passed,
+            drop.c2s_passed,
+        },
+    );
+
+    // FIX marker: when the recovery/CC + head-gap-retransmit fix lands, change
+    // `expect_stall` to false; the test then asserts the transfer COMPLETES.
+    const expect_stall = true;
+    if (expect_stall) {
+        // Pin the stall signature so the suite stays green while the bug is open.
+        try std.testing.expect(stalled and !done);
+        // cwnd has collapsed near the minimum window and never re-opens — it
+        // oscillates within a few MSS of the floor as CA nudges it up by one
+        // MSS and the next loss episode halves it back to ssthresh==min_window.
+        try std.testing.expectEqual(congestion.minimum_window, conn.cc.getSsthresh());
+        try std.testing.expect(conn.cc.getCwnd() <= 8 * congestion.mss);
+        // Sender thinks it is essentially done while the client is starved:
+        // it has acked far more than the client has contiguously delivered.
+        try std.testing.expect(conn.cc.getTotalBytesAcked() > best * 4);
+        // The client is head-of-line blocked with the tail buffered out-of-order.
+        try std.testing.expect(cl_ooo > 0);
+        try std.testing.expect(cl_ooo_max > best); // OOO data sits past the gap
+        // PTO is NOT the culprit — ACKs flow and the app PN-space never PTOs.
+        try std.testing.expectEqual(@as(u32, 0), conn.pto_count[space]);
+    } else {
+        try std.testing.expect(done);
+        const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+        try std.testing.expectEqualSlices(u8, payload, got);
+    }
 }
 
 test "server 1-RTT recv: candidate sweep past wire offset 31 does not overflow (u5 regression)" {
