@@ -2005,8 +2005,18 @@ pub const ConnState = struct {
     /// on FIN / RESET_STREAM (peer is done sending) so it tracks only
     /// concurrently-open inbound streams. When full, untracked streams fall
     /// back to connection-level flow control only (strictly safe — we never
-    /// over-advertise, we just may under-extend a rarely-used stream).
-    per_stream_recv: [256]StreamRecvEntry = [_]StreamRecvEntry{.{}} ** 256,
+    /// over-advertise, we just may under-extend an untracked stream).
+    ///
+    /// Sized [2048] to match `per_stream_send_max`: at 256 the table filled
+    /// under 31-peer load (persistent gossip + concurrent blocks_by_range /
+    /// blocks_by_root / status req-resp during catch-up), so high-VOLUME
+    /// streams went untracked and were pinned at the initial 16 MiB
+    /// `MAX_STREAM_DATA` window — a 32 MB blocks_by_range response then stalled
+    /// behind it (`stream_lim=16000000` + pending-send-queue-full backpressure)
+    /// while the connection CC had ample room, throttling block propagation and
+    /// stalling fork-choice catch-up. A larger table keeps these streams tracked
+    /// so their window slides.
+    per_stream_recv: [2048]StreamRecvEntry = [_]StreamRecvEntry{.{}} ** 2048,
 
     // ── Per-stream initial limits the peer advertised (RFC 9000 §18.2) ────────
     // The §18.2 initial values seed `peerStreamSendLimit`; mid-connection
