@@ -8545,6 +8545,32 @@ pub const Client = struct {
         dbg("io: client sent MAX_STREAMS bidi={} new_limit={}\n", .{ bidi, new_limit });
     }
 
+    /// Respond to a peer STREAMS_BLOCKED (RFC 9000 §4.6) by granting MAX_STREAMS
+    /// for peer- (server-) initiated streams.  Mirrors the server's reactive
+    /// grant in `processOneServer1RttPacket`.  Without this, a server that
+    /// exhausts the client's advertised bidi limit — e.g. server-initiated
+    /// reqresp / identify-push streams on the inbound leg of a full mesh, where
+    /// ~half of every peer is inbound-only and cannot be dialed back — never
+    /// regains credit: it is blocked, so it cannot open the next stream that
+    /// would re-trigger the proactive `clientReplenishPeerStreamCredit`, and the
+    /// budget deadlocks at the initial 256 → `StreamLimitExceeded` storms and
+    /// mesh collapse at scale (zig-libp2p#259).  `blocked_at` is the limit the
+    /// peer reported being blocked at; grant strictly above it.
+    fn clientGrantStreamCreditOnBlocked(self: *Client, bidi: bool, blocked_at: u64) void {
+        const current: u64 = if (bidi) self.conn.max_streams_bidi_recv else self.conn.max_streams_uni_recv;
+        const new_limit = @max(current, blocked_at) + 1000;
+        var buf: [16]u8 = undefined;
+        buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13);
+        const enc = varint.encode(buf[1..], new_limit) catch return;
+        _ = self.sendClient1Rtt(buf[0 .. 1 + enc.len]) orelse return;
+        if (bidi) {
+            self.conn.max_streams_bidi_recv = new_limit;
+        } else {
+            self.conn.max_streams_uni_recv = new_limit;
+        }
+        dbg("io: client granted MAX_STREAMS on STREAMS_BLOCKED bidi={} new_limit={}\n", .{ bidi, new_limit });
+    }
+
     /// Enqueue one outbound datagram into the send batch, flushing via
     /// sendmmsg(2) the moment it fills. Every hot-path 1-RTT send (ACKs +
     /// stream frames) routes through here; the `if (enqueue) flush` pattern
@@ -10672,9 +10698,15 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x16 or ft == 0x17) {
-                // STREAMS_BLOCKED — server hit stream limit; skip.
+                // STREAMS_BLOCKED — the peer (server) hit our advertised stream
+                // limit and cannot open more.  RFC 9000 §4.6: grant MAX_STREAMS
+                // so it can proceed.  Previously skipped, which deadlocked the
+                // server-initiated stream budget at the initial 256 limit (the
+                // inbound-leg reqresp / identify-push path on a full mesh) →
+                // StreamLimitExceeded storms at scale (zig-libp2p#259).
                 const v = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
+                self.clientGrantStreamCreditOnBlocked(ft == 0x16, v.value);
                 continue;
             }
             if (ft >= 0x08 and ft <= 0x0f) {
@@ -12536,6 +12568,58 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "raw-app stream credit: server-initiated bidi recovers past the 256 limit via client MAX_STREAMS-on-STREAMS_BLOCKED (#259)" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    var drop = RawDrop{};
+
+    // Open far more cumulative server-initiated bidi streams than the peer's
+    // initial advertised bidi limit (256, crypto/quic_tls.zig). The local
+    // budget (`localBidiStreamsOpened`) is monotonic — closing/releasing a
+    // stream never frees a slot — so the ONLY way past 256 is the client
+    // granting MAX_STREAMS. When the server hits the cap it sends STREAMS_BLOCKED
+    // (openRawAppStream); the client must answer with MAX_STREAMS (RFC 9000
+    // §4.6). The proactive client replenishment is tuned to 50% of the default
+    // 1000 (=500), so it never fires before the 256 cap — the reactive
+    // STREAMS_BLOCKED response is the only escape. Before the fix the client
+    // skipped STREAMS_BLOCKED → the server-initiated budget deadlocked at 256 →
+    // StreamLimitExceeded storm + mesh collapse at scale (zig-libp2p#259). Each
+    // stream is opened, FIN'd, received, and released on both ends (so the
+    // 64-slot raw-app table never overflows — that limit is orthogonal).
+    const target: usize = 400;
+    var opened: usize = 0;
+    var spins: usize = 0;
+    const max_spins: usize = 5_000; // bound: a wedged budget fails the count assert fast, never hangs
+    while (opened < target and spins < max_spins) : (spins += 1) {
+        const sid = lb.server.openRawAppStream(conn) catch |err| switch (err) {
+            // Expected at the cap boundary. The server already emitted
+            // STREAMS_BLOCKED; pump so the client's MAX_STREAMS grant reaches it.
+            error.StreamLimitExceeded => {
+                rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+                continue;
+            },
+            else => return err,
+        };
+        _ = lb.server.sendRawStreamData(conn, sid, 0, "x", true);
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        _ = lb.client.releaseRawAppStream(sid);
+        _ = releaseRawAppStream(conn, sid, allocator);
+        opened += 1;
+    }
+
+    // All 400 opened: the budget was lifted past the initial 256 via the
+    // client's MAX_STREAMS-on-STREAMS_BLOCKED grant.
+    try std.testing.expectEqual(target, opened);
+    try std.testing.expect(conn.peer_max_bidi_streams > 256);
 }
 
 test "raw-app server-initiated bidi: SERVER receives a CLIENT reply on the same stream (full duplex)" {
