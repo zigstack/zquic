@@ -12622,6 +12622,90 @@ test "raw-app stream credit: server-initiated bidi recovers past the 256 limit v
     try std.testing.expect(conn.peer_max_bidi_streams > 256);
 }
 
+test "raw-app saturation stress: sustained partial-accept backpressure + retransmits under checking allocator" {
+    // Repro harness for the live-devnet heap corruption that surfaces as
+    // `@memcpy arguments alias` under `PublishQueueFull` + `in-flight cap`
+    // saturation. std.testing.allocator is a checking allocator (double-free /
+    // UAF / leak detection), so any send-path ownership bug trips AT the site.
+    // Drives many concurrent streams, each pushing a large payload in small
+    // chunks faster than the pacer drains (→ pending_stream_sends fills →
+    // coalesce + drain-straddle paths), with periodic packet loss (→ PTO /
+    // retransmit / lost-buf transfer + free paths).
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    const NSTREAMS = 24;
+    const PAYLOAD: u64 = 64 * 1024;
+    const CHUNK: u64 = 1100;
+
+    var blob: [CHUNK]u8 = undefined;
+    for (&blob, 0..) |*b, i| b.* = @intCast((i * 7) % 251);
+
+    var sids: [NSTREAMS]u64 = undefined;
+    var sent: [NSTREAMS]u64 = undefined;
+    var nstream: usize = 0;
+    var drop = RawDrop{};
+    while (nstream < NSTREAMS) {
+        const sid = lb.server.openRawAppStream(conn) catch {
+            // budget cap: pump so the client's MAX_STREAMS grant lands, retry
+            rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+            continue;
+        };
+        sids[nstream] = sid;
+        sent[nstream] = 0;
+        nstream += 1;
+    }
+
+    var round: usize = 0;
+    const max_rounds: usize = 400_000;
+    var done = false;
+    while (!done and round < max_rounds) : (round += 1) {
+        conn.pacerUpdate(compat.milliTimestamp());
+        // Offer the next chunk on every stream. When the pacer/CC is saturated
+        // the accepted count is partial/zero → the bytes queue in
+        // pending_stream_sends (the backpressure path under test).
+        var s: usize = 0;
+        while (s < nstream) : (s += 1) {
+            if (sent[s] >= PAYLOAD) continue;
+            const end = @min(sent[s] + CHUNK, PAYLOAD);
+            const want: usize = @intCast(end - sent[s]);
+            const is_fin = end == PAYLOAD;
+            const acc = lb.server.sendRawStreamData(conn, sids[s], sent[s], blob[0..want], is_fin);
+            sent[s] += acc;
+        }
+        // Periodic burst loss on server→client DATA packets to drive the
+        // retransmit / loss-detection / lost-buf paths.
+        if (round % 40 == 0) {
+            drop.remaining = 4;
+            drop.min_len = 120;
+        }
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+
+        done = true;
+        s = 0;
+        while (s < nstream) : (s += 1) {
+            if (!lb.client.rawAppStreamFullyReceived(sids[s])) {
+                done = false;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(done); // all streams delivered intact, no corruption tripped
+    var s: usize = 0;
+    while (s < nstream) : (s += 1) {
+        _ = lb.client.releaseRawAppStream(sids[s]);
+        _ = releaseRawAppStream(conn, sids[s], allocator);
+    }
+}
+
 test "raw-app server-initiated bidi: SERVER receives a CLIENT reply on the same stream (full duplex)" {
     // The req/resp-over-inbound path (zig-libp2p) needs the *reverse* direction
     // of the gossip fallback: after the server opens a bidi stream and sends a
