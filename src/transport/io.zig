@@ -1061,7 +1061,7 @@ const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 /// each per-conn send slice short (~tens of ms) so ACKs to other peers keep
 /// flowing; CC/pacing remains the real throughput limiter, so block-sync total
 /// throughput is unchanged (the backlog just drains over more, shorter calls).
-const max_pending_drain_per_call: usize = 256;
+pub const default_max_pending_drain_per_call: usize = 256;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
@@ -2912,6 +2912,10 @@ pub const ServerConfig = struct {
     port: u16 = 443,
     cert_path: []const u8 = "/certs/cert.pem",
     key_path: []const u8 = "/certs/priv.key",
+    /// Fairness bound: max pending-stream-send entries flushed per drain call
+    /// (see `default_max_pending_drain_per_call`). Tunable so embedders can
+    /// trade per-conn send-burst size against drive-loop ACK responsiveness.
+    max_pending_drain_per_call: usize = default_max_pending_drain_per_call,
     /// In-memory PEM cert bytes. When non-null, takes precedence over
     /// `cert_path` and the cert is never read from disk. Lifetime: borrowed
     /// for the duration of `Server.init` / `initFromSocket` only; the
@@ -3504,7 +3508,7 @@ pub const Server = struct {
         var i: usize = 0;
         var drained: usize = 0;
         while (i < conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
+            if (drained >= self.config.max_pending_drain_per_call) return; // fairness bound (configurable)
             const p = &conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
@@ -7844,6 +7848,10 @@ pub const ClientConfig = struct {
     urls: []const []const u8 = &.{},
     output_dir: []const u8 = "/downloads",
     keylog_path: ?[]const u8 = null,
+    /// Fairness bound: max pending-stream-send entries flushed per drain call
+    /// (see `default_max_pending_drain_per_call`). Tunable so embedders can
+    /// trade per-conn send-burst size against drive-loop ACK responsiveness.
+    max_pending_drain_per_call: usize = default_max_pending_drain_per_call,
     resumption: bool = false,
     early_data: bool = false,
     key_update: bool = false,
@@ -8920,7 +8928,7 @@ pub const Client = struct {
         var i: usize = 0;
         var drained: usize = 0;
         while (i < self.conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
+            if (drained >= self.config.max_pending_drain_per_call) return; // fairness bound (configurable)
             const p = &self.conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
