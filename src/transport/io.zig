@@ -1055,7 +1055,13 @@ const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 /// every other peer (the residual drive-loop stall after the recv-drain bound).
 /// Cap per call; the remainder drains on subsequent iterations. Well above the
 /// steady-state per-conn send rate, so it only bounds post-stall catch-up bursts.
-const max_pending_drain_per_call: usize = 1024;
+/// 1024 still let one conn's catch-up burst run ~145ms before the embedder's
+/// drive loop pumped inbound again (live: outbound=727ms across 5 conns ->
+/// peers' ACKs starved -> 60s no-ACK teardowns -> peer drop -> fork). 256 keeps
+/// each per-conn send slice short (~tens of ms) so ACKs to other peers keep
+/// flowing; CC/pacing remains the real throughput limiter, so block-sync total
+/// throughput is unchanged (the backlog just drains over more, shorter calls).
+const max_pending_drain_per_call: usize = 256;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
