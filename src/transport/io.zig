@@ -8108,6 +8108,13 @@ const StreamDownload = struct {
 // ── QUIC Client ───────────────────────────────────────────────────────────────
 
 pub const Client = struct {
+    /// Set by `deinit` so a second `deinit` of the SAME struct is a no-op.
+    /// Defends against double-`deinit` of the dialing client during connection
+    /// teardown (the dial-timeout / outbound-close path), which otherwise frees
+    /// the per-stream `recv_reorder` pointers twice → segfault. Zeroed by
+    /// `initFromSocketInPlace`'s `@memset(asBytes(out), 0)`, so it is `false` on
+    /// a freshly-initialized client.
+    deinitialized: bool = false,
     allocator: std.mem.Allocator,
     config: ClientConfig,
     sock: std.posix.socket_t,
@@ -8400,6 +8407,8 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.deinitialized) return;
+        self.deinitialized = true;
         if (self.client_cert_owned) {
             self.allocator.free(self.client_cert_der);
         }
