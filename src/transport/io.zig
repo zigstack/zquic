@@ -1061,7 +1061,15 @@ const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 /// each per-conn send slice short (~tens of ms) so ACKs to other peers keep
 /// flowing; CC/pacing remains the real throughput limiter, so block-sync total
 /// throughput is unchanged (the backlog just drains over more, shorter calls).
-const max_pending_drain_per_call: usize = 64;
+// RAISED 64 -> 512: with 64 a single non-re-entrant drain emitted only ~77 KB
+// even when cwnd allowed MUCH more — live: a healthy conn (cwnd=14MB, srtt=22ms,
+// bif=900KB ≪ cwnd) had a FULL 32 MB pending queue because this cap, not CC, was
+// the limiter → gossip pending backed up → priority outbox dropped attestations.
+// The drive lap is now wall-clock-bounded (50ms outbound phase budget in the
+// embedder) so the packet-count cap no longer needs to be the single-conn bound;
+// 512 lets a fast conn track its cwnd while the wall-clock budget keeps the lap
+// short. CC/pacing is once again the real throughput limiter.
+const max_pending_drain_per_call: usize = 512;
 
 /// Per-`drive()` send budget shared across ALL re-entrant `drainPendingStreamSends`
 /// calls for one connection. `drainPendingStreamSends` is re-invoked synchronously
@@ -1076,7 +1084,14 @@ const max_pending_drain_per_call: usize = 64;
 /// worth total per drive); the remainder flushes on the next drive. ACKs are
 /// unaffected — they flush separately via `flushSendBatch` / `flushDeferredAck`,
 /// not through this STREAM-data path.
-const max_sends_per_drive: usize = 256;
+// RAISED 256 -> 2048: 256 packets (~300 KB) per drive throttled a healthy conn
+// BELOW its cwnd (live: cwnd=14MB/srtt=22ms wants ~640 KB-2.4 MB/drive to stay
+// CC-limited; 300 KB starved it → 32 MB pending full → attestation drops). The
+// 1156ms single-conn starvation this cap originally bounded is now bounded by the
+// embedder's 50ms wall-clock outbound phase budget (per-lap, across conns) — so
+// 2048 (~2.4 MB, a few ms of encrypt) lets CC/pacing be the throughput limiter
+// again while a single drive() still stays well under the wall-clock budget.
+const max_sends_per_drive: usize = 2048;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
