@@ -12719,13 +12719,18 @@ test "raw-app recv delivery budget: large response paces across drives, arrives 
     var drop = RawDrop{};
     var saw_partial_delivery = false; // proves pacing engaged at least once
     var done = false;
-    const deadline = compat.milliTimestamp() + 30_000;
-    while (compat.milliTimestamp() < deadline) {
-        // Feed the server pacer as much as it will take this lap.
+    // Bounded ITERATION budget, not a wall-clock deadline: the per-drive delivery
+    // budget makes the 3 MB arrive in ~total/max_raw_app_delivery_per_drive drives
+    // plus send-side flow-control drives; 200k iters is orders of magnitude of
+    // slack and is machine-speed-independent (a real-time wall-clock deadline +
+    // real-time pacer flaked on slow CI runners). Sends are gated only by
+    // `sendRawStreamData`'s own backpressure (acc==0) — not the real-time pacer —
+    // so the receive-delivery-budget behaviour under test is exercised
+    // deterministically.
+    var iter: usize = 0;
+    while (iter < 200_000) : (iter += 1) {
         var laps: usize = 0;
         while (sent < total and laps < 4000) : (laps += 1) {
-            conn.pacerUpdate(compat.milliTimestamp());
-            if (!conn.pacerHasCredit(chunk)) break;
             const end = @min(sent + chunk, total);
             const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[sent..end], end == total);
             if (acc == 0) break;
