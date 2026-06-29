@@ -1871,6 +1871,12 @@ pub const ConnState = struct {
     /// decrypted, parsed, ACKed and flow-control-credited — only the app
     /// hand-off is paced. See `raw_app_stream.max_raw_app_delivery_per_drive`.
     raw_app_delivery_budget: raw_app_stream.DeliveryBudget = .{},
+    /// Round-robin start cursor for draining `deferred` backlogs across
+    /// `raw_app_streams` (#231). `resetDriveSendBudget(s)` resumes deferred
+    /// streams starting from this index and advances it by one per drive, so a
+    /// low-index stream with a large backlog cannot perennially consume the
+    /// shared `raw_app_delivery_budget` before higher-index slots get a turn.
+    raw_app_resume_cursor: u16 = 0,
     /// Rate-limit `pending-stream-send queue full` warnings (ms).
     pending_stream_send_queue_full_warn_ms: i64 = 0,
     /// Rate-limit for [`maybeLogPendingStreamStall`].
@@ -3238,11 +3244,19 @@ pub const Server = struct {
                 // then bleed any backlog deferred by a prior heavy drive into the
                 // embedder-visible buffers under that allotment.
                 conn.raw_app_delivery_budget = .{};
-                for (&conn.raw_app_streams) |*slot| {
+                // Round-robin (#231): start the resume sweep at a rotating slot
+                // so a low-index backlog can't starve higher-index slots of the
+                // shared delivery budget. Advance the cursor one slot per drive.
+                const n = conn.raw_app_streams.len;
+                const start = conn.raw_app_resume_cursor % n;
+                var off: usize = 0;
+                while (off < n) : (off += 1) {
+                    const slot = &conn.raw_app_streams[(start + off) % n];
                     if (slot.active and slot.deferred.items.len > 0) {
                         raw_app_stream.resumeDeferred(self.allocator, slot, &conn.raw_app_delivery_budget) catch {};
                     }
                 }
+                conn.raw_app_resume_cursor = @intCast((start + 1) % n);
             }
         }
     }
@@ -3958,6 +3972,13 @@ pub const Server = struct {
                     .use_v2 = is_v2,
                     .next_local_uni_stream_id = 3,
                     .next_local_bidi_stream_id = 1,
+                };
+                // Heap-allocate the loss detector's in-flight deque (#233). On
+                // OOM, free the half-built ConnState and refuse the connection
+                // (same failure mode as the `create` above).
+                conn.ld = recovery.LossDetector.init(self.allocator) catch {
+                    self.allocator.destroy(conn);
+                    return null;
                 };
                 slot.* = conn;
                 const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
@@ -5463,7 +5484,9 @@ pub const Server = struct {
                 .cubic => congestion.CongestionController.init(.cubic),
             };
             conn.rtt = .{};
-            conn.ld = .{};
+            // Clear in-flight tracking in place (keeps the heap-backed deque
+            // allocated; frees any attached retransmit buffers) — #233.
+            conn.ld.reset(self.allocator);
         }
 
         var pos: usize = 0;
@@ -8243,10 +8266,11 @@ pub const Client = struct {
     /// stacks after the http/0.9 server arrays grew in v1.6.7).
     fn configureNewConn(
         conn: *ConnState,
+        allocator: std.mem.Allocator,
         config: ClientConfig,
         dcid: ConnectionId,
         scid: ConnectionId,
-    ) void {
+    ) !void {
         conn.* = .{
             .local_cid = scid,
             .remote_cid = dcid,
@@ -8259,6 +8283,8 @@ pub const Client = struct {
             .next_local_uni_stream_id = 2,
             .next_local_bidi_stream_id = 0,
         };
+        // Heap-allocate the loss detector's in-flight deque (#233).
+        conn.ld = try recovery.LossDetector.init(allocator);
         if (config.cubic) {
             conn.cc = congestion.CongestionController.init(.cubic);
         }
@@ -8310,7 +8336,8 @@ pub const Client = struct {
         out.tls = ClientHandshake.init();
         out.active_urls = config.urls;
         out.owns_socket = true;
-        configureNewConn(&out.conn, config, dcid, scid);
+        try configureNewConn(&out.conn, allocator, config, dcid, scid);
+        errdefer out.conn.ld.deinit(allocator);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -8365,7 +8392,8 @@ pub const Client = struct {
         out.tls = ClientHandshake.init();
         out.active_urls = config.urls;
         out.owns_socket = false;
-        configureNewConn(&out.conn, config, dcid, scid);
+        try configureNewConn(&out.conn, allocator, config, dcid, scid);
+        errdefer out.conn.ld.deinit(allocator);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -8418,7 +8446,8 @@ pub const Client = struct {
         out.tls = ClientHandshake.init();
         out.active_urls = config.urls;
         out.owns_socket = take_ownership;
-        configureNewConn(&out.conn, config, dcid, scid);
+        try configureNewConn(&out.conn, allocator, config, dcid, scid);
+        errdefer out.conn.ld.deinit(allocator);
 
         var client_cert_der: []u8 = &.{};
         var client_cert_owned: bool = false;
@@ -8512,11 +8541,19 @@ pub const Client = struct {
         // embedder-visible buffers under that allotment. See
         // `raw_app_stream.max_raw_app_delivery_per_drive`.
         self.conn.raw_app_delivery_budget = .{};
-        for (&self.raw_app_recv) |*slot| {
+        // Round-robin (#231): start the resume sweep at a rotating slot so a
+        // low-index backlog can't starve higher-index slots of the shared
+        // delivery budget. Advance the cursor one slot per drive.
+        const n = self.raw_app_recv.len;
+        const start = self.conn.raw_app_resume_cursor % n;
+        var off: usize = 0;
+        while (off < n) : (off += 1) {
+            const slot = &self.raw_app_recv[(start + off) % n];
             if (slot.active and slot.deferred.items.len > 0) {
                 raw_app_stream.resumeDeferred(self.allocator, slot, &self.conn.raw_app_delivery_budget) catch {};
             }
         }
+        self.conn.raw_app_resume_cursor = @intCast((start + 1) % n);
     }
 
     /// Try to put all deferred STREAM bytes on the wire (quinn `poll_transmit`).
@@ -12479,6 +12516,10 @@ test "localCidCount: seq 0 plus pool entries" {
 
 test "client 1-RTT send: loss detector and CC bytes_in_flight stay coupled" {
     var conn = makeConnForStreamTest();
+    // This test exercises the loss detector, so give it a real heap-backed
+    // in-flight deque (#233); the shared helper leaves `ld` inert by default.
+    conn.ld = try recovery.LossDetector.init(std.testing.allocator);
+    defer conn.ld.deinit(std.testing.allocator);
     const pkt_len: usize = 1200;
     const pn: u64 = 7;
     const recorded = conn.ld.onPacketSent(.{
@@ -13688,4 +13729,68 @@ test "raw-app server-initiated bidi: retransmitted frame after release does NOT 
         .has_length = false,
     }, lb.server_addr);
     try std.testing.expectEqual(@as(usize, 0), serverActive(conn));
+}
+
+test "raw-app credit invariant: MAX_DATA applies even when same-packet STREAM bytes are deferred (#231)" {
+    // Structural guarantee hardened in v1.7.63: a packet that carries BOTH a
+    // flow-control credit frame (MAX_DATA / MAX_STREAM_DATA) and a STREAM frame
+    // whose bytes get DEFERRED by the per-drive delivery budget must still apply
+    // the credit in the same drive. `processAppFrames` parses frames in wire
+    // order and the credit handlers are independent of STREAM delivery, so a
+    // deferral of STREAM bytes must NOT skip the credit update. We exhaust the
+    // delivery budget so the STREAM frame is forced to defer, then feed
+    // [STREAM][MAX_DATA] (credit AFTER the deferred STREAM — the meaningful case)
+    // and assert: (a) the STREAM bytes were deferred, AND (b) fc_send_max rose.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+
+    // Exhaust this drive's recv-side delivery budget so any STREAM bytes are
+    // deferred rather than delivered into the embedder-visible buffer.
+    conn.raw_app_delivery_budget.spent = raw_app_stream.max_raw_app_delivery_per_drive;
+
+    const before_fc_send_max = conn.fc_send_max;
+    const new_max_data: u64 = before_fc_send_max + 1_000_000;
+    const sid: u64 = 0; // fresh client-initiated bidi → auto-registers a slot
+
+    // Build one app-frame payload: STREAM(sid=0, "payload", no FIN) then
+    // MAX_DATA(new_max_data).
+    var frames_buf: [128]u8 = undefined;
+    var fp: usize = 0;
+    const sframe = stream_frame_mod.StreamFrame{
+        .stream_id = sid,
+        .offset = 0,
+        .data = "payload-bytes",
+        .fin = false,
+        .has_length = true,
+    };
+    fp += try sframe.serialize(frames_buf[fp..]);
+    // MAX_DATA (0x10) + varint(new_max_data).
+    frames_buf[fp] = 0x10;
+    fp += 1;
+    const enc = try varint.encode(frames_buf[fp..], new_max_data);
+    fp += enc.len;
+
+    lb.server.processAppFrames(conn, frames_buf[0..fp], lb.server_addr);
+
+    // (a) The STREAM bytes were deferred (budget was exhausted), not delivered.
+    var slot_ptr: ?*RawAppStreamSlot = null;
+    for (&conn.raw_app_streams) |*s| {
+        if (s.active and s.stream_id == sid) {
+            slot_ptr = s;
+            break;
+        }
+    }
+    const slot = slot_ptr orelse return error.SlotNotRegistered;
+    try std.testing.expect(slot.deferred.items.len > 0); // bytes parked, not lost
+    try std.testing.expectEqual(@as(usize, 0), slot.buf.items.len); // none delivered
+
+    // (b) The MAX_DATA credit was applied in the SAME drive despite the deferral.
+    try std.testing.expectEqual(new_max_data, conn.fc_send_max);
 }
