@@ -271,9 +271,14 @@ fn classifyAck(
 
 /// Loss detection state for one packet number space.
 pub const LossDetector = struct {
-    /// High-BDP paths can hold thousands of in-flight packets; 16 KiB slots
-    /// covers ~10 GbE × 100 ms RTT without silent loss-detection blind spots.
-    pub const max_tracked_packets: usize = 16_384;
+    /// High-BDP paths can hold thousands of in-flight packets. RAISED 16384 ->
+    /// 32768: live, conns with a large cwnd (up to the 32 MB pending cap ≈ 27k
+    /// MTU packets) AND inflated RTT under load hit the 16384 cap ("in-flight
+    /// tracking cap reached — packet not tracked"), which sends packets WITHOUT
+    /// loss tracking → silent loss-detection blind spot → possible stream stall.
+    /// 32768 covers a full 32 MB cwnd; cost is one fixed `[N]SentPacket` array
+    /// per LossDetector (~+1 MB/conn), acceptable on the 32 GB devnet hosts.
+    pub const max_tracked_packets: usize = 32_768;
     const max_tracked = max_tracked_packets;
 
     /// In-flight packets form a DEQUE inside `sent`: the logical packets are
