@@ -1849,6 +1849,17 @@ pub const ConnState = struct {
     /// every re-entrant credit-update-triggered drain shares the
     /// `max_sends_per_drive` budget through this counter. See `max_sends_per_drive`.
     sends_this_drive: usize = 0,
+    /// Per-drive RECV-side delivery budget: the recv analogue of
+    /// `sends_this_drive`. Bounds how many freshly reassembled raw-app STREAM
+    /// bytes are handed to the embedder (spliced into the visible `buf`) per
+    /// drive, so one conn receiving a multi-MB reqresp response can't pin the
+    /// shared drive thread for >1s in the embedder's synchronous block parse.
+    /// Shared across every `receiveFrame` in the drive; reset to 0 once at drive
+    /// entry (Client.resetDriveSendBudget / Server.resetDriveSendBudgets, which
+    /// also drain any deferred backlog). EVERY received packet is still
+    /// decrypted, parsed, ACKed and flow-control-credited — only the app
+    /// hand-off is paced. See `raw_app_stream.max_raw_app_delivery_per_drive`.
+    raw_app_delivery_budget: raw_app_stream.DeliveryBudget = .{},
     /// Rate-limit `pending-stream-send queue full` warnings (ms).
     pending_stream_send_queue_full_warn_ms: i64 = 0,
     /// Rate-limit for [`maybeLogPendingStreamStall`].
@@ -3244,7 +3255,18 @@ pub const Server = struct {
     /// one flooded conn can't consume another's allotment. See `max_sends_per_drive`.
     pub fn resetDriveSendBudgets(self: *Server) void {
         for (&self.conns) |*cslot| {
-            if (cslot.*) |conn| conn.sends_this_drive = 0;
+            if (cslot.*) |conn| {
+                conn.sends_this_drive = 0;
+                // Recv-side per-drive delivery budget (mirror): fresh allotment,
+                // then bleed any backlog deferred by a prior heavy drive into the
+                // embedder-visible buffers under that allotment.
+                conn.raw_app_delivery_budget = .{};
+                for (&conn.raw_app_streams) |*slot| {
+                    if (slot.active and slot.deferred.items.len > 0) {
+                        raw_app_stream.resumeDeferred(self.allocator, slot, &conn.raw_app_delivery_budget) catch {};
+                    }
+                }
+            }
         }
     }
 
@@ -6869,7 +6891,7 @@ pub const Server = struct {
             return;
         };
 
-        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data, &conn.raw_app_delivery_budget) catch return;
         // RFC 9000 §3.2: STREAM frame with FIN signals the peer is done
         // sending on this stream.  Record it (plus the final size) so the
         // embedder knows it can release the slot once it has consumed the
@@ -8499,6 +8521,16 @@ pub const Client = struct {
     /// stall sends permanently after the first drive. See `max_sends_per_drive`.
     pub fn resetDriveSendBudget(self: *Client) void {
         self.conn.sends_this_drive = 0;
+        // Recv-side per-drive delivery budget (mirror): fresh allotment, then
+        // bleed any backlog deferred by a prior heavy drive into the
+        // embedder-visible buffers under that allotment. See
+        // `raw_app_stream.max_raw_app_delivery_per_drive`.
+        self.conn.raw_app_delivery_budget = .{};
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.deferred.items.len > 0) {
+                raw_app_stream.resumeDeferred(self.allocator, slot, &self.conn.raw_app_delivery_budget) catch {};
+            }
+        }
     }
 
     /// Try to put all deferred STREAM bytes on the wire (quinn `poll_transmit`).
@@ -11090,7 +11122,7 @@ pub const Client = struct {
             return;
         };
 
-        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data) catch return;
+        raw_app_stream.receiveFrame(self.allocator, slot, sf.offset, sf.data, &self.conn.raw_app_delivery_budget) catch return;
         // Mirror of the server side: track FIN + final size so embedders can
         // release the slot once they have read the payload, and distinguish
         // "complete" from "FIN seen but data still arriving" via `fullyReceived`.
@@ -12655,6 +12687,77 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "raw-app recv delivery budget: large response paces across drives, arrives complete, never starves credit" {
+    // A multi-MB reqresp response (libp2p blocks_by_range) must NOT be handed to
+    // the embedder in one drive — that pins the shared drive thread for >1s in
+    // the embedder's synchronous block parse, starving gossip/ticks. zquic paces
+    // the app hand-off via the per-drive delivery budget, so a single drive
+    // delivers at most ~`max_raw_app_delivery_per_drive`, the remainder draining
+    // on subsequent drives. The full payload must still arrive byte-exact, and
+    // because EVERY packet is still decrypted/parsed/ACKed/credited, the transfer
+    // makes progress every drive (no credit starvation / wedge).
+    const allocator = std.heap.page_allocator; // big payload: avoid checking-alloc overhead
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    const total: usize = 3 * 1024 * 1024;
+    const payload = try allocator.alloc(u8, total);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 31 + 7) % 251);
+
+    var sent: usize = 0;
+    const chunk: usize = 1100;
+    var drop = RawDrop{};
+    var saw_partial_delivery = false; // proves pacing engaged at least once
+    var done = false;
+    const deadline = compat.milliTimestamp() + 30_000;
+    while (compat.milliTimestamp() < deadline) {
+        // Feed the server pacer as much as it will take this lap.
+        var laps: usize = 0;
+        while (sent < total and laps < 4000) : (laps += 1) {
+            conn.pacerUpdate(compat.milliTimestamp());
+            if (!conn.pacerHasCredit(chunk)) break;
+            const end = @min(sent + chunk, total);
+            const acc = lb.server.sendRawStreamData(conn, sid, sent, payload[sent..end], end == total);
+            if (acc == 0) break;
+            sent = end;
+        }
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        // Pacing in action: the visible buffer is observed at an intermediate
+        // length (more than the per-drive cap arrived this lap on the wire, but
+        // only a budget's worth was spliced into the embedder-visible buffer —
+        // so we catch it partway). Without the budget the buffer would jump from
+        // 0 straight to `total` in the single drive that drains the socket.
+        if (lb.client.rawAppRecvBuffer(sid)) |vis| {
+            if (vis.len > 0 and vis.len < total) saw_partial_delivery = true;
+        }
+        if (lb.client.rawAppStreamFullyReceived(sid)) {
+            if (lb.client.rawAppRecvBuffer(sid)) |got| {
+                if (got.len == total) {
+                    done = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(done);
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqual(total, got.len);
+    try std.testing.expectEqualSlices(u8, payload, got);
+    // The 3 MB payload at a 512 KiB/drive cap MUST have been paced over >1 drive.
+    try std.testing.expect(saw_partial_delivery);
+
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
 }
 
 test "raw-app stream credit: server-initiated bidi recovers past the 256 limit via client MAX_STREAMS-on-STREAMS_BLOCKED (#259)" {
