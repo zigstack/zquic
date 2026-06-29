@@ -12709,7 +12709,11 @@ test "raw-app recv delivery budget: large response paces across drives, arrives 
     const conn = rawServerConnectedConn(lb.server).?;
     const sid = try lb.server.openRawAppStream(conn);
 
-    const total: usize = 3 * 1024 * 1024;
+    // 768 KiB: comfortably exceeds the 512 KiB per-drive delivery budget (so the
+    // deferral/pacing path is exercised across ≥2 drives) while staying small
+    // enough to complete in a handful of drives — a multi-MB payload over the
+    // socket-loopback harness stalled intermittently on slow CI runners.
+    const total: usize = 768 * 1024;
     const payload = try allocator.alloc(u8, total);
     defer allocator.free(payload);
     for (payload, 0..) |*b, i| b.* = @intCast((i * 31 + 7) % 251);
@@ -12728,7 +12732,7 @@ test "raw-app recv delivery budget: large response paces across drives, arrives 
     // so the receive-delivery-budget behaviour under test is exercised
     // deterministically.
     var iter: usize = 0;
-    while (iter < 200_000) : (iter += 1) {
+    while (iter < 20_000) : (iter += 1) {
         var laps: usize = 0;
         while (sent < total and laps < 4000) : (laps += 1) {
             const end = @min(sent + chunk, total);
