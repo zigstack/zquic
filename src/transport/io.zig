@@ -1665,9 +1665,7 @@ const max_server_flight_resend_datagrams: usize = 10;
 /// requires per-stream limits to be monotonically non-decreasing, so we
 /// only ever raise `max`.
 pub const PeerStreamSendMaxEntry = struct {
-    stream_id: u64 = 0,
     max: u64 = 0,
-    in_use: bool = false,
 };
 
 /// One slot in the per-stream *receive* flow-control table (RFC 9000 §4.1).
@@ -1678,10 +1676,8 @@ pub const PeerStreamSendMaxEntry = struct {
 /// long-lived stream never stalls — the missing piece that wedged libp2p's
 /// persistent /meshsub gossip stream (zquic#172).
 pub const StreamRecvEntry = struct {
-    stream_id: u64 = 0,
     recv_off: u64 = 0,
     recv_max: u64 = 0,
-    in_use: bool = false,
 };
 
 /// Outcome of recording received stream bytes (see `ConnState.noteStreamRecv`).
@@ -2054,22 +2050,21 @@ pub const ConnState = struct {
     local_initial_max_stream_data_bidi_local: u64 = 256 * 1024,
     local_initial_max_stream_data_bidi_remote: u64 = 256 * 1024,
     local_initial_max_stream_data_uni: u64 = 256 * 1024,
-    /// Per-stream receive accounting (RFC 9000 §4.1). Bounded; a slot is freed
-    /// on FIN / RESET_STREAM (peer is done sending) so it tracks only
-    /// concurrently-open inbound streams. When full, untracked streams fall
-    /// back to connection-level flow control only (strictly safe — we never
-    /// over-advertise, we just may under-extend an untracked stream).
+    /// Per-stream receive accounting (RFC 9000 §4.1), keyed by stream_id. An
+    /// entry is removed on FIN / RESET_STREAM (peer is done sending) so it
+    /// tracks only concurrently-open inbound streams. Looked up O(1) on every
+    /// received STREAM frame (`noteStreamRecv`) — a hashmap so high-VOLUME
+    /// concurrent streams are always tracked with no per-frame scan cost.
     ///
-    /// Sized [2048] to match `per_stream_send_max`: at 256 the table filled
-    /// under 31-peer load (persistent gossip + concurrent blocks_by_range /
-    /// blocks_by_root / status req-resp during catch-up), so high-VOLUME
-    /// streams went untracked and were pinned at the initial 16 MiB
-    /// `MAX_STREAM_DATA` window — a 32 MB blocks_by_range response then stalled
-    /// behind it (`stream_lim=16000000` + pending-send-queue-full backpressure)
-    /// while the connection CC had ample room, throttling block propagation and
-    /// stalling fork-choice catch-up. A larger table keeps these streams tracked
-    /// so their window slides.
-    per_stream_recv: [2048]StreamRecvEntry = [_]StreamRecvEntry{.{}} ** 2048,
+    /// History: this was a fixed [2048] array scanned linearly per frame; under
+    /// 31-peer load (persistent gossip + concurrent blocks_by_range /
+    /// blocks_by_root / status req-resp during catch-up) the scan dominated the
+    /// QUIC drive lap (~1s vs quinn's O(1)), and at smaller sizes the table
+    /// filled and high-VOLUME streams went untracked and pinned at the initial
+    /// 16 MiB `MAX_STREAM_DATA` window — a 32 MB blocks_by_range response then
+    /// stalled behind it while the connection CC had ample room. A hashmap fixes
+    /// both: O(1) lookup and no size limit.
+    per_stream_recv: std.AutoHashMapUnmanaged(u64, StreamRecvEntry) = .empty,
 
     // ── Per-stream initial limits the peer advertised (RFC 9000 §18.2) ────────
     // The §18.2 initial values seed `peerStreamSendLimit`; mid-connection
@@ -2083,12 +2078,12 @@ pub const ConnState = struct {
     peer_max_streams_bidi: u64 = 0,
     peer_max_streams_uni: u64 = 0,
     /// Per-stream send-window overrides set by peer MAX_STREAM_DATA frames
-    /// (RFC 9000 §19.10). A 64-entry table is enough headroom for libp2p's
-    /// per-message-stream pattern (gossipsub + req/resp). When the table is
-    /// full we fall back to the §18.2 initial limit for any further streams,
-    /// which only causes us to be over-conservative on send — never to
-    /// violate the peer's window.
-    per_stream_send_max: [2048]PeerStreamSendMaxEntry = [_]PeerStreamSendMaxEntry{.{}} ** 2048,
+    /// (RFC 9000 §19.10), keyed by stream_id. Looked up O(1) on every stream
+    /// send + pending-chunk drain (`peerStreamSendLimit`). Monotonic per §19.10,
+    /// never removed except on RESET_STREAM. A missing entry (or OOM on insert)
+    /// falls back to the §18.2 initial limit for that stream, which only causes
+    /// us to be over-conservative on send — never to violate the peer's window.
+    per_stream_send_max: std.AutoHashMapUnmanaged(u64, PeerStreamSendMaxEntry) = .empty,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -2728,10 +2723,8 @@ pub const ConnState = struct {
     /// bit 0 = initiator (0=client, 1=server), bit 1 = uni.
     pub fn peerStreamSendLimit(self: *const ConnState, stream_id: u64, we_are_server: bool) u64 {
         const initial = self.peerStreamSendLimitInitial(stream_id, we_are_server);
-        for (&self.per_stream_send_max) |e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                return if (e.max > initial) e.max else initial;
-            }
+        if (self.per_stream_send_max.get(stream_id)) |e| {
+            return if (e.max > initial) e.max else initial;
         }
         return initial;
     }
@@ -2756,31 +2749,26 @@ pub const ConnState = struct {
     /// requires the value to be monotonically non-decreasing — a frame that
     /// would *lower* an existing entry is silently dropped (defensive).
     ///
-    /// Returns true when the table was modified. False means either:
+    /// Returns true when the map was modified. False means either:
     ///   - the new value is ≤ the stored value (spec-violating peer or stale
     ///     frame after reordering), or
-    ///   - the table is full and we did not previously track this stream.
-    /// In the table-full case the gate falls back to the §18.2 initial limit
-    /// for that stream, which is strictly conservative (we will under-send,
-    /// not over-send), and the peer will get a STREAM_DATA_BLOCKED if it
-    /// matters in practice.
-    pub fn applyPeerMaxStreamData(self: *ConnState, stream_id: u64, new_max: u64) bool {
-        for (&self.per_stream_send_max) |*e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                if (new_max > e.max) {
-                    e.max = new_max;
-                    return true;
-                }
-                return false;
-            }
-        }
-        for (&self.per_stream_send_max) |*e| {
-            if (!e.in_use) {
-                e.* = .{ .stream_id = stream_id, .max = new_max, .in_use = true };
+    ///   - inserting a new entry failed on OOM and we did not previously track
+    ///     this stream.
+    /// In the OOM case the gate falls back to the §18.2 initial limit for that
+    /// stream, which is strictly conservative (we will under-send, not
+    /// over-send), and the peer will get a STREAM_DATA_BLOCKED if it matters in
+    /// practice.
+    pub fn applyPeerMaxStreamData(self: *ConnState, allocator: std.mem.Allocator, stream_id: u64, new_max: u64) bool {
+        const gop = self.per_stream_send_max.getOrPut(allocator, stream_id) catch return false;
+        if (gop.found_existing) {
+            if (new_max > gop.value_ptr.max) {
+                gop.value_ptr.max = new_max;
                 return true;
             }
+            return false;
         }
-        return false;
+        gop.value_ptr.* = .{ .max = new_max };
+        return true;
     }
 
     /// Drop the per-stream send-window entry for `stream_id`. Called from the
@@ -2788,12 +2776,7 @@ pub const ConnState = struct {
     /// the stream id will never be re-used (RFC 9000 §2.1) so the slot is
     /// pure dead weight. Safe to call on a stream that was never tracked.
     pub fn clearPeerStreamSendMax(self: *ConnState, stream_id: u64) void {
-        for (&self.per_stream_send_max) |*e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                e.* = .{};
-                return;
-            }
-        }
+        _ = self.per_stream_send_max.remove(stream_id);
     }
 
     /// Seed the receive-side flow-control windows (and `fc_recv_max`) from the
@@ -2832,28 +2815,17 @@ pub const ConnState = struct {
     /// peer has consumed ≥50% of the window we advertised, advertise one more
     /// window so it never blocks. Returns `.violation=true` if the peer
     /// exceeded the limit we advertised (caller MUST close).
-    pub fn noteStreamRecv(self: *ConnState, stream_id: u64, end_off: u64, we_are_server: bool) StreamRecvAction {
+    pub fn noteStreamRecv(self: *ConnState, allocator: std.mem.Allocator, stream_id: u64, end_off: u64, we_are_server: bool) StreamRecvAction {
         const window = self.localStreamRecvInitial(stream_id, we_are_server);
-        var slot: ?*StreamRecvEntry = null;
-        for (&self.per_stream_recv) |*e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                slot = e;
-                break;
-            }
+        // OOM on first-seen insert: this stream is untracked. Don't flag a
+        // violation (we have no per-stream limit to compare against) and skip
+        // the per-stream extension — connection-level flow control still bounds
+        // total receive. (Same fallback the fixed-size table took when full.)
+        const gop = self.per_stream_recv.getOrPut(allocator, stream_id) catch return .{};
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .recv_off = 0, .recv_max = window };
         }
-        if (slot == null) {
-            for (&self.per_stream_recv) |*e| {
-                if (!e.in_use) {
-                    e.* = .{ .stream_id = stream_id, .recv_off = 0, .recv_max = window, .in_use = true };
-                    slot = e;
-                    break;
-                }
-            }
-        }
-        // Table full: this stream is untracked. Don't flag a violation (we have
-        // no per-stream limit to compare against) and skip the per-stream
-        // extension — connection-level flow control still bounds total receive.
-        const e = slot orelse return .{};
+        const e = gop.value_ptr;
         if (end_off > e.recv_off) e.recv_off = end_off;
         if (e.recv_off > e.recv_max) return .{ .violation = true };
         if (e.recv_off * 2 >= e.recv_max) {
@@ -2867,33 +2839,23 @@ pub const ConnState = struct {
     /// answer a STREAM_DATA_BLOCKED frame). Ensures a slot exists, raises the
     /// advertised limit by one window above what we have received, and returns
     /// the new limit to put on the wire.
-    pub fn bumpStreamRecvWindow(self: *ConnState, stream_id: u64, we_are_server: bool) u64 {
+    pub fn bumpStreamRecvWindow(self: *ConnState, allocator: std.mem.Allocator, stream_id: u64, we_are_server: bool) u64 {
         const window = self.localStreamRecvInitial(stream_id, we_are_server);
-        for (&self.per_stream_recv) |*e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                e.recv_max = e.recv_off + window;
-                return e.recv_max;
-            }
+        // OOM on first-seen insert — best-effort grant of one window.
+        const gop = self.per_stream_recv.getOrPut(allocator, stream_id) catch return window;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .recv_off = 0, .recv_max = window };
+            return window;
         }
-        for (&self.per_stream_recv) |*e| {
-            if (!e.in_use) {
-                e.* = .{ .stream_id = stream_id, .recv_off = 0, .recv_max = window, .in_use = true };
-                return window;
-            }
-        }
-        return window; // table full — best-effort grant of one window
+        gop.value_ptr.recv_max = gop.value_ptr.recv_off + window;
+        return gop.value_ptr.recv_max;
     }
 
     /// Drop the per-stream receive slot for `stream_id`. Called on FIN (peer
     /// has finished sending) and RESET_STREAM — the peer will send no more on
     /// this id (RFC 9000 §2.1) so the slot is free to reuse.
     pub fn clearStreamRecv(self: *ConnState, stream_id: u64) void {
-        for (&self.per_stream_recv) |*e| {
-            if (e.in_use and e.stream_id == stream_id) {
-                e.* = .{};
-                return;
-            }
-        }
+        _ = self.per_stream_recv.remove(stream_id);
     }
 };
 
@@ -5776,7 +5738,7 @@ pub const Server = struct {
                 // `sendRawStreamDataInner` honors the new ceiling.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                const updated = conn.applyPeerMaxStreamData(r.frame.stream_id, r.frame.maximum_stream_data);
+                const updated = conn.applyPeerMaxStreamData(self.allocator, r.frame.stream_id, r.frame.maximum_stream_data);
                 dbg("io: MAX_STREAM_DATA stream_id={} max={} applied={}\n", .{
                     r.frame.stream_id, r.frame.maximum_stream_data, updated,
                 });
@@ -5807,7 +5769,7 @@ pub const Server = struct {
                 // STREAM_DATA_BLOCKED — peer ran out of stream-level send credit.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                const nm = conn.bumpStreamRecvWindow(r.frame.stream_id, true);
+                const nm = conn.bumpStreamRecvWindow(self.allocator, r.frame.stream_id, true);
                 self.sendMaxStreamData(conn, r.frame.stream_id, nm, src);
                 continue;
             }
@@ -6025,7 +5987,7 @@ pub const Server = struct {
                 // Without this a long-lived stream (libp2p persistent /meshsub
                 // gossip) stalls at the initial per-stream limit — zquic#172.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
-                const sra = conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, true);
+                const sra = conn.noteStreamRecv(self.allocator, sf_r.frame.stream_id, recv_end, true);
                 if (sra.violation) {
                     self.sendConnectionClose(conn, 0x03, "stream flow control violation", src);
                     return;
@@ -7982,6 +7944,15 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     // have moved ownership into the loss detector on send; entries still
     // present here were never able to go on the wire.
     freePendingStreamSends(conn, allocator);
+    // Per-stream flow-control maps (RFC 9000 §4.1, §19.10). Values are plain
+    // structs that own no heap, so `deinit` frees the backing tables outright.
+    // Reset to `.empty` so the slot is safe to reuse (server slab reap +
+    // client reconnect both overwrite `conn.*` afterward, but a bare deinit
+    // here keeps a double-free impossible if anything reads before overwrite).
+    conn.per_stream_send_max.deinit(allocator);
+    conn.per_stream_send_max = .empty;
+    conn.per_stream_recv.deinit(allocator);
+    conn.per_stream_recv = .empty;
     // Free any retransmit buffers attached to in-flight LD entries so the
     // raw_application_streams send-side doesn't leak when a connection is
     // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
@@ -10701,7 +10672,7 @@ pub const Client = struct {
                 // `sendRawStreamDataInner` honors the new ceiling.
                 const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                const updated = self.conn.applyPeerMaxStreamData(r.frame.stream_id, r.frame.maximum_stream_data);
+                const updated = self.conn.applyPeerMaxStreamData(self.allocator, r.frame.stream_id, r.frame.maximum_stream_data);
                 dbg("io: client MAX_STREAM_DATA stream_id={} max={} applied={}\n", .{
                     r.frame.stream_id, r.frame.maximum_stream_data, updated,
                 });
@@ -10732,7 +10703,7 @@ pub const Client = struct {
                 // credit; grant more on that stream (RFC 9000 §19.13).
                 const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                const nm = self.conn.bumpStreamRecvWindow(r.frame.stream_id, false);
+                const nm = self.conn.bumpStreamRecvWindow(self.allocator, r.frame.stream_id, false);
                 self.sendMaxStreamData(r.frame.stream_id, nm);
                 continue;
             }
@@ -10868,7 +10839,7 @@ pub const Client = struct {
                     return;
                 }
                 if (self.conn.fc_bytes_recv * 2 >= self.conn.fc_recv_max) self.sendMaxData();
-                const sra = self.conn.noteStreamRecv(sf_r.frame.stream_id, recv_end, false);
+                const sra = self.conn.noteStreamRecv(self.allocator, sf_r.frame.stream_id, recv_end, false);
                 if (sra.violation) {
                     self.sendConnectionClose(0x03, "stream flow control violation");
                     return;
@@ -12058,44 +12029,52 @@ test "per-stream send max: initial limit when no MAX_STREAM_DATA seen" {
 }
 
 test "per-stream send max: MAX_STREAM_DATA raises the gate" {
+    const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_send_max.deinit(a);
     conn.peer_initial_max_stream_data_bidi_local = 1_000;
 
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(0, true));
-    try std.testing.expect(conn.applyPeerMaxStreamData(0, 5_000));
+    try std.testing.expect(conn.applyPeerMaxStreamData(a, 0, 5_000));
     try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
     // Unrelated stream still uses the initial limit.
     try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(4, true));
 }
 
 test "per-stream send max: non-monotonic frames are dropped (§19.10)" {
+    const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_send_max.deinit(a);
     conn.peer_initial_max_stream_data_bidi_local = 1_000;
 
-    try std.testing.expect(conn.applyPeerMaxStreamData(0, 5_000));
+    try std.testing.expect(conn.applyPeerMaxStreamData(a, 0, 5_000));
     // A lower value (e.g. reordered/stale frame) MUST NOT lower the stored max.
-    try std.testing.expect(!conn.applyPeerMaxStreamData(0, 4_000));
+    try std.testing.expect(!conn.applyPeerMaxStreamData(a, 0, 4_000));
     try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
     // Equal also returns false (no change).
-    try std.testing.expect(!conn.applyPeerMaxStreamData(0, 5_000));
+    try std.testing.expect(!conn.applyPeerMaxStreamData(a, 0, 5_000));
     try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
 }
 
 test "per-stream send max: value below initial is clamped on lookup" {
+    const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_send_max.deinit(a);
     conn.peer_initial_max_stream_data_bidi_local = 10_000;
 
     // Spec-violating peer sends MAX_STREAM_DATA below the initial limit.
     // The entry is inserted (we trust then verify on lookup) but lookup
     // must never return below the §18.2 ceiling.
-    try std.testing.expect(conn.applyPeerMaxStreamData(0, 500));
+    try std.testing.expect(conn.applyPeerMaxStreamData(a, 0, 500));
     try std.testing.expectEqual(@as(u64, 10_000), conn.peerStreamSendLimit(0, true));
 }
 
 test "per-stream send max: clear drops the entry, lookup falls back to initial" {
+    const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_send_max.deinit(a);
     conn.peer_initial_max_stream_data_bidi_local = 1_000;
-    _ = conn.applyPeerMaxStreamData(0, 5_000);
+    _ = conn.applyPeerMaxStreamData(a, 0, 5_000);
     try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
 
     conn.clearPeerStreamSendMax(0);
@@ -12104,76 +12083,108 @@ test "per-stream send max: clear drops the entry, lookup falls back to initial" 
     conn.clearPeerStreamSendMax(99);
 }
 
-test "per-stream send max: table-full keeps existing tracked streams correct" {
+test "per-stream send max: thousands of distinct streams all stay tracked (hashmap, no size cap)" {
+    const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_send_max.deinit(a);
     conn.peer_initial_max_stream_data_bidi_local = 1_000;
     conn.peer_initial_max_stream_data_bidi_remote = 1_000;
     conn.peer_initial_max_stream_data_uni = 1_000;
 
-    // Fill the table with one fresh entry per stream id.
+    // Insert far more distinct streams than the old fixed [2048] table held.
+    // The old array would have overflowed (untracked beyond 2048); the hashmap
+    // keeps every one tracked with O(1) lookup.
+    const n: u64 = 5_000;
     var sid: u64 = 0;
-    while (sid < conn.per_stream_send_max.len) : (sid += 1) {
-        // Use stream ids of the same parity so we stay in one bucket; the
-        // multiplier of 4 walks the §2.1 stream-id space without colliding.
-        try std.testing.expect(conn.applyPeerMaxStreamData(sid * 4, 5_000 + sid));
+    while (sid < n) : (sid += 1) {
+        // Multiplier of 4 walks the §2.1 stream-id space within one bucket.
+        try std.testing.expect(conn.applyPeerMaxStreamData(a, sid * 4, 5_000 + sid));
     }
+    try std.testing.expectEqual(@as(u32, n), conn.per_stream_send_max.count());
+    // The first, a middle, and the last entry all retain their distinct value.
+    try std.testing.expectEqual(@as(u64, 5_000), conn.peerStreamSendLimit(0, true));
+    try std.testing.expectEqual(@as(u64, 5_000 + 2_500), conn.peerStreamSendLimit(2_500 * 4, true));
+    try std.testing.expectEqual(@as(u64, 5_000 + (n - 1)), conn.peerStreamSendLimit((n - 1) * 4, true));
     // Updates to already-tracked streams still succeed.
-    try std.testing.expect(conn.applyPeerMaxStreamData(0, 9_999));
-    try std.testing.expectEqual(@as(u64, 9_999), conn.peerStreamSendLimit(0, true));
-    // A brand-new stream cannot be inserted; lookup falls back to the
-    // initial limit (under-send, never over-send).
-    const new_sid: u64 = @as(u64, conn.per_stream_send_max.len) * 4;
-    try std.testing.expect(!conn.applyPeerMaxStreamData(new_sid, 9_999));
-    try std.testing.expectEqual(@as(u64, 1_000), conn.peerStreamSendLimit(new_sid, true));
+    try std.testing.expect(conn.applyPeerMaxStreamData(a, 0, 99_999));
+    try std.testing.expectEqual(@as(u64, 99_999), conn.peerStreamSendLimit(0, true));
 }
 
 test "per-stream recv: no MAX_STREAM_DATA until 50% of window consumed" {
+    const al = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
     conn.seedLocalRecvWindows(.libp2p); // 16 MB per-stream window
     const sid: u64 = 0; // client-initiated bidi; server view: peer-initiated
     // Below 50% (8 MB) — no extension.
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 7_000_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(al, sid, 7_000_000, true).send_max);
     // Cross 50% (8 MB) — extend to recv_off + one window.
-    const a = conn.noteStreamRecv(sid, 8_000_000, true);
+    const a = conn.noteStreamRecv(al, sid, 8_000_000, true);
     try std.testing.expect(!a.violation);
     try std.testing.expectEqual(@as(?u64, 24_000_000), a.send_max);
     // After extension the next small advance does not re-trigger.
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(sid, 8_100_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(al, sid, 8_100_000, true).send_max);
 }
 
 test "per-stream recv: exceeding the advertised window is a violation" {
+    const al = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
     conn.seedLocalRecvWindows(.libp2p);
     const sid: u64 = 0;
     // Jump past the 16 MB advertised limit before any MAX_STREAM_DATA.
-    try std.testing.expect(conn.noteStreamRecv(sid, 16_000_001, true).violation);
+    try std.testing.expect(conn.noteStreamRecv(al, sid, 16_000_001, true).violation);
 }
 
 test "per-stream recv: window tracks each stream independently" {
+    const al = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
     conn.seedLocalRecvWindows(.libp2p);
     // Stream 0 crosses 50% (8 MB), stream 4 stays low — only 0 extends.
-    try std.testing.expectEqual(@as(?u64, 25_000_000), conn.noteStreamRecv(0, 9_000_000, true).send_max);
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(4, 1_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, 25_000_000), conn.noteStreamRecv(al, 0, 9_000_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(al, 4, 1_000, true).send_max);
 }
 
 test "per-stream recv: FIN/RESET clears the slot for reuse" {
+    const al = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
     conn.seedLocalRecvWindows(.libp2p);
-    _ = conn.noteStreamRecv(0, 6_000_000, true);
+    _ = conn.noteStreamRecv(al, 0, 6_000_000, true);
     conn.clearStreamRecv(0);
     // Slot freed: the same id starts fresh at the initial window again.
-    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(0, 1_000, true).send_max);
+    try std.testing.expectEqual(@as(?u64, null), conn.noteStreamRecv(al, 0, 1_000, true).send_max);
 }
 
 test "per-stream recv: bumpStreamRecvWindow answers STREAM_DATA_BLOCKED" {
+    const al = std.testing.allocator;
     var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
     conn.seedLocalRecvWindows(.libp2p);
     // Peer is blocked near the initial 16 MB; we received up to there.
-    _ = conn.noteStreamRecv(0, 9_999_999, true);
+    _ = conn.noteStreamRecv(al, 0, 9_999_999, true);
     // bump grants one window above what we have received.
-    const nm = conn.bumpStreamRecvWindow(0, true);
+    const nm = conn.bumpStreamRecvWindow(al, 0, true);
     try std.testing.expectEqual(@as(u64, 9_999_999 + 16_000_000), nm);
+}
+
+test "per-stream recv: thousands of distinct streams all stay tracked (hashmap, no size cap)" {
+    const al = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer conn.per_stream_recv.deinit(al);
+    conn.seedLocalRecvWindows(.libp2p); // 16 MB per-stream window
+    // Far more streams than the old fixed [2048] table; each crosses 50% so
+    // each gets its own independent extension. The old array would have stopped
+    // tracking past 2048 (untracked → no extension); the hashmap tracks all.
+    const n: u64 = 5_000;
+    var sid: u64 = 0;
+    while (sid < n) : (sid += 1) {
+        const act = conn.noteStreamRecv(al, sid * 4, 9_000_000, true);
+        try std.testing.expect(!act.violation);
+        try std.testing.expectEqual(@as(?u64, 25_000_000), act.send_max);
+    }
+    try std.testing.expectEqual(@as(u32, n), conn.per_stream_recv.count());
 }
 
 test "prepareConnStreamsBlocked: throttles repeat bidi emission" {
