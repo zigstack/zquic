@@ -271,13 +271,15 @@ fn classifyAck(
 
 /// Loss detection state for one packet number space.
 pub const LossDetector = struct {
-    /// High-BDP paths can hold thousands of in-flight packets; 16 KiB slots
-    /// covers ~10 GbE × 100 ms RTT without silent loss-detection blind spots.
-    /// NOTE: this is a fixed inline `[N]SentPacket` array, so it cannot be raised
-    /// without overflowing the stack of on-stack LossDetector allocations (32768
-    /// crashed 25 tests). Raising it for very-high-BDP conns requires
-    /// heap-allocating the deque first — tracked as a follow-up.
-    pub const max_tracked_packets: usize = 16_384;
+    /// High-BDP paths can hold thousands of in-flight packets. At 32768 slots a
+    /// full 32 MB cwnd (≈27k MTU-sized packets) fits without ever hitting the
+    /// in-flight tracking cap — i.e. without sending packets that loss detection
+    /// cannot see (a loss-detection blind spot under high cwnd).
+    /// `sent` is now a HEAP-allocated slice (see `init`/`deinit`), so raising
+    /// this only grows heap memory (~+2 MB/conn at 64 B/SentPacket) and never
+    /// the stack of on-stack LossDetector allocations — the constraint that
+    /// previously pinned this at 16384 (#233).
+    pub const max_tracked_packets: usize = 32_768;
     const max_tracked = max_tracked_packets;
 
     /// In-flight packets form a DEQUE inside `sent`: the logical packets are
@@ -288,10 +290,16 @@ pub const LossDetector = struct {
     /// fallback, `abandonSpace`) preserves send order, so within each PN space
     /// the packets stay ascending by pn — the invariant the front-pop relies on.
     /// This replaced an unsorted flat array + swap-remove whose onAck rescanned
-    /// ALL in-flight packets (O(sent_count), up to the 16384 cap) on every ACK —
+    /// ALL in-flight packets (O(sent_count), up to the cap) on every ACK —
     /// the per-packet cost that saturated the single drive thread under a full
     /// 31-peer mesh (#184 / drive-loop stall).
-    sent: [max_tracked]SentPacket = undefined,
+    ///
+    /// HEAP-allocated (#233): a length-`max_tracked` slice owned by this
+    /// detector. The default `&.{}` is an empty placeholder so a `.{}`-built
+    /// LossDetector is inert until `init` allocates the real backing; `deinit`
+    /// frees it. The deque indexing below treats `sent` exactly as it treated
+    /// the former inline array — `sent.len == max_tracked` once `init` ran.
+    sent: []SentPacket = &.{},
     sent_count: usize = 0,
     /// Physical index of the deque front (logical packet 0). See `sent`.
     head: usize = 0,
@@ -308,6 +316,31 @@ pub const LossDetector = struct {
 
     fn spaceIdx(space: PacketNumberSpace) usize {
         return @intFromEnum(space);
+    }
+
+    /// Allocate the heap-backed `sent` deque (length `max_tracked`). Every other
+    /// field keeps its struct default. Callers must pair this with `deinit` so
+    /// the slice is freed. The backing memory is `undefined` until written by
+    /// `onPacketSent` — only `sent[head .. head + sent_count]` is ever read.
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!LossDetector {
+        var self = LossDetector{};
+        self.sent = try allocator.alloc(SentPacket, max_tracked);
+        return self;
+    }
+
+    /// Clear the deque in place WITHOUT freeing the backing slice (RFC 9002 §9.4
+    /// path-change reset). Frees any in-flight retransmit buffers first so the
+    /// reset does not leak `stream_data`, then rewinds the deque and per-space
+    /// state. The slice stays allocated and reusable.
+    pub fn reset(self: *LossDetector, allocator: std.mem.Allocator) void {
+        for (self.sent[self.head .. self.head + self.sent_count]) |*p| {
+            if (p.stream_data) |sd| _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
+            p.stream_data = null;
+        }
+        self.sent_count = 0;
+        self.head = 0;
+        self.largest_acked = [_]u64{0} ** pn_space_count;
+        self.loss_time_ms = .{null} ** pn_space_count;
     }
 
     /// True when this PN space still has ack-eliciting packets in flight.
@@ -352,8 +385,12 @@ pub const LossDetector = struct {
         self.loss_time_ms[sidx] = null;
     }
 
-    /// Free any heap-owned retransmit buffers attached to in-flight packets.
-    /// Caller passes the same allocator used when populating `stream_data`.
+    /// Free any heap-owned retransmit buffers attached to in-flight packets AND
+    /// the heap-backed `sent` slice itself (#233). Caller passes the same
+    /// allocator used to `init` the detector and to populate `stream_data`.
+    /// Idempotent: after this `sent` is the empty placeholder again, so a second
+    /// call (or a call on a `.{}`-built detector that was never `init`ed) is a
+    /// no-op.
     pub fn deinit(self: *LossDetector, allocator: std.mem.Allocator) void {
         for (self.sent[self.head .. self.head + self.sent_count]) |*p| {
             if (p.stream_data) |sd| _ = freeStreamDataChecked(allocator, sd, p.pn, p.stream_id);
@@ -361,6 +398,10 @@ pub const LossDetector = struct {
         }
         self.sent_count = 0;
         self.head = 0;
+        if (self.sent.len != 0) {
+            allocator.free(self.sent);
+            self.sent = &.{};
+        }
     }
 
     /// True when another in-flight packet can be tracked (quinn always
@@ -592,7 +633,8 @@ test "rtt: pto increases with backoff" {
 
 test "loss: packet threshold detection" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
 
     // Send packets 0..5
@@ -617,7 +659,8 @@ test "loss: packet threshold detection" {
 
 test "loss: rejects invalid first_ack_range > largest_acked" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     var lost_buf: [4]SentPacket = undefined;
     // largest_acked=5, first_ack_range=10 → would underflow.
@@ -629,7 +672,8 @@ test "loss: rejects invalid first_ack_range > largest_acked" {
 
 test "loss: time-threshold declares old packet lost when gap < k_packet_threshold" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     // Establish an RTT sample so loss_delay is bounded and deterministic.
     rtt.update(50, 0);
@@ -652,7 +696,8 @@ test "loss: time-threshold declares old packet lost when gap < k_packet_threshol
 
 test "loss: persistent congestion across spread-out losses" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     // Pin a small SRTT so the PC threshold is small and easy to exceed.
     rtt.update(10, 0);
@@ -683,7 +728,8 @@ test "loss: persistent congestion across spread-out losses" {
 
 test "loss: no persistent congestion when ack proves path is delivering" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     rtt.update(10, 0);
     const pc_dur = rtt.persistent_congestion_duration_ms(k_max_ack_delay_ms);
@@ -723,7 +769,7 @@ test "loss: persistent_congestion_duration falls back to initial RTT before firs
 test "loss: stream_data is freed on ack and transferred on loss" {
     const testing = std.testing;
     const a = testing.allocator;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(a);
     defer ld.deinit(a);
     var rtt = RttEstimator{};
 
@@ -809,7 +855,7 @@ test "loss: streamDataLooksFreeable rejects corrupt lengths, accepts sane ones" 
 
 test "loss: stream_data ownership survives adversarial send/ack/retransmit churn at cap" {
     // Reproduces the io.zig client retransmit ownership protocol under heavy
-    // load near the 2048-packet cap:
+    // load near the in-flight tracking cap:
     //   - onPacketSent with a heap-owned stream_data slice (dup'd here, like
     //     clientSendRawStreamFrame's `dupe`).  On `false` (LD full) the caller
     //     owns the slice and must free it (io.zig:7571).
@@ -821,7 +867,7 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
     // testing.allocator flags any double-free / use-after-free / leak.
     const testing = std.testing;
     const a = testing.allocator;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(a);
     defer ld.deinit(a);
     var rtt = RttEstimator{};
 
@@ -906,7 +952,8 @@ test "loss: stream_data ownership survives adversarial send/ack/retransmit churn
 
 test "loss: per-PN-space ACK only affects matching space" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
 
     _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 190, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .handshake });
@@ -923,7 +970,8 @@ test "loss: per-PN-space ACK only affects matching space" {
 
 test "loss: abandonSpace drops only the targeted PN space" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     _ = ld.onPacketSent(.{ .pn = 0, .send_time_ms = 100, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .initial });
     _ = ld.onPacketSent(.{ .pn = 1, .send_time_ms = 110, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .handshake });
     _ = ld.onPacketSent(.{ .pn = 2, .send_time_ms = 120, .size = 50, .ack_eliciting = true, .in_flight = true, .space = .application });
@@ -939,7 +987,8 @@ test "loss: abandonSpace drops only the targeted PN space" {
 
 test "deque: contiguous front ack pops front, higher-pn suffix preserved in order" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     var pn: u64 = 0;
     while (pn < 10) : (pn += 1) {
@@ -963,7 +1012,8 @@ test "deque: contiguous front ack pops front, higher-pn suffix preserved in orde
 
 test "deque: fully acked resets head to 0 and stays usable" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     var pn: u64 = 0;
     while (pn < 3) : (pn += 1) {
@@ -980,7 +1030,8 @@ test "deque: fully acked resets head to 0 and stays usable" {
 
 test "deque: reorder gap — front losses popped, gap-keepers retained, acked-behind processed via fallback" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     var pn: u64 = 0;
     while (pn < 5) : (pn += 1) {
@@ -1001,7 +1052,8 @@ test "deque: reorder gap — front losses popped, gap-keepers retained, acked-be
 
 test "deque: head-wrap compaction preserves a sliding in-flight window" {
     const testing = std.testing;
-    var ld = LossDetector{};
+    var ld = try LossDetector.init(testing.allocator);
+    defer ld.deinit(testing.allocator);
     var rtt = RttEstimator{};
     var lost_buf: [4]SentPacket = undefined;
     const win: u64 = 4;
