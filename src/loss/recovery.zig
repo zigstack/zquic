@@ -273,6 +273,10 @@ fn classifyAck(
 pub const LossDetector = struct {
     /// High-BDP paths can hold thousands of in-flight packets; 16 KiB slots
     /// covers ~10 GbE × 100 ms RTT without silent loss-detection blind spots.
+    /// NOTE: this is a fixed inline `[N]SentPacket` array, so it cannot be raised
+    /// without overflowing the stack of on-stack LossDetector allocations (32768
+    /// crashed 25 tests). Raising it for very-high-BDP conns requires
+    /// heap-allocating the deque first — tracked as a follow-up.
     pub const max_tracked_packets: usize = 16_384;
     const max_tracked = max_tracked_packets;
 
