@@ -1061,7 +1061,22 @@ const max_pending_stream_chunk: usize = MAX_DATAGRAM_SIZE - 64;
 /// each per-conn send slice short (~tens of ms) so ACKs to other peers keep
 /// flowing; CC/pacing remains the real throughput limiter, so block-sync total
 /// throughput is unchanged (the backlog just drains over more, shorter calls).
-const max_pending_drain_per_call: usize = 256;
+const max_pending_drain_per_call: usize = 64;
+
+/// Per-`drive()` send budget shared across ALL re-entrant `drainPendingStreamSends`
+/// calls for one connection. `drainPendingStreamSends` is re-invoked synchronously
+/// on every received MAX_DATA (0x10) / MAX_STREAM_DATA (0x11) credit-update frame,
+/// and once more from `processPendingWork` — i.e. O(recv-datagrams) times per
+/// `QuicOutbound.drive` / listener drive. The per-call cap above is therefore
+/// leaky: a drive carrying many credit-updates emits `max_pending_drain_per_call`
+/// packets PER frame, so one conn sent thousands of STREAM packets uninterrupted
+/// (live: 1156ms) — starving the inbound socket for that whole window → loss →
+/// cwnd collapse → bigger backlog. This is the TRUE single-conn bound: every
+/// re-entrant drain for one drive shares ONE 256-packet budget (one full drain's
+/// worth total per drive); the remainder flushes on the next drive. ACKs are
+/// unaffected — they flush separately via `flushSendBatch` / `flushDeferredAck`,
+/// not through this STREAM-data path.
+const max_sends_per_drive: usize = 256;
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
@@ -1828,6 +1843,12 @@ pub const ConnState = struct {
     /// `checkPto` tick as a safety net.
     pending_stream_sends: std.ArrayList(PendingStreamSend) = .empty,
     pending_stream_send_bytes: usize = 0,
+    /// STREAM packets emitted by `drainPendingStreamSends` so far in the CURRENT
+    /// drive() call. Reset to 0 once per outer drive (Client.resetDriveSendBudget
+    /// / Server.resetDriveSendBudgets, called from the embedder's drive entry);
+    /// every re-entrant credit-update-triggered drain shares the
+    /// `max_sends_per_drive` budget through this counter. See `max_sends_per_drive`.
+    sends_this_drive: usize = 0,
     /// Rate-limit `pending-stream-send queue full` warnings (ms).
     pending_stream_send_queue_full_warn_ms: i64 = 0,
     /// Rate-limit for [`maybeLogPendingStreamStall`].
@@ -3216,6 +3237,17 @@ pub const Server = struct {
         }
     }
 
+    /// Reset every connection's per-drive STREAM-send budget. MUST be called
+    /// exactly once at the START of each embedder listener drive() — before the
+    /// feedPacket recv loop — so each conn's re-entrant credit-update drains share
+    /// ONE `max_sends_per_drive` allotment per drive. Per-conn (not per-Server) so
+    /// one flooded conn can't consume another's allotment. See `max_sends_per_drive`.
+    pub fn resetDriveSendBudgets(self: *Server) void {
+        for (&self.conns) |*cslot| {
+            if (cslot.*) |conn| conn.sends_this_drive = 0;
+        }
+    }
+
     /// Run loss recovery, flush pending HTTP responses, and reap idle connections — same work as an idle `run()` iteration without reading the socket.
     pub fn processPendingWork(self: *Server) void {
         self.drainAllPendingStreamSends();
@@ -3501,10 +3533,16 @@ pub const Server = struct {
     fn drainPendingStreamSends(self: *Server, conn: *ConnState) void {
         if (conn.draining or conn.phase != .connected or !conn.has_app_keys) return;
         if (conn.pending_stream_sends.items.len == 0) return;
+        // Per-drive budget shared across this conn's re-entrant credit-update
+        // drains (mirror of Client.drainPendingStreamSends). Reset once per drive
+        // via Server.resetDriveSendBudgets. See `max_sends_per_drive`.
+        const remaining = max_sends_per_drive -| conn.sends_this_drive;
+        if (remaining == 0) return;
+        const call_cap = @min(max_pending_drain_per_call, remaining);
         var i: usize = 0;
         var drained: usize = 0;
         while (i < conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
+            if (drained >= call_cap) break; // shared per-drive + per-call bound
             const p = &conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
@@ -3544,6 +3582,7 @@ pub const Server = struct {
             if (conn.app_pn == pn_before) return;
             conn.fc_bytes_sent +|= chunk_len;
             drained += 1;
+            conn.sends_this_drive += 1; // shared per-drive budget accounting
             if (conn.ld.sent_count == 0) {
                 p.sent_in_buf += chunk_len;
                 p.offset += chunk_len;
@@ -8452,6 +8491,16 @@ pub const Client = struct {
         return self.conn.pending_stream_send_bytes;
     }
 
+    /// Reset the per-drive STREAM-send budget (`conn.sends_this_drive`). MUST be
+    /// called exactly once at the START of each embedder drive() — before the
+    /// feedPacket recv loop — so every re-entrant credit-update-triggered
+    /// `drainPendingStreamSends` for this drive shares ONE `max_sends_per_drive`
+    /// allotment. Reset per-packet would remove the bound; never resetting would
+    /// stall sends permanently after the first drive. See `max_sends_per_drive`.
+    pub fn resetDriveSendBudget(self: *Client) void {
+        self.conn.sends_this_drive = 0;
+    }
+
     /// Try to put all deferred STREAM bytes on the wire (quinn `poll_transmit`).
     pub fn drainDeferredStreamSends(self: *Client) void {
         self.drainPendingStreamSendsUntilStalled();
@@ -8926,10 +8975,17 @@ pub const Client = struct {
     fn drainPendingStreamSends(self: *Client) void {
         if (self.conn.draining or self.conn.phase != .connected or !self.conn.has_app_keys) return;
         if (self.conn.pending_stream_sends.items.len == 0) return;
+        // Per-drive budget: this re-entrant call may only emit what is left of the
+        // shared `max_sends_per_drive` allotment for the current drive(), capped by
+        // the per-call slice. Without this, each credit-update frame got a fresh
+        // `max_pending_drain_per_call` packets, so one drive sent thousands.
+        const remaining = max_sends_per_drive -| self.conn.sends_this_drive;
+        if (remaining == 0) return;
+        const call_cap = @min(max_pending_drain_per_call, remaining);
         var i: usize = 0;
         var drained: usize = 0;
         while (i < self.conn.pending_stream_sends.items.len) {
-            if (drained >= max_pending_drain_per_call) return; // fairness bound
+            if (drained >= call_cap) break; // shared per-drive + per-call bound
             const p = &self.conn.pending_stream_sends.items[i];
             const unsent = p.data.len - p.sent_in_buf;
             const chunk_len = @min(unsent, max_pending_stream_chunk);
@@ -8991,6 +9047,7 @@ pub const Client = struct {
             self.conn.fc_bytes_sent +|= chunk_len;
             self.conn.note1RttSent();
             drained += 1;
+            self.conn.sends_this_drive += 1; // shared per-drive budget accounting
             // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
             // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
             // allocator's zero-length sentinel slice, which freeing on ack/loss
@@ -12438,6 +12495,11 @@ const RawDrop = struct {
 /// move all queued datagrams client↔server (dropping per `drop`), and run each
 /// side's deferred work (PTO/loss retransmit, pending-send drain, ACK flush).
 fn rawPumpOnce(server: *Server, client: *Client, server_addr: compat.Address, drop: *RawDrop) void {
+    // One pump == one embedder drive() for both legs: reset the per-drive
+    // STREAM-send budgets, mirroring QuicListener.drive / QuicOutbound.drive.
+    // Without this the budget is never replenished and sends stall after 256.
+    server.resetDriveSendBudgets();
+    client.resetDriveSendBudget();
     var pfds = [_]std.posix.pollfd{
         .{ .fd = server.sock, .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd = client.sock, .events = std.posix.POLL.IN, .revents = 0 },
