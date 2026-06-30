@@ -122,6 +122,52 @@ Varint encoding is re-exported from the shared [`zig-varint`](https://github.com
 - **Linux (`-Dshadow=true`):** dynamically linked against glibc with libc-mediated syscalls so the [Shadow simulator](#shadow-simulator--dshadowtrue)'s shim can inject. See [docs/shadow.md](docs/shadow.md).
 - **macOS:** links `libSystem` (Darwin has no stable syscall ABI); source remains pure Zig.
 
+## Logging (`DEBUG_QUIC`)
+
+zquic emits all diagnostics through Zig's standard logging under the **`.zquic`
+scope** (`std.log.scoped(.zquic)`). It never writes to a file or to stderr
+directly — the embedder's `std_options.logFn` decides what is rendered and
+where.
+
+Under sustained load the transport is *intentionally chatty* at `warn`:
+per-stream send backpressure (`pending-stream-send queue full`), congestion/loss
+notices, and connection-lost warnings are normal operational signal during
+catch-up or when a peer stops reading a stream. On a busy node this floods the
+main log, so the recommended convention (mirroring rust-libp2p) is to gate the
+`.zquic` scope behind a **`DEBUG_QUIC`** environment variable — **off by
+default**, with `err` always passing through so genuine failures stay visible:
+
+```zig
+// In your root module:
+pub const std_options: std.Options = .{ .logFn = quicAwareLogFn };
+
+var quic_debug = std.atomic.Value(bool).init(false); // set at startup from env
+
+fn quicAwareLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Gate warn/info/debug for the QUIC scope unless DEBUG_QUIC is set; err
+    // always passes through. (Add `.quic_runtime` etc. if you embed zig-libp2p.)
+    if (scope == .zquic and
+        @intFromEnum(level) >= @intFromEnum(std.log.Level.warn) and
+        !quic_debug.load(.monotonic)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+// At startup:
+if (std.posix.getenv("DEBUG_QUIC")) |v| {
+    if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true")) quic_debug.store(true, .monotonic);
+}
+```
+
+Run with `DEBUG_QUIC=1` (also accepts `true`/`yes`/`on`) to surface the full
+transport log stream when debugging; leave it unset for a quiet main log.
+zeam ships exactly this gate (`quicAwareLogFn` in `pkgs/cli/src/main.zig`),
+covering both `.zquic` and zig-libp2p's `.quic_runtime` family of scopes.
+
 ## Open work
 
 A standing quinn-vs-zquic gap analysis tracks remaining capability deltas:
