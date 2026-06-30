@@ -1037,24 +1037,36 @@ const PendingStreamSend = struct {
 //     cap.  The 4096 path is left as a follow-up once the raw-stream
 //     retx ownership / memory hygiene has been audited.
 const pending_stream_send_cap: usize = 4096;
-const pending_stream_send_bytes_cap: usize = 32 * 1024 * 1024;
+/// Per-connection pending-send byte budget. The gossip reserve is **additive**
+/// on top of the original 32 MB req/resp budget, so this is raised 32 → 40 MB:
+/// priority streams (gossip) get the full 40 MB, non-priority streams (req/resp)
+/// get `40 - pending_priority_reserve_bytes` = 32 MB — i.e. the ORIGINAL budget,
+/// unchanged. See `pending_priority_reserve_bytes` / `pendingBytesCapForStream`.
+const pending_stream_send_bytes_cap: usize = 40 * 1024 * 1024;
 
 /// Per-connection byte headroom reserved for **priority** streams (the embedder
-/// marks the persistent /meshsub gossip stream priority via
-/// `markStreamPriority`).  Non-priority streams (req/resp, e.g. a ~32 MB
-/// `blocks_by_range` sync response) enqueue against the reduced cap
-/// `pending_stream_send_bytes_cap - pending_priority_reserve_bytes`, so they can
-/// fill at most 24 MB of the 32 MB budget — always leaving 8 MB for gossip.
-/// Priority streams enqueue against the full `pending_stream_send_bytes_cap`.
+/// marks the persistent /meshsub gossip stream priority via `markStreamPriority`).
+/// The reserve is ADDITIVE: non-priority streams (req/resp, e.g. a ~32 MB
+/// single-write `blocks_by_range` sync response) keep their original 32 MB
+/// budget — they enqueue against `pending_stream_send_bytes_cap -
+/// pending_priority_reserve_bytes` (= 40 − 8 = 32 MB) — while priority (gossip)
+/// streams enqueue against the full 40 MB cap, so gossip always has 8 MB of
+/// headroom ABOVE a fully-backed-up 32 MB req/resp queue.
 ///
-/// Without this, a single large req/resp response monopolized the whole 32 MB
+/// IMPORTANT: this must NOT lower the non-priority ceiling below the largest
+/// single req/resp write. block-sync responses arrive as ONE
+/// `enqueuePendingStreamSend` call carrying the whole ~32 MB payload (split into
+/// MTU chunks only at drain). A reduced ceiling below 32 MB would make
+/// `0 + 32 MB > cap` true even from an EMPTY queue, so the response could never
+/// enqueue and sync would stall forever. Hence the additive raise to 40 MB
+/// rather than carving the reserve out of the existing 32 MB.
+///
+/// Without the reserve, a single large req/resp response monopolized the whole
 /// per-conn budget (`conn.pending_stream_send_bytes`); the persistent gossip
 /// stream's enqueue then returned false, the embedder's gossip outbox backed up,
 /// and attestations/aggregates were dropped ("persistent gossip bulk outbox cap
 /// (64) hit … dropping oldest") even though the transport itself was healthy
-/// (srtt 4.6-26 ms — pure budget monopolization, not congestion). Reserving
-/// headroom guarantees gossip can always enqueue while req/resp still sends
-/// (just not monopolize).
+/// (srtt 4.6-26 ms — pure budget monopolization, not congestion).
 const pending_priority_reserve_bytes: usize = 8 * 1024 * 1024;
 /// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
@@ -1113,9 +1125,10 @@ const max_sends_per_drive: usize = 2048;
 
 /// Effective per-connection pending-byte cap for `stream_id`.  Priority streams
 /// (the persistent gossip stream, marked by the embedder via `markStreamPriority`)
-/// get the full `pending_stream_send_bytes_cap`; non-priority streams (req/resp)
-/// get the reduced cap so they can never consume the gossip headroom.  See
-/// `pending_priority_reserve_bytes`.
+/// get the full `pending_stream_send_bytes_cap` (40 MB); non-priority streams
+/// (req/resp) get `cap - pending_priority_reserve_bytes` (= 32 MB, the original
+/// budget) so they can never consume the gossip headroom — but still fit a full
+/// ~32 MB single-write block-sync response.  See `pending_priority_reserve_bytes`.
 fn pendingBytesCapForStream(conn: *const ConnState, stream_id: u64) usize {
     if (conn.priority_stream_ids.contains(stream_id)) return pending_stream_send_bytes_cap;
     return pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
@@ -12379,12 +12392,17 @@ test "pending stream send: cap rejects past per-conn entry budget" {
 }
 
 test "pending stream send: priority stream keeps headroom under a full non-priority backlog" {
-    // The monopolization bug: a large req/resp response (non-priority stream)
-    // fills the whole 32 MB per-conn budget, so the persistent gossip stream's
-    // enqueue returns false and attestations are dropped. With the priority
-    // reserve, a non-priority stream can fill at most
-    // `pending_stream_send_bytes_cap - pending_priority_reserve_bytes` (24 MB),
-    // always leaving `pending_priority_reserve_bytes` (8 MB) for gossip.
+    // The reserve is ADDITIVE: non-priority (req/resp) streams keep their full
+    // original 32 MB budget (`cap - reserve`), while the priority (gossip) stream
+    // gets the extra `pending_priority_reserve_bytes` (8 MB) on top, up to the
+    // raised 40 MB `cap`. Two guarantees under test:
+    //   1. A SINGLE ~32 MB non-priority write (block-sync responses arrive as ONE
+    //      enqueue call carrying the whole payload) still succeeds from an empty
+    //      queue. Lowering the non-priority ceiling below 32 MB would make
+    //      `0 + 32 MB > cap` true even when empty → the response could never
+    //      enqueue → sync stalls forever (the regression this guards).
+    //   2. With the non-priority queue saturated at its 32 MB ceiling, a priority
+    //      (gossip) enqueue still succeeds out of the reserved 8 MB headroom.
     const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, a);
@@ -12395,41 +12413,34 @@ test "pending stream send: priority stream keeps headroom under a full non-prior
 
     try conn.priority_stream_ids.put(a, gossip_stream, {});
 
-    // Drive a large non-priority (req/resp) backlog. Contiguous offsets coalesce
-    // into one entry, so this exercises the byte cap, not the entry cap. Use a
-    // 1 MB chunk so we reach the reduced cap in a bounded number of steps.
-    const chunk = try a.alloc(u8, 1024 * 1024);
-    defer a.free(chunk);
-    @memset(chunk, 0xab);
+    const reqresp_cap = pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), reqresp_cap);
 
-    const reduced_cap = pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
-    var offset: u64 = 0;
-    var accepted_bytes: usize = 0;
-    while (true) {
-        const ok = enqueuePendingStreamSend(&conn, a, reqresp_stream, offset, chunk, false);
-        if (!ok) break;
-        offset += chunk.len;
-        accepted_bytes += chunk.len;
-        // Safety bound so a regression can't loop unbounded.
-        try std.testing.expect(accepted_bytes <= reduced_cap);
-    }
-    // The non-priority stream was capped at the reduced budget — it could NOT
-    // consume the reserved gossip headroom.
-    try std.testing.expect(conn.pending_stream_send_bytes <= reduced_cap);
-    try std.testing.expect(conn.pending_stream_send_bytes + chunk.len > reduced_cap);
+    // (1) A single ~32 MB block-sync write goes through in ONE enqueue from an
+    // empty queue. This is the exact shape of a live `blocks_by_range` response
+    // ("1 entries, 33554333 bytes") — the whole payload in one call, split into
+    // MTU chunks only later at drain. Use the full reqresp ceiling to prove the
+    // boundary case fits (not `>`), then the queue is exactly at its ceiling.
+    const big = try a.alloc(u8, reqresp_cap);
+    defer a.free(big);
+    @memset(big, 0xab);
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, reqresp_stream, 0, big, false));
+    try std.testing.expectEqual(reqresp_cap, conn.pending_stream_send_bytes);
 
-    // A further non-priority enqueue is rejected (would exceed the reduced cap)...
-    try std.testing.expect(!enqueuePendingStreamSend(&conn, a, reqresp_stream, offset, chunk, false));
+    // The non-priority queue is now AT its 32 MB ceiling: one more non-priority
+    // byte is rejected (it would exceed `cap - reserve`), so req/resp can never
+    // consume the gossip headroom...
+    try std.testing.expect(!enqueuePendingStreamSend(&conn, a, reqresp_stream, big.len, "x", false));
 
-    // ...but the PRIORITY (gossip) stream still has its reserved headroom: an
-    // enqueue that fits within the full cap succeeds even though the req/resp
-    // backlog has saturated the reduced cap. This is the guarantee — gossip is
-    // never starved by a large req/resp response.
+    // ...yet the PRIORITY (gossip) stream still has its full reserved 8 MB above
+    // the saturated req/resp queue. A 1 MB gossip enqueue succeeds — this is the
+    // guarantee: gossip is never starved by a full req/resp backlog.
     const gossip_chunk = try a.alloc(u8, 1024 * 1024);
     defer a.free(gossip_chunk);
     @memset(gossip_chunk, 0xcd);
     try std.testing.expect(enqueuePendingStreamSend(&conn, a, gossip_stream, 0, gossip_chunk, false));
     try std.testing.expect(conn.pending_stream_send_bytes <= pending_stream_send_bytes_cap);
+    try std.testing.expect(conn.pending_stream_send_bytes > reqresp_cap); // used the reserve
 }
 
 test "pending stream send (owned): false return leaves `owned` to the caller (no double-free)" {
