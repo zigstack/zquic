@@ -1038,6 +1038,24 @@ const PendingStreamSend = struct {
 //     retx ownership / memory hygiene has been audited.
 const pending_stream_send_cap: usize = 4096;
 const pending_stream_send_bytes_cap: usize = 32 * 1024 * 1024;
+
+/// Per-connection byte headroom reserved for **priority** streams (the embedder
+/// marks the persistent /meshsub gossip stream priority via
+/// `markStreamPriority`).  Non-priority streams (req/resp, e.g. a ~32 MB
+/// `blocks_by_range` sync response) enqueue against the reduced cap
+/// `pending_stream_send_bytes_cap - pending_priority_reserve_bytes`, so they can
+/// fill at most 24 MB of the 32 MB budget — always leaving 8 MB for gossip.
+/// Priority streams enqueue against the full `pending_stream_send_bytes_cap`.
+///
+/// Without this, a single large req/resp response monopolized the whole 32 MB
+/// per-conn budget (`conn.pending_stream_send_bytes`); the persistent gossip
+/// stream's enqueue then returned false, the embedder's gossip outbox backed up,
+/// and attestations/aggregates were dropped ("persistent gossip bulk outbox cap
+/// (64) hit … dropping oldest") even though the transport itself was healthy
+/// (srtt 4.6-26 ms — pure budget monopolization, not congestion). Reserving
+/// headroom guarantees gossip can always enqueue while req/resp still sends
+/// (just not monopolize).
+const pending_priority_reserve_bytes: usize = 8 * 1024 * 1024;
 /// Each pending entry must fit in one 1-RTT packet because `drainPendingStreamSends`
 /// emits exactly one STREAM frame per entry and pacer credit is gated per-entry.
 /// Without this cap, the coalesce path used to grow a single entry to tens of KB
@@ -1092,6 +1110,16 @@ const max_pending_drain_per_call: usize = 512;
 // 2048 (~2.4 MB, a few ms of encrypt) lets CC/pacing be the throughput limiter
 // again while a single drive() still stays well under the wall-clock budget.
 const max_sends_per_drive: usize = 2048;
+
+/// Effective per-connection pending-byte cap for `stream_id`.  Priority streams
+/// (the persistent gossip stream, marked by the embedder via `markStreamPriority`)
+/// get the full `pending_stream_send_bytes_cap`; non-priority streams (req/resp)
+/// get the reduced cap so they can never consume the gossip headroom.  See
+/// `pending_priority_reserve_bytes`.
+fn pendingBytesCapForStream(conn: *const ConnState, stream_id: u64) usize {
+    if (conn.priority_stream_ids.contains(stream_id)) return pending_stream_send_bytes_cap;
+    return pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
+}
 
 /// Enqueue bytes that exceeded flow control.  Duplicates `data` onto the
 /// heap (caller's slice typically points into a transient frame buffer).
@@ -1164,7 +1192,7 @@ fn enqueuePendingStreamSend(
         if (last.stream_id == stream_id and
             last.offset +| (last.data.len - last.sent_in_buf) == offset and !last.fin)
         {
-            if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
+            if (conn.pending_stream_send_bytes +| data.len > pendingBytesCapForStream(conn, stream_id)) return false;
             const new_len = last.data.len + data.len;
             const grown = allocator.realloc(last.data, new_len) catch return false;
             @memcpy(grown[last.data.len..][0..data.len], data);
@@ -1175,7 +1203,7 @@ fn enqueuePendingStreamSend(
         }
     }
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) return false;
-    if (conn.pending_stream_send_bytes +| data.len > pending_stream_send_bytes_cap) return false;
+    if (conn.pending_stream_send_bytes +| data.len > pendingBytesCapForStream(conn, stream_id)) return false;
     const dup = allocator.dupe(u8, data) catch return false;
     conn.pending_stream_sends.append(allocator, .{
         .stream_id = stream_id,
@@ -1235,7 +1263,7 @@ fn enqueuePendingStreamSendOwned(
             // (in practice we never reach that because the for-loop
             // already returns true for any duplicate).
             if (owned.ptr != last.data.ptr) {
-                if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+                if (conn.pending_stream_send_bytes +| owned.len > pendingBytesCapForStream(conn, stream_id)) {
                     return false; // caller owns `owned` on false (not consumed)
                 }
                 const new_len = last.data.len + owned.len;
@@ -1254,7 +1282,7 @@ fn enqueuePendingStreamSendOwned(
     if (conn.pending_stream_sends.items.len >= pending_stream_send_cap) {
         return false; // caller owns `owned` on false (not consumed)
     }
-    if (conn.pending_stream_send_bytes +| owned.len > pending_stream_send_bytes_cap) {
+    if (conn.pending_stream_send_bytes +| owned.len > pendingBytesCapForStream(conn, stream_id)) {
         return false; // caller owns `owned` on false (not consumed)
     }
     conn.pending_stream_sends.append(allocator, .{
@@ -2090,6 +2118,14 @@ pub const ConnState = struct {
     /// falls back to the §18.2 initial limit for that stream, which only causes
     /// us to be over-conservative on send — never to violate the peer's window.
     per_stream_send_max: std.AutoHashMapUnmanaged(u64, PeerStreamSendMaxEntry) = .empty,
+    /// Stream IDs the embedder marked **priority** via `markStreamPriority`
+    /// (the persistent /meshsub gossip stream).  Priority streams enqueue
+    /// pending bytes against the full `pending_stream_send_bytes_cap`;
+    /// non-priority streams (req/resp) enqueue against the reduced cap so a
+    /// large response can never consume the gossip headroom. See
+    /// `pending_priority_reserve_bytes` / `pendingBytesCapForStream`. Set is
+    /// tiny (one persistent stream per conn); cleared on conn reset/reap.
+    priority_stream_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -3291,6 +3327,23 @@ pub const Server = struct {
         fin: bool,
     ) usize {
         return self.sendRawStreamDataInner(conn, stream_id, offset, data, fin, null);
+    }
+
+    /// Mark `stream_id` as a **priority** stream on `conn`: its pending-send
+    /// bytes enqueue against the full per-connection budget, while non-priority
+    /// streams are held to a reduced cap that reserves headroom for it. The
+    /// embedder marks the persistent /meshsub gossip stream so a large req/resp
+    /// response (e.g. `blocks_by_range`) can never starve gossip. Idempotent;
+    /// silently no-ops on OOM (the stream then simply shares the reduced cap —
+    /// degraded fairness, never a crash). Cleared automatically on conn reset.
+    pub fn markStreamPriority(self: *Server, conn: *ConnState, stream_id: u64) void {
+        conn.priority_stream_ids.put(self.allocator, stream_id, {}) catch {};
+    }
+
+    /// Remove a stream's priority marking (e.g. when the persistent gossip
+    /// stream is torn down and reopened with a new id). Safe if absent.
+    pub fn unmarkStreamPriority(_: *Server, conn: *ConnState, stream_id: u64) void {
+        _ = conn.priority_stream_ids.remove(stream_id);
     }
 
     /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
@@ -7976,6 +8029,8 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     conn.per_stream_send_max = .empty;
     conn.per_stream_recv.deinit(allocator);
     conn.per_stream_recv = .empty;
+    conn.priority_stream_ids.deinit(allocator);
+    conn.priority_stream_ids = .empty;
     // Free any retransmit buffers attached to in-flight LD entries so the
     // raw_application_streams send-side doesn't leak when a connection is
     // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
@@ -8598,6 +8653,20 @@ pub const Client = struct {
         fin: bool,
     ) usize {
         return self.sendRawStreamDataInner(stream_id, offset, data, fin, null);
+    }
+
+    /// Mark `stream_id` as a **priority** stream: its pending-send bytes enqueue
+    /// against the full per-connection budget, while non-priority streams are
+    /// held to a reduced cap that reserves headroom for it. The embedder marks
+    /// the persistent /meshsub gossip stream so a large req/resp response can
+    /// never starve gossip. Idempotent; no-ops on OOM. See `Server.markStreamPriority`.
+    pub fn markStreamPriority(self: *Client, stream_id: u64) void {
+        self.conn.priority_stream_ids.put(self.allocator, stream_id, {}) catch {};
+    }
+
+    /// Remove a stream's priority marking. Safe if absent.
+    pub fn unmarkStreamPriority(self: *Client, stream_id: u64) void {
+        _ = self.conn.priority_stream_ids.remove(stream_id);
     }
 
     /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
@@ -12307,6 +12376,60 @@ test "pending stream send: cap rejects past per-conn entry budget" {
     // draining so the embedder reconnects (silently dropping would
     // corrupt the stream offset).
     try std.testing.expect(!enqueuePendingStreamSend(&conn, std.testing.allocator, 4, @intCast(i * 2), "x", false));
+}
+
+test "pending stream send: priority stream keeps headroom under a full non-priority backlog" {
+    // The monopolization bug: a large req/resp response (non-priority stream)
+    // fills the whole 32 MB per-conn budget, so the persistent gossip stream's
+    // enqueue returns false and attestations are dropped. With the priority
+    // reserve, a non-priority stream can fill at most
+    // `pending_stream_send_bytes_cap - pending_priority_reserve_bytes` (24 MB),
+    // always leaving `pending_priority_reserve_bytes` (8 MB) for gossip.
+    const a = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer freePendingStreamSends(&conn, a);
+    defer conn.priority_stream_ids.deinit(a);
+
+    const gossip_stream: u64 = 4; // marked priority below
+    const reqresp_stream: u64 = 8; // bulk blocks_by_range response
+
+    try conn.priority_stream_ids.put(a, gossip_stream, {});
+
+    // Drive a large non-priority (req/resp) backlog. Contiguous offsets coalesce
+    // into one entry, so this exercises the byte cap, not the entry cap. Use a
+    // 1 MB chunk so we reach the reduced cap in a bounded number of steps.
+    const chunk = try a.alloc(u8, 1024 * 1024);
+    defer a.free(chunk);
+    @memset(chunk, 0xab);
+
+    const reduced_cap = pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
+    var offset: u64 = 0;
+    var accepted_bytes: usize = 0;
+    while (true) {
+        const ok = enqueuePendingStreamSend(&conn, a, reqresp_stream, offset, chunk, false);
+        if (!ok) break;
+        offset += chunk.len;
+        accepted_bytes += chunk.len;
+        // Safety bound so a regression can't loop unbounded.
+        try std.testing.expect(accepted_bytes <= reduced_cap);
+    }
+    // The non-priority stream was capped at the reduced budget — it could NOT
+    // consume the reserved gossip headroom.
+    try std.testing.expect(conn.pending_stream_send_bytes <= reduced_cap);
+    try std.testing.expect(conn.pending_stream_send_bytes + chunk.len > reduced_cap);
+
+    // A further non-priority enqueue is rejected (would exceed the reduced cap)...
+    try std.testing.expect(!enqueuePendingStreamSend(&conn, a, reqresp_stream, offset, chunk, false));
+
+    // ...but the PRIORITY (gossip) stream still has its reserved headroom: an
+    // enqueue that fits within the full cap succeeds even though the req/resp
+    // backlog has saturated the reduced cap. This is the guarantee — gossip is
+    // never starved by a large req/resp response.
+    const gossip_chunk = try a.alloc(u8, 1024 * 1024);
+    defer a.free(gossip_chunk);
+    @memset(gossip_chunk, 0xcd);
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, gossip_stream, 0, gossip_chunk, false));
+    try std.testing.expect(conn.pending_stream_send_bytes <= pending_stream_send_bytes_cap);
 }
 
 test "pending stream send (owned): false return leaves `owned` to the caller (no double-free)" {
