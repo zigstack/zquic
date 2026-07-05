@@ -1,7 +1,7 @@
 .{
     .name = .zquic,
     .fingerprint = 0x947d823dd45c34db,
-    .version = "1.7.67",
+    .version = "1.7.68",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zig_varint = .{

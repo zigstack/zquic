@@ -44,6 +44,14 @@ pub const StopSending = struct {
         const code = try r.readVarint();
         return .{ .frame = .{ .stream_id = sid, .application_protocol_error_code = code }, .consumed = r.pos };
     }
+
+    pub fn serialize(self: StopSending, buf: []u8) (varint.EncodeError || varint.DecodeError)!usize {
+        var w = varint.Writer.init(buf);
+        try w.writeVarint(0x05);
+        try w.writeVarint(self.stream_id);
+        try w.writeVarint(self.application_protocol_error_code);
+        return w.pos;
+    }
 };
 
 pub const NewToken = struct {

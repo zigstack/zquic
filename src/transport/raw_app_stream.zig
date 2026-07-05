@@ -43,6 +43,10 @@ pub const RawAppStreamSlot = struct {
     /// Final stream size, recorded from the FIN frame (`offset + len`). Only
     /// meaningful once `fin_received` is true.
     fin_offset: u64 = 0,
+    /// True once the peer reset this stream with a RESET_STREAM frame
+    /// (RFC 9000 §19.4); `reset_error_code` carries the app error code.
+    reset_received: bool = false,
+    reset_error_code: u64 = 0,
 
     /// True only when the peer has FIN'd **and** all bytes up to the final
     /// size have been contiguously reassembled into `buf`. This is the signal
