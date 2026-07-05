@@ -9584,6 +9584,13 @@ pub const Client = struct {
         self.conn.app_stream_chunk = pm.app_stream_chunk;
         self.conn.plpmtu = path_mtu_mod.PlPmtuState.init(pm.max_udp_payload);
         self.conn.init_keys = InitialSecrets.derive(dcid.slice());
+        // Re-allocate the loss detector: the fresh ConnState above reset `ld` to
+        // its empty default (its heap `sent` ring was freed by the
+        // `freeConnStateRawAppBuffers` call above), so the second connection would
+        // index a zero-length `sent` buffer on its first packet — the
+        // resumption/0-RTT reconnect panic. Mirrors the `LossDetector.init` in
+        // `initInPlace`.
+        self.conn.ld = try recovery.LossDetector.init(self.allocator);
 
         // Fresh TLS handshake state.
         self.tls = ClientHandshake.init();
@@ -13927,4 +13934,28 @@ test "raw-app credit invariant: MAX_DATA applies even when same-packet STREAM by
 
     // (b) The MAX_DATA credit was applied in the SAME drive despite the deferral.
     try std.testing.expectEqual(new_max_data, conn.fc_send_max);
+}
+
+test "resetForReconnect re-allocates the loss detector (resumption/0-RTT reconnect panic)" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    try Client.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = 4433,
+        .urls = &.{},
+    }, client);
+    defer client.deinit();
+
+    // The initial connection allocates the loss-detector `sent` ring.
+    try std.testing.expect(client.conn.ld.sent.len > 0);
+
+    // The resumption / 0-RTT second connection reconnects to the same server.
+    // Before the fix this left `conn.ld.sent` empty (len 0), so the first packet
+    // sent on the new connection panicked with an index-out-of-bounds in
+    // `recovery.onPacketSent`. The ring must be re-allocated.
+    const server_addr = try compat.Address.parseIp4("127.0.0.1", 4433);
+    try client.resetForReconnect(server_addr);
+    try std.testing.expect(client.conn.ld.sent.len > 0);
 }
