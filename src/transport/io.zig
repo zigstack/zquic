@@ -5916,6 +5916,7 @@ pub const Server = struct {
                 // send- and receive-window slots are dead weight once reset.
                 conn.clearPeerStreamSendMax(r.frame.stream_id);
                 conn.clearStreamRecv(r.frame.stream_id);
+                markRawAppStreamReset(&conn.raw_app_streams, r.frame.stream_id, r.frame.application_protocol_error_code);
                 continue;
             }
             if (ft == 0x05) {
@@ -6142,6 +6143,27 @@ pub const Server = struct {
         // serialize() writes the type byte (0x04) + fields.
         const frame_len = frame.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], dst);
+    }
+
+    /// Abort a raw-app send stream: send RESET_STREAM (RFC 9000 §19.4) with
+    /// `error_code` and free the local send slot. Embedder-facing counterpart
+    /// of `openRawAppStream` / `sendRawStreamData`.
+    pub fn resetRawAppStream(self: *Server, conn: *ConnState, stream_id: u64, error_code: u64) void {
+        self.sendResetStream(conn, stream_id, error_code, conn.peer);
+        conn.clearPeerStreamSendMax(stream_id);
+        _ = releaseRawAppStream(conn, stream_id, self.allocator);
+    }
+
+    /// Ask the peer to stop sending on `stream_id` (STOP_SENDING, RFC 9000
+    /// §19.5). The peer replies with RESET_STREAM.
+    pub fn stopSendingRawAppStream(self: *Server, conn: *ConnState, stream_id: u64, error_code: u64) void {
+        const frame = transport_frames.StopSending{
+            .stream_id = stream_id,
+            .application_protocol_error_code = error_code,
+        };
+        var frame_buf: [24]u8 = undefined;
+        const frame_len = frame.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
     }
 
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
@@ -8171,6 +8193,35 @@ pub fn rawAppRecvBuffer(conn: *ConnState, stream_id: u64) ?[]const u8 {
     return null;
 }
 
+/// Mark a raw-app stream as reset by the peer (called from the RESET_STREAM
+/// handlers on both roles — the server receives on `conn.raw_app_streams`, the
+/// client on `Client.raw_app_recv`). No-op if no active slot matches.
+fn markRawAppStreamReset(slots: []RawAppStreamSlot, stream_id: u64, error_code: u64) void {
+    for (slots) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) {
+            slot.reset_received = true;
+            slot.reset_error_code = error_code;
+            return;
+        }
+    }
+}
+
+fn rawAppSlotsResetReceived(slots: []const RawAppStreamSlot, stream_id: u64) ?u64 {
+    for (slots) |*slot| {
+        if (slot.active and slot.stream_id == stream_id and slot.reset_received) {
+            return slot.reset_error_code;
+        }
+    }
+    return null;
+}
+
+/// If the peer reset `stream_id` (RESET_STREAM), returns its application error
+/// code; otherwise null. Mirrors the read side of Go transport
+/// `StreamResetError{Code}`. Server-side (streams received on the connection).
+pub fn rawAppStreamResetReceived(conn: *const ConnState, stream_id: u64) ?u64 {
+    return rawAppSlotsResetReceived(&conn.raw_app_streams, stream_id);
+}
+
 /// True when the peer has sent FIN on `stream_id` (one of the slots holds it
 /// and `fin_received` is set).  Embedders driving the libp2p
 /// per-message-stream pattern should call this after consuming the payload
@@ -9458,6 +9509,36 @@ pub const Client = struct {
             }
         }
         return null;
+    }
+
+    /// Abort a raw-app send stream: send RESET_STREAM (RFC 9000 §19.4).
+    pub fn resetRawAppStream(self: *Client, stream_id: u64, error_code: u64) void {
+        const frame = transport_frames.ResetStream{
+            .stream_id = stream_id,
+            .application_protocol_error_code = error_code,
+            .final_size = 0,
+        };
+        var frame_buf: [32]u8 = undefined;
+        const frame_len = frame.serialize(&frame_buf) catch return;
+        _ = self.sendClient1Rtt(frame_buf[0..frame_len]);
+        self.conn.clearPeerStreamSendMax(stream_id);
+    }
+
+    /// Ask the peer to stop sending on `stream_id` (STOP_SENDING, RFC 9000 §19.5).
+    pub fn stopSendingRawAppStream(self: *Client, stream_id: u64, error_code: u64) void {
+        const frame = transport_frames.StopSending{
+            .stream_id = stream_id,
+            .application_protocol_error_code = error_code,
+        };
+        var frame_buf: [24]u8 = undefined;
+        const frame_len = frame.serialize(&frame_buf) catch return;
+        _ = self.sendClient1Rtt(frame_buf[0..frame_len]);
+    }
+
+    /// If the peer reset `stream_id` we were receiving, returns its app error
+    /// code; otherwise null (see `io.rawAppStreamResetReceived` for the server).
+    pub fn rawAppStreamResetReceived(self: *const Client, stream_id: u64) ?u64 {
+        return rawAppSlotsResetReceived(&self.raw_app_recv, stream_id);
     }
 
     /// Mirror of the connection-level `rawAppStreamFinReceived`.
@@ -10863,6 +10944,7 @@ pub const Client = struct {
                 // per-stream send- and receive-window slots for this id.
                 self.conn.clearPeerStreamSendMax(r.frame.stream_id);
                 self.conn.clearStreamRecv(r.frame.stream_id);
+                markRawAppStreamReset(&self.raw_app_recv, r.frame.stream_id, r.frame.application_protocol_error_code);
                 continue;
             }
             if (ft == 0x05) {
@@ -14042,4 +14124,48 @@ test "resetForReconnect re-allocates the loss detector (resumption/0-RTT reconne
     const server_addr = try compat.Address.parseIp4("127.0.0.1", 4433);
     try client.resetForReconnect(server_addr);
     try std.testing.expect(client.conn.ld.sent.len > 0);
+}
+
+test "resetRawAppStream: server resets a stream, client observes RESET_STREAM code (#40)" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    // Send a chunk (no FIN) so the client allocates a recv slot for `sid`.
+    const payload = "hello-then-reset";
+    var drop = RawDrop{};
+    _ = lb.server.sendRawStreamData(conn, sid, 0, payload, false);
+    var delivered = false;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppRecvBuffer(sid)) |b| {
+            if (b.len == payload.len) {
+                delivered = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(delivered);
+    try std.testing.expect(lb.client.rawAppStreamResetReceived(sid) == null); // not reset yet
+
+    // Reset the stream with application error code 42.
+    lb.server.resetRawAppStream(conn, sid, 42);
+    var seen_code: ?u64 = null;
+    i = 0;
+    while (i < 400) : (i += 1) {
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppStreamResetReceived(sid)) |code| {
+            seen_code = code;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(?u64, 42), seen_code);
 }
