@@ -3020,6 +3020,14 @@ pub const ServerConfig = struct {
     preferred_address: ?quic_tls_mod.PreferredAddressTp = null,
     /// QUIC transport-parameter profile advertised during the TLS handshake.
     transport_params_preset: quic_tls_mod.TransportParamsPreset = .default,
+    /// Override the advertised `initial_max_streams_bidi` (RFC 9000 §18.2, TP
+    /// 0x08) and the matching receive-side accounting for peer-initiated bidi
+    /// streams. `null` keeps the `transport_params_preset` value (1000 for
+    /// `default`). Raise this for workloads that open many concurrent streams.
+    max_incoming_streams: ?u64 = null,
+    /// Same as `max_incoming_streams` for unidirectional streams
+    /// (`initial_max_streams_uni`, TP 0x09).
+    max_incoming_uni_streams: ?u64 = null,
     /// RFC 9221: max DATAGRAM frame size to advertise (0 = use HTTP/3 default).
     max_datagram_frame_size: u64 = 0,
     /// RFC 9220: SETTINGS_ENABLE_CONNECT_PROTOCOL on the HTTP/3 control stream.
@@ -4667,6 +4675,17 @@ pub const Server = struct {
         const datagram_tp = configMaxDatagramFrameSize(self.config.http3, self.config.max_datagram_frame_size);
         tp_opts.max_datagram_frame_size = datagram_tp;
         conn.local_max_datagram_frame_size = datagram_tp;
+        // Optional per-server override of the advertised incoming-stream limits.
+        // Also raise our own receive-side accounting so we actually accept the
+        // number of peer-initiated streams we advertised.
+        if (self.config.max_incoming_streams) |n| {
+            tp_opts.initial_max_streams_bidi = n;
+            conn.max_streams_bidi_recv = n;
+        }
+        if (self.config.max_incoming_uni_streams) |n| {
+            tp_opts.initial_max_streams_uni = n;
+            conn.max_streams_uni_recv = n;
+        }
         // Mirror the windows we are about to advertise so our MAX_DATA /
         // MAX_STREAM_DATA extension thresholds match what the peer will obey.
         conn.seedLocalRecvWindows(self.config.transport_params_preset);
@@ -12895,6 +12914,71 @@ test "raw-app server-initiated bidi: client receives multi-frame payload in orde
     try std.testing.expect(lb.client.releaseRawAppStream(sid));
     try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
     try std.testing.expect(!lb.client.releaseRawAppStream(sid)); // idempotent
+}
+
+test "ServerConfig.max_incoming_streams raises the advertised stream limits (#65)" {
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const server_sock = try compat.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+    const bind_addr = try compat.Address.parseIp4("127.0.0.1", 0);
+    compat.bind(server_sock, &bind_addr.any, bind_addr.getOsSockLen()) catch |e| {
+        compat.close(server_sock);
+        return e;
+    };
+    var sa: std.posix.sockaddr.storage = undefined;
+    var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
+    if (std.posix.errno(std.posix.system.getsockname(server_sock, @ptrCast(&sa), &sl)) != .SUCCESS) {
+        compat.close(server_sock);
+        return error.GetSockNameFailed;
+    }
+    const server_port = rawAddrFromStorage(&sa).getPort();
+    const server_addr = try compat.Address.parseIp4("127.0.0.1", server_port);
+
+    const server = Server.initFromSocket(allocator, .{
+        .cert_pem = raw_app_test_cert,
+        .key_pem = raw_app_test_key,
+        .raw_application_streams = true,
+        .alpn = "raw-app-test",
+        // The knob under test: advertise more than the `default` preset's 1000.
+        .max_incoming_streams = 16_384,
+        .max_incoming_uni_streams = 8_192,
+    }, server_sock, true) catch |e| {
+        compat.close(server_sock);
+        return e;
+    };
+    defer server.deinit();
+
+    try Client.initInPlace(allocator, .{
+        .host = "127.0.0.1",
+        .port = server_port,
+        .raw_application_streams = true,
+        .alpn = "raw-app-test",
+        .urls = &.{},
+    }, client);
+    defer client.deinit();
+
+    client.conn.peer = server_addr;
+    try client.sendClientHello(server_addr);
+
+    var drop = RawDrop{};
+    var connected = false;
+    const deadline = compat.milliTimestamp() + 5_000;
+    while (compat.milliTimestamp() < deadline) {
+        rawPumpOnce(server, client, server_addr, &drop);
+        if (client.conn.phase == .connected and rawServerConnectedConn(server) != null) {
+            connected = true;
+            break;
+        }
+    }
+    try std.testing.expect(connected);
+
+    // The client parsed the server's transport parameters, so its view of how
+    // many streams the server permits it to open reflects the config override
+    // (would be 1000 without it).
+    try std.testing.expectEqual(@as(u64, 16_384), client.conn.peer_max_bidi_streams);
+    try std.testing.expectEqual(@as(u64, 8_192), client.conn.peer_max_uni_streams);
 }
 
 test "raw-app recv delivery budget: large response paces across drives, arrives complete, never starves credit" {
