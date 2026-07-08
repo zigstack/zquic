@@ -484,6 +484,38 @@ pub fn buildInitialPacket(
     );
 }
 
+/// Build an ack-eliciting Initial PTO probe (a single PING frame) into `out`,
+/// expanded with PADDING frames to >= `types.min_initial_mtu` (1200 B).
+///
+/// RFC 9000 §14.1 requires BOTH client and server to pad every UDP datagram
+/// carrying an ack-eliciting Initial to >= 1200 bytes. RFC-strict peers (e.g.
+/// ngtcp2/lantern) SILENTLY DISCARD undersized Initials, so an unpadded probe
+/// makes Initial-space loss recovery impossible and stalls the handshake
+/// (observed as a storm of ~32-byte Initials with no response). Both the
+/// client and server PTO-probe paths route through here so neither can regress.
+/// Returns the built packet length.
+pub fn buildPaddedInitialPtoProbe(
+    out: []u8,
+    dcid: ConnectionId,
+    scid: ConnectionId,
+    token: []const u8,
+    pn: u64,
+    km: *const KeyMaterial,
+    version: u32,
+) !usize {
+    // Pad the payload to `min_initial_mtu` up-front: a PING frame followed by
+    // PADDING. A bare 1-byte PING payload is too short for header-protection
+    // sampling (buildInitialPacket returns error.BufferTooSmall) — which is
+    // why the pre-fix probe silently failed to send at all — and even if built
+    // would violate the RFC 9000 §14.1 >= 1200-byte datagram minimum. Building
+    // with a 1200-byte payload clears both in a single pass; the resulting
+    // datagram is >= 1200 bytes (min_initial_mtu payload + header/tag overhead).
+    var frame_buf: [types.min_initial_mtu]u8 = undefined;
+    frame_buf[0] = 0x01; // PING frame
+    buildPaddingFrames(frame_buf[1..], frame_buf.len - 1); // rest = PADDING (0x00)
+    return buildInitialPacket(out, dcid, scid, token, frame_buf[0..], pn, km, version);
+}
+
 /// Build a Handshake packet with the given payload.
 /// `version` selects QUIC v1 or v2.
 pub fn buildHandshakePacket(
@@ -3058,6 +3090,21 @@ fn statelessResetTriggerEligible(trigger_len: usize) bool {
     return trigger_len >= stateless_reset_min_trigger_len;
 }
 
+/// Effective qlog output directory: explicit config wins, else the
+/// `ZQUIC_QLOG_DIR` env var (diagnostic aid for local interop repros — lets
+/// an embedder that doesn't plumb `qlog_dir` still capture per-connection
+/// `.sqlog` traces). Returned slice points into the process environment and
+/// is stable for the process lifetime.
+fn effectiveQlogDir(cfg_qlog: ?[]const u8) ?[]const u8 {
+    if (cfg_qlog) |q| return q;
+    // std.posix.getenv / std.os.environ were removed/moved in Zig 0.16; use
+    // libc getenv where available (zeam's build links libc). Comptime-guarded
+    // so libc-free artifacts (zquic example exes) still compile.
+    if (!@import("builtin").link_libc) return null;
+    const raw = std.c.getenv("ZQUIC_QLOG_DIR") orelse return null;
+    return std.mem.span(raw);
+}
+
 // ── QUIC Server ───────────────────────────────────────────────────────────────
 
 pub const Server = struct {
@@ -4069,7 +4116,7 @@ pub const Server = struct {
                 }
                 conn.deriveInitialKeys(dcid);
                 // Open qlog file named after the original destination CID (ODCID).
-                if (self.config.qlog_dir) |qd| {
+                if (effectiveQlogDir(self.config.qlog_dir)) |qd| {
                     conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "server");
                     var peer_buf: [64]u8 = undefined;
                     const peer_str = std.fmt.bufPrint(&peer_buf, "{any}", .{peer}) catch "?";
@@ -6532,15 +6579,15 @@ pub const Server = struct {
 
     fn sendInitialPtoProbe(self: *Server, conn: *ConnState, dst: compat.Address) bool {
         const init_km = conn.init_keys orelse return false;
-        var send_buf: [256]u8 = undefined;
-        const ping = [_]u8{0x01};
+        var send_buf: [1500]u8 = undefined;
         const init_pn_sent = conn.init_pn;
-        const pkt_len = buildInitialPacket(
+        // RFC 9000 §14.1: pad the Initial probe datagram to >= 1200 bytes
+        // (see buildPaddedInitialPtoProbe). Servers send no token in Initials.
+        const pkt_len = buildPaddedInitialPtoProbe(
             &send_buf,
             conn.remote_cid,
             conn.local_cid,
             &.{},
-            &ping,
             init_pn_sent,
             &init_km.server,
             conn.quicVersion(),
@@ -8456,7 +8503,7 @@ pub const Client = struct {
             // a server Initial that uses QUIC v2 (compatible version negotiation).
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
         }
-        if (config.qlog_dir) |qd| {
+        if (effectiveQlogDir(config.qlog_dir)) |qd| {
             conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "client");
             var dst_buf: [64]u8 = undefined;
             const dst_str = std.fmt.bufPrint(&dst_buf, "{s}:{}", .{ config.host, config.port }) catch "?";
@@ -9387,15 +9434,16 @@ pub const Client = struct {
 
     fn sendClientInitialPtoProbe(self: *Client) bool {
         const init_km = self.conn.init_keys orelse return false;
-        var send_buf: [256]u8 = undefined;
-        const ping = [_]u8{0x01};
+        var send_buf: [1500]u8 = undefined;
         const init_pn_sent = self.conn.init_pn;
-        const pkt_len = buildInitialPacket(
+        // RFC 9000 §14.1: pad the Initial probe datagram to >= 1200 bytes
+        // (see buildPaddedInitialPtoProbe). Carry the Retry token if issued.
+        const token = self.conn.retry_token[0..self.conn.retry_token_len];
+        const pkt_len = buildPaddedInitialPtoProbe(
             &send_buf,
             self.conn.remote_cid,
             self.conn.local_cid,
-            &.{},
-            &ping,
+            token,
             init_pn_sent,
             &init_km.client,
             self.conn.quicVersion(),
@@ -12243,6 +12291,21 @@ test "io PEM: ServerConfig with both nil falls back to path loader" {
     else
         loadCertDer(a, config.cert_path);
     try std.testing.expectError(error.FileNotFound, r);
+}
+
+test "Initial PTO probe is padded to >= min_initial_mtu (RFC 9000 §14.1)" {
+    // A single-PING Initial probe must be expanded to >= 1200 B, else
+    // RFC-strict peers (ngtcp2/lantern) SILENTLY DISCARD it and Initial-space
+    // loss recovery becomes impossible — the zeam↔lantern dial-timeout bug.
+    // Both client and server probe builds route through the shared helper.
+    const dcid = try ConnectionId.fromSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 });
+    const scid = try ConnectionId.fromSlice(&[_]u8{ 0x11, 0x12, 0x13, 0x14 });
+    const secrets = InitialSecrets.derive(dcid.slice());
+    var out: [1500]u8 = undefined;
+    const client_len = try buildPaddedInitialPtoProbe(&out, dcid, scid, &.{}, 0, &secrets.client, QUIC_VERSION_1);
+    try std.testing.expect(client_len >= types.min_initial_mtu);
+    const server_len = try buildPaddedInitialPtoProbe(&out, dcid, scid, &.{}, 0, &secrets.server, QUIC_VERSION_1);
+    try std.testing.expect(server_len >= types.min_initial_mtu);
 }
 
 // ── Per-stream send-window tests (RFC 9000 §19.10) ────────────────────────────
