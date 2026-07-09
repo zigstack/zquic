@@ -4572,10 +4572,28 @@ pub const Server = struct {
     fn handleInitialCrypto(
         self: *Server,
         conn: *ConnState,
-        data: []const u8,
-        offset: u64,
+        data_in: []const u8,
+        offset_in: u64,
         src: compat.Address,
     ) void {
+        // Normalize the segment against the contiguity frontier before the
+        // in-order check. A peer that fragments the ClientHello into many small
+        // CRYPTO frames (ngtcp2 / c-lean-libp2p / lantern) retransmits with
+        // DIFFERENT fragment boundaries each round, so a retransmitted frame
+        // frequently straddles the frontier: drop the fully-consumed duplicate
+        // and trim the already-received prefix of a straddling frame so its
+        // fresh tail is delivered in-order instead of being parked as
+        // "out-of-order" until a boundary-aligned retransmit happens to arrive
+        // (which stalled reassembly for several round trips).
+        var data = data_in;
+        var offset = offset_in;
+        if (offset + data.len <= conn.init_crypto_offset) return; // pure duplicate
+        if (offset < conn.init_crypto_offset) {
+            const skip: usize = @intCast(conn.init_crypto_offset - offset);
+            data = data[skip..];
+            offset = conn.init_crypto_offset;
+        }
+
         // In-order reassembly with reorder buffering (RFC 9001 §4.1.3).
         // If data arrives out-of-order, buffer it and wait for the missing prefix.
         if (offset != conn.init_crypto_offset) {

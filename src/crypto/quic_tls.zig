@@ -849,14 +849,33 @@ pub const CryptoReorderBuf = struct {
         @memcpy(self.slots[oldest].data[0..data.len], data);
     }
 
-    /// If a segment starting at `next_offset` is buffered, copy it into `out`
-    /// (up to `out.len` bytes) and free the slot.  Returns the segment length,
-    /// or 0 if no matching segment is found.
+    /// Return the buffered bytes that continue the contiguous stream at
+    /// `next_offset`, copy them into `out`, and free the slot.  Returns the
+    /// number of bytes, or 0 if nothing extends the stream.
+    ///
+    /// Overlap-aware: a slot whose range merely *covers* `next_offset`
+    /// (`slot.offset <= next_offset < slot.offset + slot.len`) yields its tail
+    /// from `next_offset` onward.  Peers that fragment a handshake message into
+    /// many small CRYPTO frames (ngtcp2 / c-lean-libp2p) retransmit with
+    /// DIFFERENT boundaries each round, so the contiguity frontier frequently
+    /// lands mid-slot; an exact-offset match would leave those bytes
+    /// unreachable until a boundary-aligned retransmit happened to arrive,
+    /// stalling reassembly for several round trips.  Fully-consumed slots
+    /// (`offset + len <= next_offset`) are freed in passing.
     pub fn take(self: *CryptoReorderBuf, next_offset: u64, out: []u8) usize {
         for (&self.slots) |*slot| {
-            if (slot.used and slot.offset == next_offset) {
-                const n = @min(slot.len, out.len);
-                @memcpy(out[0..n], slot.data[0..n]);
+            if (!slot.used) continue;
+            const end = slot.offset + slot.len;
+            if (end <= next_offset) {
+                // Entirely below the frontier — a stale duplicate. Reclaim it.
+                slot.used = false;
+                continue;
+            }
+            if (slot.offset <= next_offset) {
+                const skip: usize = @intCast(next_offset - slot.offset);
+                const avail = slot.len - skip;
+                const n = @min(avail, out.len);
+                @memcpy(out[0..n], slot.data[skip..][0..n]);
                 slot.used = false;
                 return n;
             }
@@ -954,6 +973,38 @@ test "crypto_reorder_buf: drain sequence" {
 
     try testing.expectEqual(@as(u64, 10), expected_offset);
     try testing.expectEqual(@as(usize, 0), rb.take(expected_offset, &out));
+}
+
+test "crypto_reorder_buf: take yields tail of a straddling slot" {
+    const testing = std.testing;
+    var rb = CryptoReorderBuf{};
+
+    // A frame covering [0,10) is buffered while the frontier is already at 4
+    // (a coarser earlier fragment delivered [0,4)). take must return the tail
+    // [4,10) rather than nothing, so a peer that retransmits with different
+    // fragment boundaries doesn't stall the stream.
+    rb.insert(0, "0123456789");
+    var out: [32]u8 = undefined;
+    const n = rb.take(4, &out);
+    try testing.expectEqual(@as(usize, 6), n);
+    try testing.expectEqualSlices(u8, "456789", out[0..n]);
+    // Slot consumed.
+    try testing.expectEqual(@as(usize, 0), rb.take(10, &out));
+}
+
+test "crypto_reorder_buf: take reclaims fully-consumed stale slots" {
+    const testing = std.testing;
+    var rb = CryptoReorderBuf{};
+
+    // Stale duplicate entirely below the frontier: must be freed, not matched.
+    rb.insert(0, "abc"); // [0,3), frontier already past it
+    var out: [32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), rb.take(3, &out));
+    // The slot was reclaimed, so a genuine future segment can now be taken.
+    rb.insert(3, "def");
+    const n = rb.take(3, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u8, "def", out[0..n]);
 }
 
 test "crypto_stream: out-of-order feedRecv with reorder" {
