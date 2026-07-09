@@ -4144,20 +4144,8 @@ pub const Server = struct {
         buf: []const u8,
         src: compat.Address,
     ) void {
-        // ── Inbound-Initial capture (interop diagnosis) ──────────────────────
-        // Log every inbound Initial + the outcome so a capture can tell, per
-        // source, whether we (a) never received it, (b) dropped it (parse /
-        // AEAD / conn-table-full), or (c) decrypted it and are responding (→ a
-        // later failure is the peer rejecting our server cert / transport
-        // params, not us dropping). `.zquic`-scope warn: surfaced only under
-        // DEBUG_QUIC, so it costs nothing in normal operation.
-        const cap_ip = src.any.data[2..6];
-        log.warn("zquic: CAPTURE inbound Initial src={d}.{d}.{d}.{d} buf_len={d} version=0x{x:0>8}", .{
-            cap_ip[0],                                                                                                       cap_ip[1], cap_ip[2], cap_ip[3], buf.len,
-            if (buf.len >= 5) (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4] else 0,
-        });
         const ip = packet_mod.parseInitial(buf) catch |err| {
-            log.warn("zquic: CAPTURE inbound Initial DROP parseInitial src={d}.{d}.{d}.{d}: {s} buf_len={d} first={x:0>2}", .{ cap_ip[0], cap_ip[1], cap_ip[2], cap_ip[3], @errorName(err), buf.len, if (buf.len > 0) buf[0] else 0 });
+            dbg("io: inbound Initial parseInitial failed: {}\n", .{err});
             return;
         };
         // Detect QUIC version from raw packet (already validated in processPacket).
@@ -4218,13 +4206,25 @@ pub const Server = struct {
                     self.replayStoredServerFlight(existing, src);
                     return;
                 }
+                // After we sent a HelloRetryRequest (still in `.initial`, client
+                // keeps its original DCID because it hasn't seen our SCID yet), a
+                // retransmitted ClientHello means our HRR was lost. Resend the
+                // stored HRR Initial instead of routing to the reassembly path,
+                // which would ignore the duplicate (offset already advanced) and
+                // stall the handshake on lossy links.
+                if (existing.tls_inited and existing.tls.sent_hrr and
+                    existing.phase == .initial and existing.init_resend_valid)
+                {
+                    self.replayStoredServerFlight(existing, src);
+                    return;
+                }
                 break :blk existing;
             }
 
             // Truly new connection (new DCID from this peer = new handshake
             // attempt).
             const c = self.newConn(ip.dcid, ip.scid, src, is_v2_conn) orelse {
-                log.warn("zquic: CAPTURE inbound Initial DROP newConn-full src={d}.{d}.{d}.{d} (conn table at capacity)", .{ cap_ip[0], cap_ip[1], cap_ip[2], cap_ip[3] });
+                dbg("io: newConn failed — conn table at capacity\n", .{});
                 return;
             };
             break :blk c;
@@ -4258,18 +4258,11 @@ pub const Server = struct {
             &init_km.client,
             conn.init_recv_pn,
         ) catch |err| {
-            log.warn("zquic: CAPTURE inbound Initial DROP AEAD/header-protection src={d}.{d}.{d}.{d}: {s} dcid_len={d} pn_start={d} payload_len={d}", .{
-                cap_ip[0], cap_ip[1], cap_ip[2], cap_ip[3], @errorName(err), ip.dcid.len, pn_start, ip.payload_len,
-            });
+            dbg("io: inbound Initial AEAD/header-protection failed: {} dcid_len={} payload_len={}\n", .{ err, ip.dcid.len, ip.payload_len });
             return;
         };
         const pt_len = dec.pt_len;
         conn.init_ecn_ect0_recv += 1;
-        // Decrypt succeeded → we accept this Initial and will send our server
-        // flight (Initial + Handshake w/ cert). If the peer's dial still fails
-        // after this, it rejected OUR response (cert / transport params / ALPN),
-        // NOT a drop on our side.
-        log.warn("zquic: CAPTURE inbound Initial decrypted OK src={d}.{d}.{d}.{d} — sending server flight (cert)", .{ cap_ip[0], cap_ip[1], cap_ip[2], cap_ip[3] });
 
         // Compatible version negotiation (RFC 9368): if the server is configured
         // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
@@ -4653,7 +4646,7 @@ pub const Server = struct {
         // The connection stays in `.initial`. sh_bytes holds the HRR.
         if (conn.tls.hrr_pending) {
             conn.tls.hrr_pending = false;
-            log.warn("zquic: CAPTURE inbound Initial — client sent no X25519 key_share; sending HelloRetryRequest", .{});
+            dbg("io: client offered no X25519 key_share; sending HelloRetryRequest\n", .{});
             self.sendInitialServerHello(conn, src);
             // The HRR is sent and stored in init_resend for loss recovery.
             // Clear sh_len so the client's SECOND ClientHello (arriving at the
