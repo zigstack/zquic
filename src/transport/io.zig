@@ -1847,6 +1847,16 @@ pub const ConnState = struct {
     init_crypto_reorder: quic_tls_mod.CryptoReorderBuf = .{},
     hs_crypto_reorder: quic_tls_mod.CryptoReorderBuf = .{},
 
+    /// Reassembly buffer for the client's Initial-space ClientHello. The
+    /// ClientHello can span multiple CRYPTO frames — modern AWS-LC/BoringSSL
+    /// lead their key_share with the X25519MLKEM768 post-quantum hybrid (~1200
+    /// bytes), pushing the whole ClientHello past a single Initial packet. We
+    /// accumulate the contiguous byte stream here and only hand a COMPLETE
+    /// handshake message to the TLS parser (RFC 9001 §4.1.3: CRYPTO is an
+    /// ordered byte stream, not one-message-per-frame).
+    init_ch_buf: [8192]u8 = undefined,
+    init_ch_len: usize = 0,
+
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
     /// Peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220).
@@ -4582,24 +4592,39 @@ pub const Server = struct {
         // Advance the expected offset now that we have the contiguous segment.
         conn.init_crypto_offset += data.len;
 
-        // Retransmitted ClientHello after we already sent the server flight: replay
-        // the cached UDP payloads byte-for-byte. Re-running processClientHello /
-        // buildServerFlight re-injects TLS records and quinn reports
-        // UnsolicitedEncryptedExtension (see processInitialPacket findConnByPeer).
-        if (data.len >= 4 and data[0] == tls_hs.MSG_CLIENT_HELLO and
-            (conn.phase != .initial or (conn.tls_inited and conn.sh_len > 0)))
-        {
+        // Reassemble the ClientHello. It may span several CRYPTO frames (a
+        // post-quantum key_share pushes AWS-LC/BoringSSL's ClientHello past one
+        // packet), so accumulate the contiguous byte stream and only parse once
+        // a COMPLETE handshake message is buffered — do NOT treat the first
+        // fragment as the whole message.
+        if (conn.init_ch_len + data.len > conn.init_ch_buf.len) {
+            conn.init_ch_len = 0; // malformed / oversized — re-sync
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
+        @memcpy(conn.init_ch_buf[conn.init_ch_len..][0..data.len], data);
+        conn.init_ch_len += data.len;
+        const acc = conn.init_ch_buf[0..conn.init_ch_len];
+
+        if (acc.len < 4 or acc[0] != tls_hs.MSG_CLIENT_HELLO) {
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
+        const ch_body_len = (@as(usize, acc[1]) << 16) | (@as(usize, acc[2]) << 8) | acc[3];
+        if (acc.len < 4 + ch_body_len) {
+            // Incomplete ClientHello — pull more contiguous fragments and wait.
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
+        const ch = acc[0 .. 4 + ch_body_len];
+
+        // Retransmitted ClientHello after we already responded: replay our
+        // cached flight byte-for-byte (re-running processClientHello would
+        // re-inject TLS records; see processInitialPacket findConnByPeer).
+        if (conn.phase != .initial or (conn.tls_inited and conn.sh_len > 0)) {
             if (conn.init_resend_valid or conn.hs_resend_count > 0) {
                 self.replayStoredServerFlight(conn, src);
             }
-            self.drainInitCryptoReorder(conn, src);
-            return;
-        }
-        if (conn.phase != .initial) {
-            self.drainInitCryptoReorder(conn, src);
-            return;
-        }
-        if (data.len < 4 or data[0] != tls_hs.MSG_CLIENT_HELLO) {
             self.drainInitCryptoReorder(conn, src);
             return;
         }
@@ -4610,13 +4635,35 @@ pub const Server = struct {
             conn.tls_inited = true;
         }
 
-        // Process ClientHello → ServerHello
-        const sh_len = conn.tls.processClientHello(data, &conn.sh_bytes) catch |err| {
+        // Full ClientHello reassembled — reset the accumulator so the client's
+        // NEXT handshake message (e.g. ClientHello2 after a HelloRetryRequest)
+        // accumulates fresh, then process it.
+        conn.init_ch_len = 0;
+        const sh_len = conn.tls.processClientHello(ch, &conn.sh_bytes) catch |err| {
             dbg("io: TLS ClientHello failed: {}\n", .{err});
             self.drainInitCryptoReorder(conn, src);
             return;
         };
         conn.sh_len = sh_len;
+
+        // HelloRetryRequest: processClientHello produced an HRR (client sent no
+        // X25519 key_share but supports X25519 — e.g. AWS-LC leading with a PQ
+        // hybrid). Send it as the server Initial and WAIT for the client's
+        // second ClientHello; do NOT derive handshake keys or send the flight.
+        // The connection stays in `.initial`. sh_bytes holds the HRR.
+        if (conn.tls.hrr_pending) {
+            conn.tls.hrr_pending = false;
+            log.warn("zquic: CAPTURE inbound Initial — client sent no X25519 key_share; sending HelloRetryRequest", .{});
+            self.sendInitialServerHello(conn, src);
+            // The HRR is sent and stored in init_resend for loss recovery.
+            // Clear sh_len so the client's SECOND ClientHello (arriving at the
+            // next CRYPTO offset) is processed as a fresh ClientHello rather
+            // than being mistaken for a ServerHello retransmit by the guard
+            // above. Stay in `.initial`.
+            conn.sh_len = 0;
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
 
         // Apply peer's transport parameters now that ClientHello has been parsed.
         // Done before the server flight is sent so any size-driven adjustments

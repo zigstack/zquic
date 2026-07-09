@@ -36,6 +36,9 @@ const Certificate = std.crypto.Certificate;
 // TLS 1.3 handshake message types
 pub const MSG_CLIENT_HELLO: u8 = 0x01;
 pub const MSG_SERVER_HELLO: u8 = 0x02;
+/// RFC 8446 §4.4.1 synthetic "message_hash" handshake type, used to rewrite the
+/// transcript when a HelloRetryRequest is sent.
+pub const MSG_MESSAGE_HASH: u8 = 0xFE;
 pub const MSG_NEW_SESSION_TICKET: u8 = 0x04;
 pub const MSG_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 pub const MSG_CERTIFICATE: u8 = 0x0b;
@@ -97,6 +100,9 @@ pub const ClientHelloData = struct {
     session_id: [32]u8 = [_]u8{0} ** 32,
     session_id_len: u8 = 0,
     x25519_key: ?[32]u8 = null,
+    /// True if the client listed X25519 (0x001d) in supported_groups, even
+    /// when it did not send an X25519 key_share. Drives HelloRetryRequest.
+    x25519_supported_group: bool = false,
     cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
     quic_transport_params: ?struct { offset: usize, len: usize } = null,
     /// TLS extension type the client used for QUIC transport parameters.
@@ -285,6 +291,20 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
                     }
                 }
             },
+            EXT_SUPPORTED_GROUPS => {
+                // Record whether the client lists X25519 among the groups it
+                // supports, even if it did not send an X25519 *key_share*
+                // (modern AWS-LC/BoringSSL lead their key_share with the
+                // X25519MLKEM768 PQ hybrid and offer X25519 only here). This
+                // drives the HelloRetryRequest decision in processClientHello.
+                if (ext_data.len >= 2) {
+                    const gl = readU16(ext_data);
+                    var gp: usize = 2;
+                    while (gp + 2 <= 2 + gl and gp + 2 <= ext_data.len) : (gp += 2) {
+                        if (readU16(ext_data[gp..]) == GROUP_X25519) result.x25519_supported_group = true;
+                    }
+                }
+            },
             EXT_QUIC_TRANSPORT_PARAMS, EXT_QUIC_TRANSPORT_PARAMS_DRAFT => {
                 // Store offset into original data slice
                 const offset = (data.ptr + 4 + @as(usize, @intCast(body_len - (body.len - p)))) - data.ptr;
@@ -333,7 +353,9 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
         p += ext_len;
     }
 
-    if (result.x25519_key == null) return error.NoKeyShare;
+    // NOTE: a missing X25519 key_share is no longer a parse error — the caller
+    // (processClientHello) decides between HelloRetryRequest (when X25519 is in
+    // supported_groups) and rejection.
     return result;
 }
 
@@ -442,6 +464,67 @@ pub fn buildServerHello(
     @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
     pos += ep;
 
+    return pos;
+}
+
+/// SHA-256("HelloRetryRequest") — the special ServerHello.random that marks a
+/// message as a HelloRetryRequest (RFC 8446 §4.1.3).
+pub const hello_retry_request_random = [32]u8{
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
+
+/// Build a HelloRetryRequest (RFC 8446 §4.1.4): a ServerHello carrying the HRR
+/// magic random, echoing the client's session_id + chosen cipher suite, plus a
+/// key_share extension that names ONLY the `group` the server wants the client
+/// to use on its next ClientHello (no key bytes). Sent when the ClientHello
+/// carried no key_share for a group we support (e.g. modern AWS-LC/BoringSSL
+/// lead with X25519MLKEM768) but listed one we do (X25519) in supported_groups.
+pub fn buildHelloRetryRequest(
+    out: []u8,
+    session_id: []const u8,
+    cipher_suite: u16,
+    group: u16,
+) !usize {
+    var ext_buf: [64]u8 = undefined;
+    var ep: usize = 0;
+    // supported_versions: selected_version = TLS 1.3
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_VERSIONS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 2);
+    ep += 2;
+    writeU16(ext_buf[ep..], TLS_VERSION_13);
+    ep += 2;
+    // key_share (HRR form): ext data = selected_group only (2 bytes), no key.
+    writeU16(ext_buf[ep..], EXT_KEY_SHARE);
+    ep += 2;
+    writeU16(ext_buf[ep..], 2);
+    ep += 2;
+    writeU16(ext_buf[ep..], group);
+    ep += 2;
+
+    const body_len = 2 + 32 + 1 + session_id.len + 2 + 1 + 2 + ep;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_SERVER_HELLO, body_len);
+    writeU16(out[pos..], TLS_LEGACY_VERSION);
+    pos += 2;
+    @memcpy(out[pos .. pos + 32], &hello_retry_request_random);
+    pos += 32;
+    out[pos] = @intCast(session_id.len);
+    pos += 1;
+    if (session_id.len > 0) {
+        @memcpy(out[pos .. pos + session_id.len], session_id);
+        pos += session_id.len;
+    }
+    writeU16(out[pos..], cipher_suite);
+    pos += 2;
+    out[pos] = 0; // compression
+    pos += 1;
+    writeU16(out[pos..], @intCast(ep));
+    pos += 2;
+    @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
+    pos += ep;
     return pos;
 }
 
@@ -1281,6 +1364,13 @@ pub const ServerHandshake = struct {
     /// See `ClientHandshake.peer_qtp` for the size rationale.
     peer_qtp: [512]u8 = undefined,
     peer_qtp_len: u16 = 0,
+    /// HelloRetryRequest state. `sent_hrr` prevents a second HRR (RFC 8446
+    /// §4.1.4 permits at most one). `hrr_pending` signals to the QUIC layer
+    /// that the most recent `processClientHello` produced an HRR — it must be
+    /// sent as the server Initial, and handshake keys / server flight must NOT
+    /// be derived yet (they come after the client's second ClientHello).
+    sent_hrr: bool = false,
+    hrr_pending: bool = false,
 
     pub fn init() ServerHandshake {
         return .{
@@ -1308,6 +1398,47 @@ pub const ServerHandshake = struct {
         out_initial: []u8,
     ) !usize {
         self.ch = try parseClientHello(ch_bytes);
+
+        // HelloRetryRequest (RFC 8446 §4.1.4): the client sent no X25519
+        // key_share. If it nonetheless listed X25519 in supported_groups (as
+        // AWS-LC/BoringSSL do — they lead their key_share with the
+        // X25519MLKEM768 PQ hybrid), ask it to retry with X25519. Otherwise we
+        // truly cannot agree on a group.
+        if (self.ch.x25519_key == null) {
+            if (self.ch.x25519_supported_group and !self.sent_hrr) {
+                // Transcript rewrite (RFC 8446 §4.4.1): replace ClientHello1
+                // with the synthetic "message_hash" message, then append the
+                // HelloRetryRequest. Subsequent messages (ClientHello2,
+                // ServerHello, ...) extend this transcript.
+                var h1_ctx = Sha256.init(.{});
+                h1_ctx.update(ch_bytes);
+                const h1 = peekHash(h1_ctx);
+                self.transcript = Sha256.init(.{});
+                var synth: [4 + 32]u8 = undefined;
+                synth[0] = MSG_MESSAGE_HASH;
+                synth[1] = 0;
+                synth[2] = 0;
+                synth[3] = 32;
+                @memcpy(synth[4..], &h1);
+                self.transcript.update(&synth);
+
+                const hrr_len = try buildHelloRetryRequest(
+                    out_initial,
+                    self.ch.session_id[0..self.ch.session_id_len],
+                    self.ch.cipher_suite,
+                    GROUP_X25519,
+                );
+                self.transcript.update(out_initial[0..hrr_len]);
+                self.sent_hrr = true;
+                self.hrr_pending = true;
+                return hrr_len;
+            }
+            return error.NoKeyShare;
+        }
+        // Normal ServerHello path (this may be the client's SECOND ClientHello
+        // after an HRR, in which case the transcript already holds
+        // message_hash(CH1) || HelloRetryRequest and update() below appends CH2).
+        self.hrr_pending = false;
 
         // Capture the peer's QUIC transport parameters before `ch_bytes`
         // ownership escapes us (see ClientHandshake.peer_qtp for rationale).
@@ -2057,6 +2188,70 @@ test "handshake: selectPreferredCipherSuite prefers AES-128 over AES-256" {
     };
     const picked = try selectPreferredCipherSuite(&suites);
     try testing.expectEqual(TLS_AES_128_GCM_SHA256, picked);
+}
+
+test "handshake: buildHelloRetryRequest carries HRR random + selected group" {
+    const testing = std.testing;
+    var out: [128]u8 = undefined;
+    const session_id = [_]u8{0xAB} ** 32;
+    const n = try buildHelloRetryRequest(&out, &session_id, TLS_AES_128_GCM_SHA256, GROUP_X25519);
+    // Handshake header: ServerHello type + 3-byte length.
+    try testing.expectEqual(@as(u8, MSG_SERVER_HELLO), out[0]);
+    // ServerHello.random (offset 4 legacy_version(2) → random at 6) must be the
+    // magic HelloRetryRequest value (RFC 8446 §4.1.3).
+    try testing.expect(std.mem.eql(u8, out[6 .. 6 + 32], &hello_retry_request_random));
+    // The message must contain a key_share extension naming X25519 (0x001d).
+    var found_group = false;
+    var i: usize = 0;
+    while (i + 1 < n) : (i += 1) {
+        if (out[i] == 0x00 and out[i + 1] == 0x1d) found_group = true;
+    }
+    try testing.expect(found_group);
+}
+
+test "handshake: ClientHello with X25519 only in supported_groups (no key_share) is not a parse error" {
+    const testing = std.testing;
+    // Minimal ClientHello: no key_share extension, supported_groups = {X25519}.
+    // Body: legacy_version(2) random(32) sid_len(1)=0 cs_len(2)=2 cs(2) comp(1)=1 comp(1)=0 ext...
+    var body: [256]u8 = undefined;
+    var p: usize = 0;
+    writeU16(body[p..], TLS_LEGACY_VERSION);
+    p += 2;
+    @memset(body[p .. p + 32], 0x11);
+    p += 32; // random
+    body[p] = 0;
+    p += 1; // session_id len = 0
+    writeU16(body[p..], 2);
+    p += 2; // cipher_suites len
+    writeU16(body[p..], TLS_AES_128_GCM_SHA256);
+    p += 2;
+    body[p] = 1;
+    p += 1; // compression methods len
+    body[p] = 0;
+    p += 1; // null compression
+    // extensions: supported_groups {X25519}
+    var ext: [16]u8 = undefined;
+    var ep: usize = 0;
+    writeU16(ext[ep..], EXT_SUPPORTED_GROUPS);
+    ep += 2;
+    writeU16(ext[ep..], 4);
+    ep += 2; // ext_data len
+    writeU16(ext[ep..], 2);
+    ep += 2; // group list byte length
+    writeU16(ext[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(body[p..], @intCast(ep));
+    p += 2; // extensions total length
+    @memcpy(body[p .. p + ep], ext[0..ep]);
+    p += ep;
+
+    var msg: [300]u8 = undefined;
+    const total = writeHsMsgHeader(&msg, 0, MSG_CLIENT_HELLO, p);
+    @memcpy(msg[total .. total + p], body[0..p]);
+
+    const ch = try parseClientHello(msg[0 .. total + p]);
+    try testing.expect(ch.x25519_key == null); // no key_share offered
+    try testing.expect(ch.x25519_supported_group); // but X25519 acceptable → HRR path
 }
 
 test "handshake: QUIC key derivation" {
