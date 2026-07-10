@@ -4612,7 +4612,12 @@ pub const Server = struct {
                 const crypto_data = plaintext[pos .. pos + dlen];
                 self.handleInitialCrypto(conn, crypto_data, off_r.value, src);
                 pos += dlen;
+            } else if (plaintext[pos] == 0x01) {
+                // PING (no body) — same coalescing concern as the Handshake
+                // space: never break on it or a following CRYPTO frame is lost.
+                pos += 1;
             } else {
+                dbgq("srv initial frame loop STOP at unhandled byte=0x{x:0>2} pos={} pt_len={}", .{ plaintext[pos], pos, pt_len });
                 break; // unknown frame, stop
             }
         }
@@ -5535,7 +5540,19 @@ pub const Server = struct {
                 fpos += 1;
                 fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                 continue;
+            } else if (plaintext[fpos] == 0x01) {
+                // PING (RFC 9000 §19.2): no body. ngtcp2/c-lean (lantern)
+                // coalesces PING with its client Handshake flight; without this
+                // skip the loop `break`s on the PING and NEVER parses the
+                // following CRYPTO frame — the Certificate/Finished are dropped,
+                // the connection wedges in `.waiting_finished`, and the peer
+                // holds a zombie it dedups fresh dials against (the persistent
+                // zeam<->lantern flap). Valid frame types in the Handshake space
+                // are PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE (§12.4).
+                fpos += 1;
+                continue;
             } else {
+                dbgq("srv hs frame loop STOP at unhandled byte=0x{x:0>2} fpos={} pt_len={}", .{ plaintext[fpos], fpos, pt_len });
                 break;
             }
         }
