@@ -5480,7 +5480,10 @@ pub const Server = struct {
                         conn.hs_crypto_offset += fresh.len;
                         self.handleHandshakeCrypto(conn, fresh, src);
                     } else {
-                        // Out-of-order: buffer for later reassembly.
+                        // Out-of-order: buffer for later reassembly. A gap here
+                        // (frame offset ahead of the frontier) that retransmits
+                        // never fill is the multi-packet wedge signature.
+                        dbgq("srv hs CRYPTO out-of-order off={} dlen={} frontier={} (GAP {})", .{ off_r.value, dlen, conn.hs_crypto_offset, off_r.value - conn.hs_crypto_offset });
                         conn.hs_crypto_reorder.insert(off_r.value, cdata);
                     }
                     // Drain any buffered segment that (now) covers the frontier.
@@ -5586,7 +5589,14 @@ pub const Server = struct {
             while (p + 4 <= acc.len) {
                 const mlen = (@as(usize, acc[p + 1]) << 16) | (@as(usize, acc[p + 2]) << 8) | acc[p + 3];
                 const mend = p + 4 + mlen;
-                if (mend > acc.len) return; // partial message — wait for more bytes
+                if (mend > acc.len) {
+                    // Partial message — wait for more bytes. Log what we're
+                    // blocked on: distinguishes a large multi-packet flight
+                    // (e.g. a hash-sig CertificateVerify) still arriving from a
+                    // lost middle fragment that retransmits never bridge.
+                    dbgq("srv hs-flight PARTIAL msg_type=0x{x:0>2} msg_len={} need_end={} have_acc={} frontier={}", .{ acc[p], mlen, mend, acc.len, conn.hs_crypto_offset });
+                    return;
+                }
                 if (acc[p] == tls_hs.MSG_FINISHED) break :blk mend;
                 p = mend;
             }
