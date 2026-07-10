@@ -34,6 +34,7 @@ const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
 const h3_connect = @import("../http3/connect.zig");
 const datagram_mod = @import("../frames/datagram.zig");
+const ack_frequency_mod = @import("../frames/ack_frequency.zig");
 const datagrams_mod = @import("datagrams.zig");
 const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
@@ -2189,6 +2190,40 @@ pub const ConnState = struct {
     /// Used by our PTO computation (RFC 9002 §6.2.1). Defaults to the spec
     /// default of 25 ms.
     peer_max_ack_delay_ms: u64 = 25,
+
+    // ── ACK Frequency extension state (draft-ietf-quic-ack-frequency) ──
+    /// Our advertised `min_ack_delay` (µs); >0 means we advertised the TP and
+    /// MUST honor inbound ACK_FREQUENCY / IMMEDIATE_ACK frames.
+    local_min_ack_delay_us: u64 = 0,
+    /// Peer's advertised `min_ack_delay` (µs); >0 gates whether WE may send
+    /// ACK_FREQUENCY / IMMEDIATE_ACK frames toward the peer (draft §3).
+    peer_min_ack_delay_us: u64 = 0,
+    /// Largest ACK_FREQUENCY sequence number processed; stale/duplicate
+    /// frames (seq <= this) are ignored per draft §4.
+    ack_freq_seq: ?u64 = null,
+    /// Requested max ack delay from the peer's ACK_FREQUENCY frame, in ms
+    /// (rounded up from µs, min 1 ms).  null = no ACK_FREQUENCY received →
+    /// default behavior (ACKs flush every drive tick, unchanged from before
+    /// this extension).
+    ack_freq_max_delay_ms: ?u64 = null,
+    /// Ack-eliciting packets we may accumulate before an ACK is due (only
+    /// consulted when `ack_freq_max_delay_ms != null`).
+    ack_freq_threshold: u64 = 0,
+    /// Reordering tolerance: 0 = reordering never forces an immediate ACK;
+    /// >=1 = a reorder event of at least this magnitude does (1 = RFC 9000
+    /// default of ack-immediately on any reorder).
+    ack_freq_reorder_threshold: u64 = 1,
+    /// Ack-eliciting packets received since the last app-ACK flush.
+    ack_eliciting_since_flush: u64 = 0,
+    /// Wall-clock stamp of the first unflushed ack-eliciting packet (0 =
+    /// none pending).  Drives the requested-max-ack-delay timer.
+    oldest_unacked_recv_ms: i64 = 0,
+    /// Force the next flush regardless of thresholds (IMMEDIATE_ACK frame,
+    /// reorder trigger).
+    ack_immediate: bool = false,
+    /// Scratch: set by `noteFrameReceived` when the current packet carried an
+    /// ack-eliciting frame; consumed by `noteAppAckPacketObserved`.
+    recvd_ack_eliciting_frame: bool = false,
     /// Server-advertised preferred address (RFC 9000 §9.6) captured from
     /// the peer's transport-parameters extension (0x0d).  Used purely as a
     /// signal to trigger active migration on the client — we still send to
@@ -2344,6 +2379,72 @@ pub const ConnState = struct {
 
     pub fn noteFrameReceived(self: *ConnState, ft: u64) void {
         stats_mod.noteFrameRx(&self.stats_acc.frames, ft);
+        // Ack-eliciting = anything but PADDING, ACK/ACK_ECN, CONNECTION_CLOSE
+        // (RFC 9000 §13.2.1).  Feeds the ACK-frequency threshold counter.
+        switch (ft) {
+            0x00, 0x02, 0x03, 0x1c, 0x1d => {},
+            else => self.recvd_ack_eliciting_frame = true,
+        }
+    }
+
+    /// Per received 1-RTT packet, after its frames were processed and before
+    /// `observe(pn)`: update ACK-frequency accounting (threshold counter,
+    /// delay-timer stamp, reorder trigger).  No-op behavioral change until an
+    /// ACK_FREQUENCY frame arms `ack_freq_max_delay_ms`.
+    pub fn noteAppAckPacketObserved(self: *ConnState, pn: u64, now_ms: i64, tracker_largest: u64, tracker_has_ranges: bool) void {
+        if (self.recvd_ack_eliciting_frame) {
+            self.recvd_ack_eliciting_frame = false;
+            self.ack_eliciting_since_flush +|= 1;
+            if (self.oldest_unacked_recv_ms == 0) self.oldest_unacked_recv_ms = now_ms;
+        }
+        // Reorder trigger (draft §6.2): a packet that arrives late (pn below
+        // the tracked largest by >= threshold) or that opens a gap (skips
+        // ahead) should elicit an immediate ACK so the sender's loss detector
+        // keeps working despite the relaxed ack cadence.
+        if (self.ack_freq_max_delay_ms != null and self.ack_freq_reorder_threshold != 0 and tracker_has_ranges) {
+            const late = pn + self.ack_freq_reorder_threshold <= tracker_largest;
+            const gap = pn > tracker_largest + 1;
+            if (late or gap) self.ack_immediate = true;
+        }
+    }
+
+    /// True when the accumulated app-space ACK ranges should be flushed now.
+    /// Default mode (no ACK_FREQUENCY received): always true — preserves the
+    /// pre-extension flush-every-drive-tick behavior exactly.
+    pub fn ackFlushDue(self: *const ConnState, now_ms: i64) bool {
+        const max_delay_ms = self.ack_freq_max_delay_ms orelse return true;
+        if (self.ack_immediate) return true;
+        if (self.ack_eliciting_since_flush > self.ack_freq_threshold) return true;
+        if (self.oldest_unacked_recv_ms != 0 and
+            now_ms - self.oldest_unacked_recv_ms >= @as(i64, @intCast(max_delay_ms))) return true;
+        return false;
+    }
+
+    /// Reset ACK-frequency accounting after an app-ACK actually went out.
+    pub fn noteAckFlushed(self: *ConnState) void {
+        self.ack_eliciting_since_flush = 0;
+        self.oldest_unacked_recv_ms = 0;
+        self.ack_immediate = false;
+    }
+
+    pub const AckFrequencyApply = enum { applied, stale, protocol_violation };
+
+    /// Apply an inbound ACK_FREQUENCY frame (draft §4): sequence-gated;
+    /// requested max ack delay below our advertised min_ack_delay is a
+    /// PROTOCOL_VIOLATION the caller must surface as a connection error.
+    pub fn applyAckFrequencyFrame(self: *ConnState, f: ack_frequency_mod.AckFrequencyFrame) AckFrequencyApply {
+        if (self.ack_freq_seq) |seen| {
+            if (f.sequence_number <= seen) return .stale;
+        }
+        if (self.local_min_ack_delay_us > 0 and f.request_max_ack_delay_us < self.local_min_ack_delay_us) {
+            return .protocol_violation;
+        }
+        self.ack_freq_seq = f.sequence_number;
+        self.ack_freq_threshold = f.ack_eliciting_threshold;
+        // µs → ms, rounded up, min 1 ms (our timers are ms-granular).
+        self.ack_freq_max_delay_ms = @max(1, (f.request_max_ack_delay_us + 999) / 1000);
+        self.ack_freq_reorder_threshold = f.reordering_threshold;
+        return .applied;
     }
 
     pub fn note1RttPayloadSent(self: *ConnState, payload: []const u8, pkt_len: usize) void {
@@ -2505,6 +2606,16 @@ pub const ConnState = struct {
         }
         self.peer_grease_quic_bit = parsed.grease_quic_bit;
         self.peer_max_datagram_frame_size = parsed.max_datagram_frame_size;
+        // draft-ietf-quic-ack-frequency §3: min_ack_delay greater than the
+        // same peer's max_ack_delay is a TRANSPORT_PARAMETER_ERROR per the
+        // draft; we defensively treat the extension as not-advertised instead
+        // of tearing down the handshake from inside this void apply path.
+        if (parsed.min_ack_delay_us > parsed.max_ack_delay_ms *| 1000) {
+            dbg("io: peer min_ack_delay {}us > max_ack_delay {}ms — ignoring ack-frequency support\n", .{ parsed.min_ack_delay_us, parsed.max_ack_delay_ms });
+            self.peer_min_ack_delay_us = 0;
+        } else {
+            self.peer_min_ack_delay_us = parsed.min_ack_delay_us;
+        }
     }
 
     /// True when both endpoints advertised a non-zero max_datagram_frame_size.
@@ -4800,6 +4911,7 @@ pub const Server = struct {
         const datagram_tp = configMaxDatagramFrameSize(self.config.http3, self.config.max_datagram_frame_size);
         tp_opts.max_datagram_frame_size = datagram_tp;
         conn.local_max_datagram_frame_size = datagram_tp;
+        conn.local_min_ack_delay_us = tp_opts.min_ack_delay_us;
         // Optional per-server override of the advertised incoming-stream limits.
         // Also raise our own receive-side accounting so we actually accept the
         // number of peer-initiated streams we advertised.
@@ -5530,6 +5642,12 @@ pub const Server = struct {
                 conn.noteDatagramRecv(buf.len);
 
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
+                conn.noteAppAckPacketObserved(
+                    srv_decrypted_pn,
+                    compat.milliTimestamp(),
+                    conn.app_recv_ack.largest,
+                    conn.app_recv_ack.range_count > 0,
+                );
                 if (conn.app_recv_ack.observe(srv_decrypted_pn)) {
                     self.flushConnAppAck(conn, src);
                     _ = conn.app_recv_ack.observe(srv_decrypted_pn);
@@ -5711,6 +5829,32 @@ pub const Server = struct {
 
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
+            if (ft == ack_frequency_mod.immediate_ack_frame_type) {
+                // IMMEDIATE_ACK (draft-ietf-quic-ack-frequency §5): flush the
+                // pending app ACK at the end of this recv pass instead of
+                // waiting out any ACK_FREQUENCY-relaxed cadence.
+                conn.ack_immediate = true;
+                continue;
+            }
+            if (ft == ack_frequency_mod.ack_frequency_frame_type) {
+                // ACK_FREQUENCY (draft §4): peer tunes our ack cadence.
+                const afr = ack_frequency_mod.AckFrequencyFrame.parse(frames[pos..]) catch {
+                    dbg("io: malformed ACK_FREQUENCY frame\n", .{});
+                    self.sendConnectionClose(conn, 0x07, "malformed ACK_FREQUENCY", src);
+                    return;
+                };
+                pos += afr.consumed;
+                switch (conn.applyAckFrequencyFrame(afr.frame)) {
+                    .applied, .stale => {},
+                    .protocol_violation => {
+                        // draft §4: requested max ack delay below our
+                        // advertised min_ack_delay.
+                        self.sendConnectionClose(conn, 0x0a, "ACK_FREQUENCY max_ack_delay < min_ack_delay", src);
+                        return;
+                    },
+                }
+                continue;
+            }
             if (ft == 0x02 or ft == 0x03) {
                 // ACK frame (RFC 9000 §19.3).
                 // Parse Largest Acknowledged, ACK Delay, ACK Range Count, and
@@ -6378,15 +6522,22 @@ pub const Server = struct {
         if (ack_len == 0) return;
         self.send1Rtt(conn, ack_buf[0..ack_len], dst);
         conn.app_recv_ack.reset();
+        conn.noteAckFlushed();
     }
 
     /// Flush deferred 1-RTT ACKs for all connections (after a recv batch).
     fn flushAllConnAppAcks(self: *Server) void {
+        const now_ms = compat.milliTimestamp();
         for (&self.conns) |*cslot| {
             const conn = if (cslot.*) |c| c else continue;
             if (!conn.has_app_keys) continue;
             if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
             if (conn.app_recv_ack.range_count == 0) continue;
+            // ACK-frequency gate (draft-ietf-quic-ack-frequency): once the
+            // peer sent an ACK_FREQUENCY frame, hold ACKs until the eliciting
+            // threshold / requested delay / immediate trigger fires.  Default
+            // (no frame received): always due — unchanged behavior.
+            if (!conn.ackFlushDue(now_ms)) continue;
             self.flushConnAppAck(conn, conn.peer);
         }
     }
@@ -6605,8 +6756,16 @@ pub const Server = struct {
         return switch (space) {
             .application => blk: {
                 if (!conn.has_app_keys) break :blk false;
-                const ping_frame = [_]u8{0x01};
-                self.send1Rtt(conn, &ping_frame, dst);
+                // When the peer supports the ACK-frequency extension, ride an
+                // IMMEDIATE_ACK on the probe so it answers without waiting out
+                // its (possibly ACK_FREQUENCY-relaxed) delayed-ack timer.
+                if (conn.peer_min_ack_delay_us > 0) {
+                    const probe = [_]u8{ 0x01, 0x1f };
+                    self.send1Rtt(conn, &probe, dst);
+                } else {
+                    const ping_frame = [_]u8{0x01};
+                    self.send1Rtt(conn, &ping_frame, dst);
+                }
                 break :blk true;
             },
             .handshake => self.sendHandshakePtoProbe(conn, dst),
@@ -9623,6 +9782,13 @@ pub const Client = struct {
     /// congestion window. Returns false if packet build or `sendto` fails.
     /// Shared between PTO probe and idle keepalive (RFC 9000 §10.1.2).
     fn sendOnePingFrame(self: *Client) bool {
+        // When the peer supports the ACK-frequency extension, ride an
+        // IMMEDIATE_ACK (0x1f) on the PTO probe so the peer answers without
+        // waiting out its (possibly ACK_FREQUENCY-relaxed) delayed-ack timer.
+        if (self.conn.peer_min_ack_delay_us > 0) {
+            const probe = [_]u8{ 0x01, 0x1f };
+            return self.sendClient1Rtt(&probe) != null;
+        }
         const ping_frame = [_]u8{0x01};
         return self.sendClient1Rtt(&ping_frame) != null;
     }
@@ -10064,6 +10230,9 @@ pub const Client = struct {
             var quic_tp_buf: [128]u8 = undefined;
             const datagram_tp = configMaxDatagramFrameSize(self.config.http3, self.config.max_datagram_frame_size);
             self.conn.local_max_datagram_frame_size = datagram_tp;
+            // buildEndpointTransportParams uses TransportParamsOpts defaults
+            // for min_ack_delay (advertised unless zeroed there).
+            self.conn.local_min_ack_delay_us = (quic_tls_mod.TransportParamsOpts{ .initial_source_cid = &.{} }).min_ack_delay_us;
             const quic_tp = try buildEndpointTransportParams(
                 &quic_tp_buf,
                 self.conn.local_cid.slice(),
@@ -10829,6 +10998,28 @@ pub const Client = struct {
 
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
+            if (ft == ack_frequency_mod.immediate_ack_frame_type) {
+                // IMMEDIATE_ACK (draft-ietf-quic-ack-frequency §5).
+                self.conn.ack_immediate = true;
+                continue;
+            }
+            if (ft == ack_frequency_mod.ack_frequency_frame_type) {
+                // ACK_FREQUENCY (draft §4): peer tunes our ack cadence.
+                const afr = ack_frequency_mod.AckFrequencyFrame.parse(plaintext[pos..pt_len]) catch {
+                    dbg("io: client malformed ACK_FREQUENCY frame\n", .{});
+                    self.sendConnectionClose(0x07, "malformed ACK_FREQUENCY");
+                    return;
+                };
+                pos += afr.consumed;
+                switch (self.conn.applyAckFrequencyFrame(afr.frame)) {
+                    .applied, .stale => {},
+                    .protocol_violation => {
+                        self.sendConnectionClose(0x0a, "ACK_FREQUENCY max_ack_delay < min_ack_delay");
+                        return;
+                    },
+                }
+                continue;
+            }
             if (ft == 0x02 or ft == 0x03) {
                 // ACK frame (RFC 9000 §19.3).  Parse the first range and run
                 // it through the loss detector so server-sent ACKs can ack
@@ -11223,6 +11414,12 @@ pub const Client = struct {
         }
 
         // Defer ACK until after the recv drain loop in downloadUrls.
+        self.conn.noteAppAckPacketObserved(
+            decompressed_pn,
+            compat.milliTimestamp(),
+            self.app_ack.largest,
+            self.app_ack.range_count > 0,
+        );
         if (self.app_ack.observe(decompressed_pn)) {
             self.flushDeferredAck();
             _ = self.app_ack.observe(decompressed_pn);
@@ -11290,6 +11487,7 @@ pub const Client = struct {
             self.app_ack.largest, self.app_ack.range_count,
         });
         self.app_ack.reset();
+        self.conn.noteAckFlushed();
     }
 
     fn handleAppCrypto(self: *Client, data: []const u8) void {
@@ -14309,4 +14507,135 @@ test "resetRawAppStream: server resets a stream, client observes RESET_STREAM co
         }
     }
     try std.testing.expectEqual(@as(?u64, 42), seen_code);
+}
+
+test "ack-frequency: default mode flushes every tick (no behavior change)" {
+    var conn = makeConnForStreamTest();
+    // No ACK_FREQUENCY frame received → ack_freq_max_delay_ms is null →
+    // always due, regardless of counters.
+    try std.testing.expect(conn.ackFlushDue(1000));
+    conn.ack_eliciting_since_flush = 0;
+    try std.testing.expect(conn.ackFlushDue(1000));
+}
+
+test "ack-frequency: applyAckFrequencyFrame applies, ignores stale, rejects below min_ack_delay" {
+    var conn = makeConnForStreamTest();
+    conn.local_min_ack_delay_us = 1000;
+
+    // Apply seq 3.
+    try std.testing.expectEqual(ConnState.AckFrequencyApply.applied, conn.applyAckFrequencyFrame(.{
+        .sequence_number = 3,
+        .ack_eliciting_threshold = 9,
+        .request_max_ack_delay_us = 25_000,
+        .reordering_threshold = 0,
+    }));
+    try std.testing.expectEqual(@as(?u64, 25), conn.ack_freq_max_delay_ms);
+    try std.testing.expectEqual(@as(u64, 9), conn.ack_freq_threshold);
+    try std.testing.expectEqual(@as(u64, 0), conn.ack_freq_reorder_threshold);
+
+    // Stale (seq <= 3) is ignored, state unchanged.
+    try std.testing.expectEqual(ConnState.AckFrequencyApply.stale, conn.applyAckFrequencyFrame(.{
+        .sequence_number = 3,
+        .ack_eliciting_threshold = 1,
+        .request_max_ack_delay_us = 5_000,
+        .reordering_threshold = 1,
+    }));
+    try std.testing.expectEqual(@as(u64, 9), conn.ack_freq_threshold);
+
+    // Requested delay below our advertised min_ack_delay → protocol violation
+    // (draft §4); state unchanged.
+    try std.testing.expectEqual(ConnState.AckFrequencyApply.protocol_violation, conn.applyAckFrequencyFrame(.{
+        .sequence_number = 4,
+        .ack_eliciting_threshold = 1,
+        .request_max_ack_delay_us = 999,
+        .reordering_threshold = 1,
+    }));
+    try std.testing.expectEqual(@as(?u64, 25), conn.ack_freq_max_delay_ms);
+
+    // µs → ms rounds up with a 1 ms floor.
+    try std.testing.expectEqual(ConnState.AckFrequencyApply.applied, conn.applyAckFrequencyFrame(.{
+        .sequence_number = 5,
+        .ack_eliciting_threshold = 0,
+        .request_max_ack_delay_us = 1000,
+        .reordering_threshold = 1,
+    }));
+    try std.testing.expectEqual(@as(?u64, 1), conn.ack_freq_max_delay_ms);
+}
+
+test "ack-frequency: threshold, delay timer, and IMMEDIATE_ACK gate the flush" {
+    var conn = makeConnForStreamTest();
+    conn.local_min_ack_delay_us = 1000;
+    _ = conn.applyAckFrequencyFrame(.{
+        .sequence_number = 1,
+        .ack_eliciting_threshold = 2, // up to 2 eliciting packets may wait
+        .request_max_ack_delay_us = 20_000, // 20 ms
+        .reordering_threshold = 1,
+    });
+
+    // Simulate two ack-eliciting packets at t=1000 — under threshold, within
+    // the delay window → not due.
+    conn.recvd_ack_eliciting_frame = true;
+    conn.noteAppAckPacketObserved(10, 1000, 0, false);
+    conn.recvd_ack_eliciting_frame = true;
+    conn.noteAppAckPacketObserved(11, 1005, 10, true);
+    try std.testing.expect(!conn.ackFlushDue(1010));
+
+    // Third eliciting packet exceeds the threshold → due.
+    conn.recvd_ack_eliciting_frame = true;
+    conn.noteAppAckPacketObserved(12, 1010, 11, true);
+    try std.testing.expect(conn.ackFlushDue(1010));
+
+    // Flush resets the accounting.
+    conn.noteAckFlushed();
+    try std.testing.expect(!conn.ackFlushDue(1011));
+
+    // Delay timer: one eliciting packet, then 20 ms elapse → due.
+    conn.recvd_ack_eliciting_frame = true;
+    conn.noteAppAckPacketObserved(13, 2000, 12, true);
+    try std.testing.expect(!conn.ackFlushDue(2019));
+    try std.testing.expect(conn.ackFlushDue(2020));
+
+    // IMMEDIATE_ACK forces due regardless of counters.
+    conn.noteAckFlushed();
+    conn.ack_immediate = true;
+    try std.testing.expect(conn.ackFlushDue(2021));
+}
+
+test "ack-frequency: reorder trigger honors reordering_threshold" {
+    var conn = makeConnForStreamTest();
+    conn.local_min_ack_delay_us = 1000;
+    _ = conn.applyAckFrequencyFrame(.{
+        .sequence_number = 1,
+        .ack_eliciting_threshold = 100,
+        .request_max_ack_delay_us = 100_000,
+        .reordering_threshold = 1,
+    });
+
+    // In-order packet: no immediate.
+    conn.noteAppAckPacketObserved(6, 1000, 5, true);
+    try std.testing.expect(!conn.ack_immediate);
+    // Late packet (pn 3 while largest tracked is 6) → immediate.
+    conn.noteAppAckPacketObserved(3, 1001, 6, true);
+    try std.testing.expect(conn.ack_immediate);
+
+    // reordering_threshold = 0 disables the trigger entirely.
+    conn.noteAckFlushed();
+    _ = conn.applyAckFrequencyFrame(.{
+        .sequence_number = 2,
+        .ack_eliciting_threshold = 100,
+        .request_max_ack_delay_us = 100_000,
+        .reordering_threshold = 0,
+    });
+    conn.noteAppAckPacketObserved(2, 1002, 6, true);
+    try std.testing.expect(!conn.ack_immediate);
+
+    // Gap (pn skips ahead past largest+1) also triggers when threshold >= 1.
+    _ = conn.applyAckFrequencyFrame(.{
+        .sequence_number = 3,
+        .ack_eliciting_threshold = 100,
+        .request_max_ack_delay_us = 100_000,
+        .reordering_threshold = 1,
+    });
+    conn.noteAppAckPacketObserved(20, 1003, 6, true);
+    try std.testing.expect(conn.ack_immediate);
 }

@@ -173,6 +173,12 @@ pub const TransportParamsOpts = struct {
     grease_quic_bit: bool = false,
     /// RFC 9221 `max_datagram_frame_size` (0x20).  Omitted when zero (disabled).
     max_datagram_frame_size: u64 = 0,
+    /// draft-ietf-quic-ack-frequency `min_ack_delay` (0xff04de1b), in
+    /// MICROSECONDS.  Advertising it signals support for ACK_FREQUENCY /
+    /// IMMEDIATE_ACK frames and obligates us to honor them.  Omitted when
+    /// zero.  Default 1 ms — matches the drive-loop ACK granularity.  Must
+    /// not exceed our advertised max_ack_delay (25 ms).
+    min_ack_delay_us: u64 = 1000,
 };
 
 /// Preset transport-parameter profiles for common embedders.
@@ -336,6 +342,10 @@ pub fn buildTransportParams(out: []u8, opts: TransportParamsOpts) (varint.Encode
     if (opts.max_datagram_frame_size > 0) {
         pos = try writeParamVarint(out, pos, 0x20, opts.max_datagram_frame_size);
     }
+    // draft-ietf-quic-ack-frequency: min_ack_delay (0xff04de1b), microseconds.
+    if (opts.min_ack_delay_us > 0) {
+        pos = try writeParamVarint(out, pos, 0xff04de1b, opts.min_ack_delay_us);
+    }
     return pos;
 }
 
@@ -398,6 +408,9 @@ pub const PeerTransportParams = struct {
     grease_quic_bit: bool = false,
     /// 0x20 — RFC 9221 max DATAGRAM frame payload size.  Zero when absent.
     max_datagram_frame_size: u64 = 0,
+    /// 0xff04de1b — draft-ietf-quic-ack-frequency min_ack_delay in
+    /// MICROSECONDS.  Zero when absent (peer does not support the extension).
+    min_ack_delay_us: u64 = 0,
 };
 
 /// On-wire layout of the preferred_address transport parameter (RFC 9000
@@ -494,6 +507,7 @@ pub fn parseTransportParams(bytes: []const u8) varint.DecodeError!PeerTransportP
             0x0e => out.active_connection_id_limit = readVarintField(value) catch continue,
             0x2ab2 => out.grease_quic_bit = (value_len == 0),
             0x20 => out.max_datagram_frame_size = readVarintField(value) catch continue,
+            0xff04de1b => out.min_ack_delay_us = readVarintField(value) catch continue,
             else => {}, // unknown / reserved / connection-id params are not surfaced here
         }
     }
@@ -527,6 +541,20 @@ test "transport params: round-trip varint fields" {
     try testing.expectEqual(@as(u64, 4), parsed.active_connection_id_limit);
     // We don't emit `disable_active_migration`; check the default here.
     try testing.expectEqual(false, parsed.disable_active_migration);
+    // draft-ietf-quic-ack-frequency: advertised by default at 1 ms.
+    try testing.expectEqual(@as(u64, 1000), parsed.min_ack_delay_us);
+}
+
+test "transport params: min_ack_delay omitted when zero" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const cid = [_]u8{0xaa};
+    const n = try buildTransportParams(&buf, .{
+        .initial_source_cid = &cid,
+        .min_ack_delay_us = 0,
+    });
+    const parsed = try parseTransportParams(buf[0..n]);
+    try testing.expectEqual(@as(u64, 0), parsed.min_ack_delay_us);
 }
 
 test "transport params: max_datagram_frame_size round-trip" {

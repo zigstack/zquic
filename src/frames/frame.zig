@@ -23,7 +23,9 @@
 //!   PATH_RESPONSE     0x1b
 //!   CONNECTION_CLOSE  0x1c / 0x1d
 //!   HANDSHAKE_DONE    0x1e
+//!   IMMEDIATE_ACK     0x1f          (draft-ietf-quic-ack-frequency)
 //!   DATAGRAM          0x30 / 0x31  (RFC 9221)
+//!   ACK_FREQUENCY     0xaf          (draft-ietf-quic-ack-frequency)
 
 const std = @import("std");
 const varint = @import("../varint.zig");
@@ -32,6 +34,7 @@ const types = @import("../types.zig");
 pub const ack = @import("ack.zig");
 pub const crypto_frame = @import("crypto_frame.zig");
 pub const datagram_mod = @import("datagram.zig");
+pub const ack_frequency_mod = @import("ack_frequency.zig");
 pub const stream = @import("stream.zig");
 pub const transport = @import("transport.zig");
 
@@ -60,6 +63,7 @@ pub const FrameType = enum(u64) {
     connection_close_quic = 0x1c,
     connection_close_app = 0x1d,
     handshake_done = 0x1e,
+    immediate_ack = 0x1f,
     _,
 };
 
@@ -88,6 +92,8 @@ pub const Frame = union(enum) {
     connection_close: transport.ConnectionClose,
     handshake_done: transport.HandshakeDone,
     datagram: datagram_mod.DatagramFrame,
+    immediate_ack: ack_frequency_mod.ImmediateAck,
+    ack_frequency: ack_frequency_mod.AckFrequencyFrame,
 
     /// Returns true if this frame type is allowed in Initial packets.
     pub fn allowedInInitial(self: Frame) bool {
@@ -213,9 +219,14 @@ pub fn parseOne(buf: []const u8) ParseError!struct { frame: Frame, consumed: usi
             return .{ .frame = .{ .connection_close = r.frame }, .consumed = pos + r.consumed };
         },
         0x1e => return .{ .frame = .{ .handshake_done = .{} }, .consumed = pos },
+        0x1f => return .{ .frame = .{ .immediate_ack = .{} }, .consumed = pos },
         0x30, 0x31 => {
             const r = try datagram_mod.DatagramFrame.parse(buf[pos..], ft);
             return .{ .frame = .{ .datagram = r.frame }, .consumed = pos + r.consumed };
+        },
+        ack_frequency_mod.ack_frequency_frame_type => {
+            const r = try ack_frequency_mod.AckFrequencyFrame.parse(buf[pos..]);
+            return .{ .frame = .{ .ack_frequency = r.frame }, .consumed = pos + r.consumed };
         },
         else => return error.UnknownFrameType,
     }
