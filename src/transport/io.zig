@@ -1857,6 +1857,18 @@ pub const ConnState = struct {
     init_ch_buf: [8192]u8 = undefined,
     init_ch_len: usize = 0,
 
+    /// Reassembly buffer for the client's Handshake-space flight (Certificate +
+    /// CertificateVerify + Finished, or a bare Finished). Mirrors `init_ch_buf`:
+    /// ngtcp2/c-lean-libp2p (lantern) fragments this flight into many small
+    /// CRYPTO frames, so the contiguous byte stream is accumulated here and the
+    /// TLS parser only runs once a COMPLETE Finished message is buffered.
+    /// `processClientHandshakeInbound` requires whole messages — feeding it a
+    /// fragment returns TruncatedMessage AFTER the frontier already advanced,
+    /// permanently consuming the bytes and wedging the connection in
+    /// `.waiting_finished` (the zeam<->lantern inbound-zombie bug).
+    hs_cli_flight_buf: [24576]u8 = undefined,
+    hs_cli_flight_len: usize = 0,
+
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
     /// Peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220).
@@ -5171,10 +5183,25 @@ pub const Server = struct {
                 const dlen: usize = @intCast(dlen_r.value);
                 if (fpos + dlen > pt_len) break;
                 const cdata = plaintext[fpos .. fpos + dlen];
-                if (off_r.value == conn.hs_crypto_offset) {
-                    conn.hs_crypto_offset += dlen;
-                    self.handleHandshakeCrypto(conn, cdata, src);
-                    // Drain any now-contiguous buffered Handshake CRYPTO segments.
+                // Overlap-aware reassembly (mirror of the Initial-space fix):
+                // ngtcp2/c-lean (lantern) retransmits the client flight with
+                // DIFFERENT fragment boundaries each round, so a frame often
+                // STRADDLES the contiguity frontier. Consume only the fresh
+                // tail; buffer future segments; and ALWAYS drain — pre-fix the
+                // drain only ran on an exact-offset match, stranding buffered
+                // segments forever and wedging the handshake in
+                // `.waiting_finished` (the zeam<->lantern inbound zombie).
+                if (off_r.value + dlen > conn.hs_crypto_offset) {
+                    if (off_r.value <= conn.hs_crypto_offset) {
+                        const skip: usize = @intCast(conn.hs_crypto_offset - off_r.value);
+                        const fresh = cdata[skip..];
+                        conn.hs_crypto_offset += fresh.len;
+                        self.handleHandshakeCrypto(conn, fresh, src);
+                    } else {
+                        // Out-of-order: buffer for later reassembly.
+                        conn.hs_crypto_reorder.insert(off_r.value, cdata);
+                    }
+                    // Drain any buffered segment that (now) covers the frontier.
                     var hs_drain: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
                     while (true) {
                         const dn = conn.hs_crypto_reorder.take(conn.hs_crypto_offset, &hs_drain);
@@ -5182,10 +5209,8 @@ pub const Server = struct {
                         conn.hs_crypto_offset += dn;
                         self.handleHandshakeCrypto(conn, hs_drain[0..dn], src);
                     }
-                } else {
-                    // Out-of-order: buffer for later reassembly.
-                    conn.hs_crypto_reorder.insert(off_r.value, cdata);
                 }
+                // else: duplicate entirely below the frontier — drop.
                 fpos += dlen;
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
@@ -5240,12 +5265,44 @@ pub const Server = struct {
     }
 
     fn handleHandshakeCrypto(self: *Server, conn: *ConnState, data: []const u8, src: compat.Address) void {
-        if (data.len < 4) return;
+        // Late retransmit after completion: nothing left to process, and
+        // re-feeding the TLS machine would corrupt the transcript.
+        if (conn.phase == .connected) return;
 
-        conn.tls.processClientHandshakeInbound(data) catch |err| {
+        // Accumulate the client's Handshake-space flight and only parse once a
+        // COMPLETE Finished message is buffered. CRYPTO is an ordered byte
+        // stream (RFC 9001 §4.1.3): ngtcp2/c-lean (lantern) splits Certificate +
+        // CertificateVerify + Finished across many small frames, while
+        // `processClientHandshakeInbound` requires whole messages — feeding it a
+        // fragment fails AFTER the frontier already advanced, permanently
+        // consuming the bytes and wedging the connection in `.waiting_finished`.
+        if (conn.hs_cli_flight_len + data.len > conn.hs_cli_flight_buf.len) {
+            dbg("io: client Handshake flight overflow ({} + {})\n", .{ conn.hs_cli_flight_len, data.len });
+            conn.hs_cli_flight_len = 0; // malformed / oversized — re-sync
+            return;
+        }
+        @memcpy(conn.hs_cli_flight_buf[conn.hs_cli_flight_len..][0..data.len], data);
+        conn.hs_cli_flight_len += data.len;
+        const acc = conn.hs_cli_flight_buf[0..conn.hs_cli_flight_len];
+
+        // Walk complete handshake messages until a complete Finished is found.
+        var p: usize = 0;
+        const fin_end: usize = blk: {
+            while (p + 4 <= acc.len) {
+                const mlen = (@as(usize, acc[p + 1]) << 16) | (@as(usize, acc[p + 2]) << 8) | acc[p + 3];
+                const mend = p + 4 + mlen;
+                if (mend > acc.len) return; // partial message — wait for more bytes
+                if (acc[p] == tls_hs.MSG_FINISHED) break :blk mend;
+                p = mend;
+            }
+            return; // flight incomplete — wait for more CRYPTO data
+        };
+
+        conn.tls.processClientHandshakeInbound(acc[0..fin_end]) catch |err| {
             dbg("io: client post-handshake TLS failed: {}\n", .{err});
             return;
         };
+        conn.hs_cli_flight_len = 0;
 
         dbg("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
@@ -10640,17 +10697,25 @@ pub const Client = struct {
             const dlen: usize = @intCast(dlen_r.value);
             if (fpos + dlen > pt_len) break;
             const cdata = plaintext[fpos .. fpos + dlen];
-            if (off_r.value == self.conn.hs_crypto_offset) {
-                self.appendClientHandshakeCrypto(cdata);
+            // Overlap-aware reassembly (mirror of the server-side fix): a
+            // reboundaried retransmit may STRADDLE the frontier — consume only
+            // the fresh tail, and ALWAYS drain so a buffered segment covering
+            // the frontier is never stranded.
+            if (off_r.value + dlen > self.conn.hs_crypto_offset) {
+                if (off_r.value <= self.conn.hs_crypto_offset) {
+                    const skip: usize = @intCast(self.conn.hs_crypto_offset - off_r.value);
+                    self.appendClientHandshakeCrypto(cdata[skip..]);
+                } else {
+                    self.conn.hs_crypto_reorder.insert(off_r.value, cdata);
+                }
                 var hs_drain: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
                 while (true) {
                     const dn = self.conn.hs_crypto_reorder.take(self.conn.hs_crypto_offset, &hs_drain);
                     if (dn == 0) break;
                     self.appendClientHandshakeCrypto(hs_drain[0..dn]);
                 }
-            } else {
-                self.conn.hs_crypto_reorder.insert(off_r.value, cdata);
             }
+            // else: duplicate entirely below the frontier — drop.
             fpos += dlen;
         }
     }
