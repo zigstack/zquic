@@ -404,49 +404,49 @@ fn writeKeylog(path: []const u8, client_random: [32]u8, secrets: *const tls_hs.T
 /// stays focused on RFC 9002 §B.4 ECN feedback handling.
 fn parseAckEcnCounts(data: []const u8) ?struct { ect0: u64, ect1: u64, ce: u64 } {
     var pos: usize = 0;
-    const lar = varint.decode(data[pos..]) catch return null;
+    const lar = varint.decodePermissive(data[pos..]) catch return null;
     pos += lar.len;
-    const del = varint.decode(data[pos..]) catch return null;
+    const del = varint.decodePermissive(data[pos..]) catch return null;
     pos += del.len;
-    const cnt = varint.decode(data[pos..]) catch return null;
+    const cnt = varint.decodePermissive(data[pos..]) catch return null;
     pos += cnt.len;
-    const fst = varint.decode(data[pos..]) catch return null;
+    const fst = varint.decodePermissive(data[pos..]) catch return null;
     pos += fst.len;
     var ri: u64 = 0;
     while (ri < cnt.value) : (ri += 1) {
-        const gp = varint.decode(data[pos..]) catch return null;
+        const gp = varint.decodePermissive(data[pos..]) catch return null;
         pos += gp.len;
-        const rl = varint.decode(data[pos..]) catch return null;
+        const rl = varint.decodePermissive(data[pos..]) catch return null;
         pos += rl.len;
     }
-    const ect0 = varint.decode(data[pos..]) catch return null;
+    const ect0 = varint.decodePermissive(data[pos..]) catch return null;
     pos += ect0.len;
-    const ect1 = varint.decode(data[pos..]) catch return null;
+    const ect1 = varint.decodePermissive(data[pos..]) catch return null;
     pos += ect1.len;
-    const ce = varint.decode(data[pos..]) catch return null;
+    const ce = varint.decodePermissive(data[pos..]) catch return null;
     return .{ .ect0 = ect0.value, .ect1 = ect1.value, .ce = ce.value };
 }
 
 fn skipAckBody(data: []const u8, is_ecn: bool) usize {
     var pos: usize = 0;
-    const lar = varint.decode(data[pos..]) catch return data.len;
+    const lar = varint.decodePermissive(data[pos..]) catch return data.len;
     pos += lar.len;
-    const del = varint.decode(data[pos..]) catch return data.len;
+    const del = varint.decodePermissive(data[pos..]) catch return data.len;
     pos += del.len;
-    const cnt = varint.decode(data[pos..]) catch return data.len;
+    const cnt = varint.decodePermissive(data[pos..]) catch return data.len;
     pos += cnt.len;
-    const fst = varint.decode(data[pos..]) catch return data.len;
+    const fst = varint.decodePermissive(data[pos..]) catch return data.len;
     pos += fst.len;
     var ri: u64 = 0;
     while (ri < cnt.value) : (ri += 1) {
-        const gp = varint.decode(data[pos..]) catch return data.len;
+        const gp = varint.decodePermissive(data[pos..]) catch return data.len;
         pos += gp.len;
-        const rl = varint.decode(data[pos..]) catch return data.len;
+        const rl = varint.decodePermissive(data[pos..]) catch return data.len;
         pos += rl.len;
     }
     if (is_ecn) {
         inline for (0..3) |_| {
-            const ec = varint.decode(data[pos..]) catch return data.len;
+            const ec = varint.decodePermissive(data[pos..]) catch return data.len;
             pos += ec.len;
         }
     }
@@ -4556,27 +4556,27 @@ pub const Server = struct {
             if (plaintext[pos] == 0x02 or plaintext[pos] == 0x03) {
                 const is_ecn = plaintext[pos] == 0x03;
                 var ack_pos: usize = pos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const lar_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const del_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const cnt_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const fst_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
@@ -4603,9 +4603,9 @@ pub const Server = struct {
             // Try to parse as CRYPTO frame
             if (plaintext[pos] == 0x06) {
                 pos += 1;
-                const off_r = varint.decode(plaintext[pos..]) catch break;
+                const off_r = varint.decodePermissive(plaintext[pos..]) catch break;
                 pos += off_r.len;
-                const data_len_r = varint.decode(plaintext[pos..]) catch break;
+                const data_len_r = varint.decodePermissive(plaintext[pos..]) catch break;
                 pos += data_len_r.len;
                 const dlen: usize = @intCast(data_len_r.value);
                 if (pos + dlen > pt_len) break;
@@ -4643,7 +4643,7 @@ pub const Server = struct {
         // Parse the length + PN fields that follow the QUIC long header.
         var pos = lh.consumed;
         if (pos >= buf.len) return;
-        const payload_len_r = varint.decode(buf[pos..]) catch return;
+        const payload_len_r = varint.decodePermissive(buf[pos..]) catch return;
         pos += payload_len_r.len;
         const payload_len: usize = @intCast(payload_len_r.value);
         const pn_start = pos;
@@ -5421,7 +5421,7 @@ pub const Server = struct {
         // Parse the Handshake packet: after Long Header = length(varint) + pn + payload
         var pos = lh.consumed;
         if (pos >= buf.len) return;
-        const payload_len_r = varint.decode(buf[pos..]) catch return;
+        const payload_len_r = varint.decodePermissive(buf[pos..]) catch return;
         pos += payload_len_r.len;
         const payload_len: usize = @intCast(payload_len_r.value);
         const pn_start = pos;
@@ -5458,9 +5458,9 @@ pub const Server = struct {
             }
             if (plaintext[fpos] == 0x06) {
                 fpos += 1;
-                const off_r = varint.decode(plaintext[fpos..]) catch break;
+                const off_r = varint.decodePermissive(plaintext[fpos..]) catch break;
                 fpos += off_r.len;
-                const dlen_r = varint.decode(plaintext[fpos..]) catch break;
+                const dlen_r = varint.decodePermissive(plaintext[fpos..]) catch break;
                 fpos += dlen_r.len;
                 const dlen: usize = @intCast(dlen_r.value);
                 if (fpos + dlen > pt_len) break;
@@ -5500,27 +5500,27 @@ pub const Server = struct {
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
                 var ack_pos: usize = fpos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const lar_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const del_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const cnt_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const fst_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
@@ -6072,7 +6072,7 @@ pub const Server = struct {
 
         var pos: usize = 0;
         while (pos < frames.len) {
-            const ft_r = varint.decode(frames[pos..]) catch {
+            const ft_r = varint.decodePermissive(frames[pos..]) catch {
                 dbg("io: frame type decode error at pos={}\n", .{pos});
                 break;
             };
@@ -6114,27 +6114,27 @@ pub const Server = struct {
                 // First ACK Range so that the loss detector knows which packets
                 // were genuinely acknowledged vs. which are in a gap.
                 var ack_pos: usize = pos;
-                const lar_r = varint.decode(frames[ack_pos..]) catch {
+                const lar_r = varint.decodePermissive(frames[ack_pos..]) catch {
                     pos += skipAckBody(frames[pos..], ft == 0x03);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
 
-                const del_r = varint.decode(frames[ack_pos..]) catch {
+                const del_r = varint.decodePermissive(frames[ack_pos..]) catch {
                     pos += skipAckBody(frames[pos..], ft == 0x03);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
 
-                const cnt_r = varint.decode(frames[ack_pos..]) catch {
+                const cnt_r = varint.decodePermissive(frames[ack_pos..]) catch {
                     pos += skipAckBody(frames[pos..], ft == 0x03);
                     continue;
                 };
                 ack_pos += cnt_r.len;
 
-                const fst_r = varint.decode(frames[ack_pos..]) catch {
+                const fst_r = varint.decodePermissive(frames[ack_pos..]) catch {
                     pos += skipAckBody(frames[pos..], ft == 0x03);
                     continue;
                 };
@@ -6347,7 +6347,7 @@ pub const Server = struct {
             }
             if (ft == 0x10) {
                 // MAX_DATA — peer raises our connection-level send window.
-                const v = varint.decode(frames[pos..]) catch return;
+                const v = varint.decodePermissive(frames[pos..]) catch return;
                 pos += v.len;
                 if (v.value > conn.fc_send_max) {
                     conn.fc_send_max = v.value;
@@ -6377,7 +6377,7 @@ pub const Server = struct {
             }
             if (ft == 0x12 or ft == 0x13) {
                 // MAX_STREAMS — peer raises how many streams we may open (RFC 9000 §19.11).
-                const v = varint.decode(frames[pos..]) catch return;
+                const v = varint.decodePermissive(frames[pos..]) catch return;
                 pos += v.len;
                 if (ft == 0x12) {
                     conn.peer_max_bidi_streams = v.value;
@@ -6390,7 +6390,7 @@ pub const Server = struct {
             if (ft == 0x14) {
                 // DATA_BLOCKED — peer ran out of connection-level send credit.
                 // Respond with MAX_DATA to unblock it.
-                const db = varint.decode(frames[pos..]) catch return;
+                const db = varint.decodePermissive(frames[pos..]) catch return;
                 pos += db.len;
                 self.sendMaxData(conn, src);
                 continue;
@@ -6458,7 +6458,7 @@ pub const Server = struct {
             }
             if (ft == 0x16 or ft == 0x17) {
                 // STREAMS_BLOCKED — peer hit stream-count limit; grant more (RFC 9000 §4.6).
-                const v = varint.decode(frames[pos..]) catch return;
+                const v = varint.decodePermissive(frames[pos..]) catch return;
                 pos += v.len;
                 self.sendMaxStreams(conn, ft == 0x16, src);
                 continue;
@@ -6492,7 +6492,7 @@ pub const Server = struct {
             }
             if (ft == 0x19) {
                 // RETIRE_CONNECTION_ID — peer retires one of our CIDs (RFC 9000 §19.16).
-                const seq_r = varint.decode(frames[pos..]) catch return;
+                const seq_r = varint.decodePermissive(frames[pos..]) catch return;
                 pos += seq_r.len;
                 dbg("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 if (seq_r.value == 0) {
@@ -6515,9 +6515,9 @@ pub const Server = struct {
             if (ft == 0x18) {
                 // NEW_CONNECTION_ID from client (RFC 9000 §19.15) — rare but valid
                 // when the client advertises alternates.  Enforce our limit and store.
-                const seq_r = varint.decode(frames[pos..]) catch return;
+                const seq_r = varint.decodePermissive(frames[pos..]) catch return;
                 pos += seq_r.len;
-                const rpt_r = varint.decode(frames[pos..]) catch return;
+                const rpt_r = varint.decodePermissive(frames[pos..]) catch return;
                 pos += rpt_r.len;
                 if (pos >= frames.len) return;
                 const cid_len_byte = frames[pos];
@@ -6631,7 +6631,7 @@ pub const Server = struct {
             }
             if (ft == 0x07) {
                 // NEW_TOKEN (RFC 9000 §19.7) — ignore on server.
-                const len_r = varint.decode(frames[pos..]) catch break;
+                const len_r = varint.decodePermissive(frames[pos..]) catch break;
                 pos += len_r.len;
                 const tlen = varint.lenToUsize(len_r.value) catch break;
                 if (pos + tlen > frames.len) break;
@@ -10966,27 +10966,27 @@ pub const Client = struct {
             if (ft == 0x02 or ft == 0x03) {
                 const is_ecn = ft == 0x03;
                 var ack_pos: usize = pos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const lar_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const del_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const cnt_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const fst_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += 1;
                     pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
                     continue;
@@ -11012,9 +11012,9 @@ pub const Client = struct {
             }
             if (ft != 0x06) break; // not a CRYPTO frame — stop
             pos += 1;
-            const off_r = varint.decode(plaintext[pos..]) catch break;
+            const off_r = varint.decodePermissive(plaintext[pos..]) catch break;
             pos += off_r.len;
-            const dlen_r = varint.decode(plaintext[pos..]) catch break;
+            const dlen_r = varint.decodePermissive(plaintext[pos..]) catch break;
             pos += dlen_r.len;
             const dlen: usize = @intCast(dlen_r.value);
             if (pos + dlen > pt_len) break;
@@ -11083,27 +11083,27 @@ pub const Client = struct {
             if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
                 const is_ecn = plaintext[fpos] == 0x03;
                 var ack_pos: usize = fpos + 1;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const lar_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const del_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const cnt_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
                 };
                 ack_pos += cnt_r.len;
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const fst_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     fpos += 1;
                     fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
                     continue;
@@ -11328,7 +11328,7 @@ pub const Client = struct {
 
         var pos: usize = 0;
         while (pos < pt_len) {
-            const ft_r = varint.decode(plaintext[pos..]) catch return;
+            const ft_r = varint.decodePermissive(plaintext[pos..]) catch return;
             const ft = ft_r.value;
             pos += ft_r.len;
             self.conn.noteFrameReceived(ft);
@@ -11363,27 +11363,27 @@ pub const Client = struct {
                 // our outgoing 1-RTT packets and surface lost STREAM frames
                 // for the raw-application retransmit path below.
                 var ack_pos: usize = pos;
-                const lar_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const lar_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
                 ack_pos += lar_r.len;
                 const largest_ack = lar_r.value;
 
-                const del_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const del_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
                 ack_pos += del_r.len;
                 const ack_delay = del_r.value;
 
-                const cnt_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const cnt_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
                 ack_pos += cnt_r.len;
 
-                const fst_r = varint.decode(plaintext[ack_pos..pt_len]) catch {
+                const fst_r = varint.decodePermissive(plaintext[ack_pos..pt_len]) catch {
                     pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
                     continue;
                 };
@@ -11507,9 +11507,9 @@ pub const Client = struct {
             }
             if (ft == 0x06) {
                 // CRYPTO frame — may contain NewSessionTicket
-                const off_r = varint.decode(plaintext[pos..]) catch return;
+                const off_r = varint.decodePermissive(plaintext[pos..]) catch return;
                 pos += off_r.len;
-                const dlen_r = varint.decode(plaintext[pos..]) catch return;
+                const dlen_r = varint.decodePermissive(plaintext[pos..]) catch return;
                 pos += dlen_r.len;
                 const dlen: usize = @intCast(dlen_r.value);
                 if (pos + dlen > pt_len) return;
@@ -11535,7 +11535,7 @@ pub const Client = struct {
             }
             if (ft == 0x10) {
                 // MAX_DATA — server raises our connection-level send window.
-                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                const v = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
                 if (v.value > self.conn.fc_send_max) {
                     self.conn.fc_send_max = v.value;
@@ -11560,7 +11560,7 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
-                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                const v = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
                 if (ft == 0x12) {
                     self.conn.peer_max_bidi_streams = v.value;
@@ -11573,7 +11573,7 @@ pub const Client = struct {
             if (ft == 0x14) {
                 // DATA_BLOCKED — server ran out of connection-level send credit;
                 // grant more so it can resume (RFC 9000 §19.12).
-                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                const v = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
                 self.sendMaxData();
                 continue;
@@ -11623,9 +11623,9 @@ pub const Client = struct {
             }
             if (ft == 0x18) {
                 // NEW_CONNECTION_ID — store for migration (RFC 9000 §19.15 / §5.1.2).
-                const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                const seq_r = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
-                const rpt_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                const rpt_r = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += rpt_r.len;
                 if (pos >= pt_len) return;
                 const cid_len_byte = plaintext[pos];
@@ -11668,7 +11668,7 @@ pub const Client = struct {
             }
             if (ft == 0x19) {
                 // RETIRE_CONNECTION_ID — server retires one of our issued CIDs.
-                const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                const seq_r = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
                 dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 if (seq_r.value == 0) {
@@ -11685,7 +11685,7 @@ pub const Client = struct {
                 // server-initiated stream budget at the initial 256 limit (the
                 // inbound-leg reqresp / identify-push path on a full mesh) →
                 // StreamLimitExceeded storms at scale (zig-libp2p#259).
-                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                const v = varint.decodePermissive(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
                 self.clientGrantStreamCreditOnBlocked(ft == 0x16, v.value);
                 continue;
