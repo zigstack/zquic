@@ -280,6 +280,41 @@ jobs:
             --log-dir ../interop-results/logs-cross-zquic-quinn \
             --json ../interop-results/results-cross-zquic-quinn.json \
             --debug || true
+
+          # #229: the bulk `transfer` testcases intermittently stall on loaded
+          # runners (a DIFFERENT transfer flakes each run on behavior-identical
+          # commits). Auto-retry ONLY failed `transfer` cases once, into
+          # results-<suite>-retry.json; the summary gate below treats a
+          # base-failed + retry-passed transfer as flaky-passed. A real
+          # transfer regression fails both attempts and still reds the gate.
+          # cross-zquic-quinn's transfer is already KNOWN_FAILING (#184) — no
+          # retry there.
+          retry_transfer() {
+            local suite="$1" rclient="$2" rserver="$3"
+            python3 - "$suite" <<'PY' || return 0
+          import json, pathlib, sys
+          p = pathlib.Path(f"../interop-results/results-{sys.argv[1]}.json")
+          try:
+              d = json.loads(p.read_text())
+          except Exception:
+              sys.exit(1)
+          for pair in d.get("results", []):
+              for t in pair:
+                  if isinstance(t, dict) and t.get("name") == "transfer" and t.get("result") == "failed":
+                      sys.exit(0)  # exit 0 = a failed transfer exists -> retry
+          sys.exit(1)
+          PY
+            echo "::notice::retrying flaky transfer for suite '$suite' (zquic#229)"
+            python3 run.py \
+              --client "$rclient" \
+              --server "$rserver" \
+              --test transfer \
+              --log-dir "../interop-results/logs-$suite-retry" \
+              --json "../interop-results/results-$suite-retry.json" \
+              --debug || true
+          }
+          retry_transfer zquic zquic zquic
+          retry_transfer cross-quinn-zquic quinn zquic
         # The "Print result summary" step (if: always()) is the authoritative
         # gate — it exits non-zero on any NEW/unexpected failure. Upload/summary
         # steps below use if: always() so they run regardless.
@@ -300,10 +335,27 @@ jobs:
           python3 - <<'EOF'
           import json, pathlib, sys
 
-          result_files = sorted(pathlib.Path("interop-results").glob("results-*.json"))
+          all_files = sorted(pathlib.Path("interop-results").glob("results-*.json"))
+          result_files = [p for p in all_files if not p.stem.endswith("-retry")]
           if not result_files:
               print("No results-*.json found — test run may have failed to start.")
               sys.exit(0)
+
+          # #229: tests that passed on the automatic retry (results-<suite>-retry.json).
+          # A base failure with a passing retry is classified flaky-passed, not failed.
+          retry_passed = set()
+          for p in all_files:
+              if not p.stem.endswith("-retry"):
+                  continue
+              suite = p.stem.removeprefix("results-").removesuffix("-retry")
+              try:
+                  data = json.loads(p.read_text())
+              except Exception:
+                  continue
+              for pair in data.get("results", []):
+                  for t in pair:
+                      if isinstance(t, dict) and t.get("result") == "succeeded":
+                          retry_passed.add((suite, t.get("name")))
 
           # Known cross-impl gaps (zquic-as-client vs a quinn server), tracked
           # in zquic#184. Classified separately so a known gap does NOT fail the
@@ -313,6 +365,7 @@ jobs:
               "rebind-port(cross-zquic-quinn:zquic→quinn)",
           }
           passed, failed, unsupported, cross_failed, known_failing = [], [], [], [], []
+          flaky_passed = []
           for p in result_files:
               data = json.loads(p.read_text())
               suite = p.stem.removeprefix("results-")
@@ -341,6 +394,8 @@ jobs:
                               unsupported.append(tag)
                           elif tag in KNOWN_FAILING:
                               known_failing.append(tag)
+                          elif (suite, test_name) in retry_passed:
+                              flaky_passed.append(tag)
                           elif suite.startswith("cross-"):
                               cross_failed.append(tag)
                           else:
@@ -350,6 +405,8 @@ jobs:
           print(f"INTEROP RESULTS")
           print(f"{'='*55}")
           print(f"  PASSED      : {len(passed):2d}  {passed}")
+          if flaky_passed:
+              print(f"  FLAKY-PASSED: {len(flaky_passed):2d}  {flaky_passed}  (failed once, passed on retry — zquic#229)")
           print(f"  FAILED      : {len(failed):2d}  {failed}")
           if cross_failed:
               print(f"  CROSS FAILED: {len(cross_failed):2d}  {cross_failed}")

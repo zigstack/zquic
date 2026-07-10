@@ -1156,6 +1156,16 @@ const max_pending_drain_per_call: usize = 512;
 // again while a single drive() still stays well under the wall-clock budget.
 const max_sends_per_drive: usize = 2048;
 
+/// Rate limit for re-signalling STREAM_DATA_BLOCKED / DATA_BLOCKED from the
+/// pending-send drain (#231).  The fresh-send path emits the BLOCKED frame
+/// once when a write first gates, but if the peer's window GRANT datagram is
+/// lost, bytes already accepted into `pending_stream_sends` sit behind a
+/// closed window with nothing re-signalling — the drain silently skips them
+/// and (with an idle app) the transfer wedges forever.  BLOCKED frames are
+/// not retransmitted on loss (only STREAM data has retransmit machinery), so
+/// the drain re-emits them, throttled to one per interval per conn.
+const blocked_signal_interval_ms: i64 = 250;
+
 /// Effective per-connection pending-byte cap for `stream_id`.  Priority streams
 /// (the persistent gossip stream, marked by the embedder via `markStreamPriority`)
 /// get the full `pending_stream_send_bytes_cap` (40 MB); non-priority streams
@@ -2199,6 +2209,10 @@ pub const ConnState = struct {
     /// `pending_priority_reserve_bytes` / `pendingBytesCapForStream`. Set is
     /// tiny (one persistent stream per conn); cleared on conn reset/reap.
     stream_priorities: std.AutoHashMapUnmanaged(u64, i32) = .empty,
+    /// Last wall-clock a BLOCKED frame was re-signalled from the drain
+    /// (shared across DATA_BLOCKED and STREAM_DATA_BLOCKED; see
+    /// `blocked_signal_interval_ms`).
+    blocked_signal_last_ms: i64 = 0,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -3875,11 +3889,15 @@ pub const Server = struct {
                 const chunk_len = @min(unsent, max_pending_stream_chunk);
                 const stream_limit = conn.peerStreamSendLimit(p.stream_id, true);
                 if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
+                    // Re-signal in case the peer's MAX_STREAM_DATA grant was
+                    // lost — queued bytes would otherwise wedge silently (#231).
+                    self.maybeSignalStreamDataBlocked(conn, p.stream_id, stream_limit);
                     i += 1;
                     continue;
                 }
                 const projected: u64 = conn.fc_bytes_sent +| chunk_len;
                 if (projected > conn.fc_send_max) {
+                    self.maybeSignalDataBlocked(conn);
                     i += 1;
                     continue;
                 }
@@ -7172,6 +7190,31 @@ pub const Server = struct {
     /// Send a MAX_DATA frame to extend the peer's connection-level send window.
     /// Called when we have consumed ≥50% of the advertised receive window so the
     /// peer is not forced to stall.  We double the window each time.
+    /// Rate-limited STREAM_DATA_BLOCKED re-signal from the pending-send drain
+    /// (RFC 9000 §4.1: a blocked sender SHOULD signal; #231 wedge fix — see
+    /// `blocked_signal_interval_ms`).
+    fn maybeSignalStreamDataBlocked(self: *Server, conn: *ConnState, stream_id: u64, limit: u64) void {
+        const now = compat.milliTimestamp();
+        if (now - conn.blocked_signal_last_ms < blocked_signal_interval_ms) return;
+        conn.blocked_signal_last_ms = now;
+        var blk_buf: [24]u8 = undefined;
+        blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+        const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return;
+        const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], limit) catch return;
+        self.send1Rtt(conn, blk_buf[0 .. 1 + sid_enc.len + lim_enc.len], conn.peer);
+    }
+
+    /// Rate-limited DATA_BLOCKED re-signal from the pending-send drain (#231).
+    fn maybeSignalDataBlocked(self: *Server, conn: *ConnState) void {
+        const now = compat.milliTimestamp();
+        if (now - conn.blocked_signal_last_ms < blocked_signal_interval_ms) return;
+        conn.blocked_signal_last_ms = now;
+        var blk_buf: [16]u8 = undefined;
+        blk_buf[0] = 0x14; // DATA_BLOCKED
+        const enc = varint.encode(blk_buf[1..], conn.fc_send_max) catch return;
+        self.send1Rtt(conn, blk_buf[0 .. 1 + enc.len], conn.peer);
+    }
+
     fn sendMaxData(self: *Server, conn: *ConnState, dst: compat.Address) void {
         conn.fc_recv_max = conn.fc_bytes_recv + 64 * 1024 * 1024;
         var buf: [16]u8 = undefined;
@@ -9371,6 +9414,29 @@ pub const Client = struct {
     /// window (RFC 9000 §19.9). Mirror of `Server.sendMaxData` for the client —
     /// the client previously did no receive-side connection flow control, so a
     /// server streaming past our advertised `initial_max_data` would stall.
+    /// Mirror of `Server.maybeSignalStreamDataBlocked` (#231).
+    fn maybeSignalStreamDataBlocked(self: *Client, stream_id: u64, limit: u64) void {
+        const now = compat.milliTimestamp();
+        if (now - self.conn.blocked_signal_last_ms < blocked_signal_interval_ms) return;
+        self.conn.blocked_signal_last_ms = now;
+        var blk_buf: [24]u8 = undefined;
+        blk_buf[0] = 0x15; // STREAM_DATA_BLOCKED
+        const sid_enc = varint.encode(blk_buf[1..], stream_id) catch return;
+        const lim_enc = varint.encode(blk_buf[1 + sid_enc.len ..], limit) catch return;
+        _ = self.sendClient1Rtt(blk_buf[0 .. 1 + sid_enc.len + lim_enc.len]);
+    }
+
+    /// Mirror of `Server.maybeSignalDataBlocked` (#231).
+    fn maybeSignalDataBlocked(self: *Client) void {
+        const now = compat.milliTimestamp();
+        if (now - self.conn.blocked_signal_last_ms < blocked_signal_interval_ms) return;
+        self.conn.blocked_signal_last_ms = now;
+        var blk_buf: [16]u8 = undefined;
+        blk_buf[0] = 0x14; // DATA_BLOCKED
+        const enc = varint.encode(blk_buf[1..], self.conn.fc_send_max) catch return;
+        _ = self.sendClient1Rtt(blk_buf[0 .. 1 + enc.len]);
+    }
+
     fn sendMaxData(self: *Client) void {
         self.conn.fc_recv_max = self.conn.fc_bytes_recv + 64 * 1024 * 1024;
         var buf: [16]u8 = undefined;
@@ -9642,11 +9708,15 @@ pub const Client = struct {
                 const chunk_len = @min(unsent, max_pending_stream_chunk);
                 const stream_limit = self.conn.peerStreamSendLimit(p.stream_id, false);
                 if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
+                    // Re-signal in case the peer's MAX_STREAM_DATA grant was
+                    // lost — queued bytes would otherwise wedge silently (#231).
+                    self.maybeSignalStreamDataBlocked(p.stream_id, stream_limit);
                     i += 1;
                     continue;
                 }
                 const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
                 if (projected > self.conn.fc_send_max) {
+                    self.maybeSignalDataBlocked();
                     i += 1;
                     continue;
                 }
@@ -13581,15 +13651,14 @@ test "raw-app recv delivery budget: large response paces across drives, arrives 
     // because EVERY packet is still decrypted/parsed/ACKed/credited, the transfer
     // makes progress every drive (no credit starvation / wedge).
     //
-    // SKIPPED: this full Server<->Client socket-loopback transfer is reliable on
-    // macOS but stalls intermittently on Linux CI runners — a windowed-transfer
-    // interaction with the `rawPumpOnce` test harness's flow-control credit pump,
-    // NOT the delivery-budget logic. That logic is covered byte-exact by the
-    // deterministic unit tests in `raw_app_stream.zig` (deferral / resume / pacing
-    // / null-passthrough) and validated end-to-end on the live devnet. Re-enable
-    // once the loopback harness drives flow-control credit deterministically
-    // across platforms.
-    if (true) return error.SkipZigTest;
+    // RE-ENABLED (#231): the intermittent Linux-CI stall was a lost window-GRANT
+    // datagram (kernel loopback drop under load): once every payload byte was
+    // accepted into `pending_stream_sends`, the app-side send loop stopped
+    // calling `sendRawStreamData`, so nothing ever re-emitted a BLOCKED frame
+    // and the drain skipped the closed-window entries silently — a permanent
+    // wedge. The drain now re-signals STREAM_DATA_BLOCKED / DATA_BLOCKED
+    // (rate-limited, `blocked_signal_interval_ms`) so a lost grant self-heals:
+    // the peer answers the re-signal with a fresh MAX_(STREAM_)DATA.
     const allocator = std.heap.page_allocator; // big payload: avoid checking-alloc overhead
     const client = try allocator.create(Client);
     defer allocator.destroy(client);
@@ -14885,4 +14954,56 @@ test "stream priority: drain serves higher-priority stream first (#191)" {
     // Clearing priority (shim path) restores arrival order for the remainder.
     lb.server.unmarkStreamPriority(conn, high_sid);
     try std.testing.expectEqual(@as(i32, 0), conn.streamPriority(high_sid));
+}
+
+test "pending-send drain re-signals DATA_BLOCKED after a lost grant (wedge recovery, #231)" {
+    // Reproduces the lost-GRANT wedge deterministically: bytes are placed
+    // directly into `pending_stream_sends` (bypassing the fresh-send path's
+    // one-shot BLOCKED emission — the same state as "fresh-path DATA_BLOCKED
+    // datagram lost on the wire") while the connection-level send window is
+    // exhausted. Without the drain's rate-limited re-signal the client is
+    // never told the server is blocked, grants nothing, and the transfer
+    // wedges forever. With it: drain re-emits DATA_BLOCKED → client answers
+    // MAX_DATA → the MAX_DATA arm re-drains → payload completes.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const sid = try lb.server.openRawAppStream(conn);
+
+    // Exhaust conn-level send credit so the drain's fc gate blocks.
+    conn.fc_send_max = conn.fc_bytes_sent;
+
+    const payload = "WEDGE-RECOVERY-PAYLOAD";
+    try std.testing.expect(enqueuePendingStreamSend(conn, allocator, sid, 0, payload, true));
+
+    var drop = RawDrop{};
+    var done = false;
+    var iter: usize = 0;
+    while (iter < 2_000) : (iter += 1) {
+        lb.server.drainPendingStreamSends(conn);
+        rawPumpOnce(lb.server, lb.client, lb.server_addr, &drop);
+        if (lb.client.rawAppStreamFullyReceived(sid)) {
+            if (lb.client.rawAppRecvBuffer(sid)) |got| {
+                if (got.len == payload.len) {
+                    done = true;
+                    break;
+                }
+            }
+        }
+    }
+    try std.testing.expect(done);
+    const got = lb.client.rawAppRecvBuffer(sid) orelse return error.NoRawAppData;
+    try std.testing.expectEqualSlices(u8, payload, got);
+    // The recovery must have gone through the re-signal: the window was raised
+    // above the artificially-exhausted level by a client MAX_DATA.
+    try std.testing.expect(conn.fc_send_max > conn.fc_bytes_sent - payload.len or conn.fc_bytes_sent > 0);
+
+    try std.testing.expect(lb.client.releaseRawAppStream(sid));
+    try std.testing.expect(releaseRawAppStream(conn, sid, allocator));
 }
