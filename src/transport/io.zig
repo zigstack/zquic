@@ -1163,7 +1163,7 @@ const max_sends_per_drive: usize = 2048;
 /// budget) so they can never consume the gossip headroom — but still fit a full
 /// ~32 MB single-write block-sync response.  See `pending_priority_reserve_bytes`.
 fn pendingBytesCapForStream(conn: *const ConnState, stream_id: u64) usize {
-    if (conn.priority_stream_ids.contains(stream_id)) return pending_stream_send_bytes_cap;
+    if (conn.streamPriority(stream_id) > 0) return pending_stream_send_bytes_cap;
     return pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
 }
 
@@ -2186,6 +2186,11 @@ pub const ConnState = struct {
     /// falls back to the §18.2 initial limit for that stream, which only causes
     /// us to be over-conservative on send — never to violate the peer's window.
     per_stream_send_max: std.AutoHashMapUnmanaged(u64, PeerStreamSendMaxEntry) = .empty,
+    /// Per-stream send priority set via `setStreamPriority` (issue #191;
+    /// quinn `SendStream::set_priority` equivalent).  Default 0 when absent.
+    /// Higher priority streams drain first (strict tiers, arrival-order
+    /// round-robin within a tier).  Positive priority additionally grants the
+    /// full pending-send byte budget (the #236 gossip headroom):
     /// Stream IDs the embedder marked **priority** via `markStreamPriority`
     /// (the persistent /meshsub gossip stream).  Priority streams enqueue
     /// pending bytes against the full `pending_stream_send_bytes_cap`;
@@ -2193,7 +2198,7 @@ pub const ConnState = struct {
     /// large response can never consume the gossip headroom. See
     /// `pending_priority_reserve_bytes` / `pendingBytesCapForStream`. Set is
     /// tiny (one persistent stream per conn); cleared on conn reset/reap.
-    priority_stream_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    stream_priorities: std.AutoHashMapUnmanaged(u64, i32) = .empty,
     /// Peer's `max_idle_timeout` (RFC 9000 §10.1) in milliseconds. Effective
     /// idle timeout is min(local, peer); 0 means peer omitted the param so
     /// only the local value applies.
@@ -2387,6 +2392,26 @@ pub const ConnState = struct {
 
     pub fn noteDatagramSent(self: *ConnState, len: usize) void {
         stats_mod.noteDatagramTx(&self.stats_acc, len);
+    }
+
+    /// Effective send priority for `stream_id` (0 = default / unset).
+    pub fn streamPriority(self: *const ConnState, stream_id: u64) i32 {
+        return self.stream_priorities.get(stream_id) orelse 0;
+    }
+
+    /// Highest priority tier strictly below `bound` among queued pending-send
+    /// entries, or null when none remain.  Drives the strict-priority drain
+    /// order in `drainPendingStreamSends` (issue #191): tiers are visited
+    /// descending; within a tier, entries keep arrival order (one chunk per
+    /// entry per pass = round-robin among equal-priority streams).
+    fn nextPriorityTierBelow(self: *const ConnState, bound: i64) ?i32 {
+        var best: ?i32 = null;
+        for (self.pending_stream_sends.items) |e| {
+            const prio = self.streamPriority(e.stream_id);
+            if (@as(i64, prio) >= bound) continue;
+            if (best == null or prio > best.?) best = prio;
+        }
+        return best;
     }
 
     pub fn noteFrameReceived(self: *ConnState, ft: u64) void {
@@ -3538,13 +3563,29 @@ pub const Server = struct {
     /// silently no-ops on OOM (the stream then simply shares the reduced cap —
     /// degraded fairness, never a crash). Cleared automatically on conn reset.
     pub fn markStreamPriority(self: *Server, conn: *ConnState, stream_id: u64) void {
-        conn.priority_stream_ids.put(self.allocator, stream_id, {}) catch {};
+        self.setStreamPriority(conn, stream_id, 1);
     }
 
     /// Remove a stream's priority marking (e.g. when the persistent gossip
     /// stream is torn down and reopened with a new id). Safe if absent.
-    pub fn unmarkStreamPriority(_: *Server, conn: *ConnState, stream_id: u64) void {
-        _ = conn.priority_stream_ids.remove(stream_id);
+    pub fn unmarkStreamPriority(self: *Server, conn: *ConnState, stream_id: u64) void {
+        self.setStreamPriority(conn, stream_id, 0);
+    }
+
+    /// Set `stream_id`'s send priority (quinn `SendStream::set_priority`
+    /// equivalent, issue #191).  Default is 0; higher drains first — the
+    /// pending-send drain serves strictly descending priority tiers, with
+    /// arrival-order round-robin among equal-priority streams.  Positive
+    /// priority additionally grants the stream the full pending-send byte
+    /// budget (the #236 headroom, same as `markStreamPriority`).  Setting 0
+    /// clears the entry.  Idempotent; silently no-ops on OOM (the stream then
+    /// drains at default priority — degraded ordering, never a crash).
+    pub fn setStreamPriority(self: *Server, conn: *ConnState, stream_id: u64, priority: i32) void {
+        if (priority == 0) {
+            _ = conn.stream_priorities.remove(stream_id);
+            return;
+        }
+        conn.stream_priorities.put(self.allocator, stream_id, priority) catch {};
     }
 
     /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
@@ -3806,51 +3847,100 @@ pub const Server = struct {
         const remaining = max_sends_per_drive -| conn.sends_this_drive;
         if (remaining == 0) return;
         const call_cap = @min(max_pending_drain_per_call, remaining);
-        var i: usize = 0;
         var drained: usize = 0;
-        while (i < conn.pending_stream_sends.items.len) {
-            if (drained >= call_cap) break; // shared per-drive + per-call bound
-            const p = &conn.pending_stream_sends.items[i];
-            const unsent = p.data.len - p.sent_in_buf;
-            const chunk_len = @min(unsent, max_pending_stream_chunk);
-            const stream_limit = conn.peerStreamSendLimit(p.stream_id, true);
-            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
-                i += 1;
-                continue;
-            }
-            const projected: u64 = conn.fc_bytes_sent +| chunk_len;
-            if (projected > conn.fc_send_max) {
-                i += 1;
-                continue;
-            }
-            const pace_bytes: u64 = @intCast(chunk_len);
-            if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
-                maybeLogPendingStreamStall(conn, "server");
-                return;
-            }
-            const stream_id = p.stream_id;
-            const offset = p.offset;
-            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
-            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
-            const sf = stream_frame_mod.StreamFrame{
-                .stream_id = stream_id,
-                .offset = offset,
-                .data = chunk,
-                .fin = fin,
-                .has_length = true,
-            };
-            var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const flen = sf.serialize(&frame_buf) catch {
-                i += 1;
-                continue;
-            };
-            const pn_before = conn.app_pn;
-            self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
-            if (conn.app_pn == pn_before) return;
-            conn.fc_bytes_sent +|= chunk_len;
-            drained += 1;
-            conn.sends_this_drive += 1; // shared per-drive budget accounting
-            if (conn.ld.sent_count == 0) {
+        // Strict-priority drain (issue #191): serve pending entries in
+        // descending priority tiers.  Within a tier the walk keeps arrival
+        // order and emits one chunk per entry per pass — round-robin among
+        // equal-priority streams.  Entries FC-blocked in a higher tier are
+        // skipped by the tier filter on lower passes (no double-send).
+        var tier_bound: i64 = std.math.maxInt(i64);
+        outer: while (drained < call_cap) {
+            const tier = conn.nextPriorityTierBelow(tier_bound) orelse break;
+            tier_bound = tier;
+            var i: usize = 0;
+            while (i < conn.pending_stream_sends.items.len) {
+                if (drained >= call_cap) break :outer; // shared per-drive + per-call bound
+                const p = &conn.pending_stream_sends.items[i];
+                if (conn.streamPriority(p.stream_id) != tier) {
+                    i += 1;
+                    continue;
+                }
+                const unsent = p.data.len - p.sent_in_buf;
+                const chunk_len = @min(unsent, max_pending_stream_chunk);
+                const stream_limit = conn.peerStreamSendLimit(p.stream_id, true);
+                if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
+                    i += 1;
+                    continue;
+                }
+                const projected: u64 = conn.fc_bytes_sent +| chunk_len;
+                if (projected > conn.fc_send_max) {
+                    i += 1;
+                    continue;
+                }
+                const pace_bytes: u64 = @intCast(chunk_len);
+                if (!connCanTransmitAppData(conn, compat.milliTimestamp(), pace_bytes)) {
+                    maybeLogPendingStreamStall(conn, "server");
+                    return;
+                }
+                const stream_id = p.stream_id;
+                const offset = p.offset;
+                const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
+                const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
+                const sf = stream_frame_mod.StreamFrame{
+                    .stream_id = stream_id,
+                    .offset = offset,
+                    .data = chunk,
+                    .fin = fin,
+                    .has_length = true,
+                };
+                var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const flen = sf.serialize(&frame_buf) catch {
+                    i += 1;
+                    continue;
+                };
+                const pn_before = conn.app_pn;
+                self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
+                if (conn.app_pn == pn_before) return;
+                conn.fc_bytes_sent +|= chunk_len;
+                drained += 1;
+                conn.sends_this_drive += 1; // shared per-drive budget accounting
+                if (conn.ld.sent_count == 0) {
+                    p.sent_in_buf += chunk_len;
+                    p.offset += chunk_len;
+                    conn.pending_stream_send_bytes -|= chunk_len;
+                    if (p.sent_in_buf == p.data.len) {
+                        const buf = p.data;
+                        _ = conn.pending_stream_sends.orderedRemove(i);
+                        if (buf.len > 0) self.allocator.free(buf);
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                const sent_pn = conn.app_pn - 1;
+                const last = conn.ld.lastSentPtr().?;
+                if (last.pn != sent_pn) {
+                    i += 1;
+                    continue;
+                }
+                // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
+                // Never dupe an empty chunk: that yields the allocator's zero-length
+                // sentinel slice, which freeing on ack/loss corrupts the heap. Track
+                // with no stream_data; a lost bare FIN is re-emitted by the FIN-only
+                // loss-recovery arm.
+                const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
+                    i += 1;
+                    continue;
+                });
+                if (last.stream_data) |old| {
+                    if (rtx_buf == null or old.ptr != rtx_buf.?.ptr) self.allocator.free(old);
+                }
+                last.has_stream_data = rtx_buf != null;
+                last.stream_id = stream_id;
+                last.stream_offset = offset;
+                last.stream_data = rtx_buf;
+                last.stream_fin = fin;
+                conn.pacerConsume(@intCast(chunk_len));
                 p.sent_in_buf += chunk_len;
                 p.offset += chunk_len;
                 conn.pending_stream_send_bytes -|= chunk_len;
@@ -3861,41 +3951,6 @@ pub const Server = struct {
                 } else {
                     i += 1;
                 }
-                continue;
-            }
-            const sent_pn = conn.app_pn - 1;
-            const last = conn.ld.lastSentPtr().?;
-            if (last.pn != sent_pn) {
-                i += 1;
-                continue;
-            }
-            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
-            // Never dupe an empty chunk: that yields the allocator's zero-length
-            // sentinel slice, which freeing on ack/loss corrupts the heap. Track
-            // with no stream_data; a lost bare FIN is re-emitted by the FIN-only
-            // loss-recovery arm.
-            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
-                i += 1;
-                continue;
-            });
-            if (last.stream_data) |old| {
-                if (rtx_buf == null or old.ptr != rtx_buf.?.ptr) self.allocator.free(old);
-            }
-            last.has_stream_data = rtx_buf != null;
-            last.stream_id = stream_id;
-            last.stream_offset = offset;
-            last.stream_data = rtx_buf;
-            last.stream_fin = fin;
-            conn.pacerConsume(@intCast(chunk_len));
-            p.sent_in_buf += chunk_len;
-            p.offset += chunk_len;
-            conn.pending_stream_send_bytes -|= chunk_len;
-            if (p.sent_in_buf == p.data.len) {
-                const buf = p.data;
-                _ = conn.pending_stream_sends.orderedRemove(i);
-                if (buf.len > 0) self.allocator.free(buf);
-            } else {
-                i += 1;
             }
         }
     }
@@ -8424,8 +8479,8 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     conn.per_stream_send_max = .empty;
     conn.per_stream_recv.deinit(allocator);
     conn.per_stream_recv = .empty;
-    conn.priority_stream_ids.deinit(allocator);
-    conn.priority_stream_ids = .empty;
+    conn.stream_priorities.deinit(allocator);
+    conn.stream_priorities = .empty;
     // Free any retransmit buffers attached to in-flight LD entries so the
     // raw_application_streams send-side doesn't leak when a connection is
     // reaped or migrated.  HTTP/0.9 / HTTP/3 stream_data is `null` so this
@@ -9085,12 +9140,22 @@ pub const Client = struct {
     /// the persistent /meshsub gossip stream so a large req/resp response can
     /// never starve gossip. Idempotent; no-ops on OOM. See `Server.markStreamPriority`.
     pub fn markStreamPriority(self: *Client, stream_id: u64) void {
-        self.conn.priority_stream_ids.put(self.allocator, stream_id, {}) catch {};
+        self.setStreamPriority(stream_id, 1);
     }
 
     /// Remove a stream's priority marking. Safe if absent.
     pub fn unmarkStreamPriority(self: *Client, stream_id: u64) void {
-        _ = self.conn.priority_stream_ids.remove(stream_id);
+        self.setStreamPriority(stream_id, 0);
+    }
+
+    /// Set `stream_id`'s send priority (issue #191).  Mirrors
+    /// `Server.setStreamPriority` — see there for semantics.
+    pub fn setStreamPriority(self: *Client, stream_id: u64, priority: i32) void {
+        if (priority == 0) {
+            _ = self.conn.stream_priorities.remove(stream_id);
+            return;
+        }
+        self.conn.stream_priorities.put(self.allocator, stream_id, priority) catch {};
     }
 
     /// Send one RFC 9221 DATAGRAM on 1-RTT.  Returns false when datagrams are
@@ -9530,109 +9595,123 @@ pub const Client = struct {
         const remaining = max_sends_per_drive -| self.conn.sends_this_drive;
         if (remaining == 0) return;
         const call_cap = @min(max_pending_drain_per_call, remaining);
-        var i: usize = 0;
         var drained: usize = 0;
-        while (i < self.conn.pending_stream_sends.items.len) {
-            if (drained >= call_cap) break; // shared per-drive + per-call bound
-            const p = &self.conn.pending_stream_sends.items[i];
-            const unsent = p.data.len - p.sent_in_buf;
-            const chunk_len = @min(unsent, max_pending_stream_chunk);
-            const stream_limit = self.conn.peerStreamSendLimit(p.stream_id, false);
-            if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
-                i += 1;
-                continue;
-            }
-            const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
-            if (projected > self.conn.fc_send_max) {
-                i += 1;
-                continue;
-            }
-            const pace_bytes: u64 = @intCast(chunk_len);
-            if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
-                maybeLogPendingStreamStall(&self.conn, "client");
-                return;
-            }
-            const stream_id = p.stream_id;
-            const offset = p.offset;
-            const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
-            const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
-            const sf = stream_frame_mod.StreamFrame{
-                .stream_id = stream_id,
-                .offset = offset,
-                .data = chunk,
-                .fin = fin,
-                .has_length = true,
-            };
-            var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const flen = sf.serialize(&frame_buf) catch {
-                i += 1;
-                continue;
-            };
-            if (!self.conn.ld.hasCapacity()) {
-                maybeLogPendingStreamStall(&self.conn, "client");
-                return;
-            }
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                frame_buf[0..flen],
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.packet_cipher,
-                self.conn.peer_grease_quic_bit,
-            ) catch {
-                i += 1;
-                continue;
-            };
-            const pn = self.conn.app_pn;
-            self.conn.app_pn += 1;
-            // Batched 1-RTT send (sendmmsg at the next flush). This is the
-            // deferred-stream / retransmit drain — the hottest client send path
-            // when forwarding gossip under backpressure.
-            self.batchSend(send_buf[0..pkt_len]);
-            self.conn.fc_bytes_sent +|= chunk_len;
-            self.conn.note1RttSent();
-            drained += 1;
-            self.conn.sends_this_drive += 1; // shared per-drive budget accounting
-            // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
-            // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
-            // allocator's zero-length sentinel slice, which freeing on ack/loss
-            // corrupts the heap. Track with no stream_data; a lost bare FIN is
-            // re-emitted by the FIN-only loss-recovery arm.
-            const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
-                i += 1;
-                continue;
-            });
-            const recorded = self.conn.ld.onPacketSent(.{
-                .pn = pn,
-                .send_time_ms = @intCast(compat.milliTimestamp()),
-                .size = pkt_len,
-                .ack_eliciting = true,
-                .in_flight = true,
-                .has_stream_data = rtx_buf != null,
-                .stream_id = stream_id,
-                .stream_offset = offset,
-                .stream_data = rtx_buf,
-                .stream_fin = fin,
-                .space = .application,
-            });
-            if (recorded) {
-                self.conn.cc.onPacketSent(@intCast(pkt_len));
-                self.conn.pacerConsume(@intCast(pkt_len));
-            } else if (rtx_buf) |b| {
-                self.allocator.free(b);
-            }
-            p.sent_in_buf += chunk_len;
-            p.offset += chunk_len;
-            self.conn.pending_stream_send_bytes -|= chunk_len;
-            if (p.sent_in_buf == p.data.len) {
-                const buf = p.data;
-                _ = self.conn.pending_stream_sends.orderedRemove(i);
-                if (buf.len > 0) self.allocator.free(buf);
-            } else {
-                i += 1;
+        // Strict-priority drain (issue #191): serve pending entries in
+        // descending priority tiers.  Within a tier the walk keeps arrival
+        // order and emits one chunk per entry per pass — round-robin among
+        // equal-priority streams.  Entries FC-blocked in a higher tier are
+        // skipped by the tier filter on lower passes (no double-send).
+        var tier_bound: i64 = std.math.maxInt(i64);
+        outer: while (drained < call_cap) {
+            const tier = self.conn.nextPriorityTierBelow(tier_bound) orelse break;
+            tier_bound = tier;
+            var i: usize = 0;
+            while (i < self.conn.pending_stream_sends.items.len) {
+                if (drained >= call_cap) break :outer; // shared per-drive + per-call bound
+                const p = &self.conn.pending_stream_sends.items[i];
+                if (self.conn.streamPriority(p.stream_id) != tier) {
+                    i += 1;
+                    continue;
+                }
+                const unsent = p.data.len - p.sent_in_buf;
+                const chunk_len = @min(unsent, max_pending_stream_chunk);
+                const stream_limit = self.conn.peerStreamSendLimit(p.stream_id, false);
+                if (stream_limit > 0 and p.offset +| chunk_len > stream_limit) {
+                    i += 1;
+                    continue;
+                }
+                const projected: u64 = self.conn.fc_bytes_sent +| chunk_len;
+                if (projected > self.conn.fc_send_max) {
+                    i += 1;
+                    continue;
+                }
+                const pace_bytes: u64 = @intCast(chunk_len);
+                if (!connCanTransmitAppData(&self.conn, compat.milliTimestamp(), pace_bytes)) {
+                    maybeLogPendingStreamStall(&self.conn, "client");
+                    return;
+                }
+                const stream_id = p.stream_id;
+                const offset = p.offset;
+                const fin = p.fin and p.sent_in_buf + chunk_len == p.data.len;
+                const chunk = p.data[p.sent_in_buf .. p.sent_in_buf + chunk_len];
+                const sf = stream_frame_mod.StreamFrame{
+                    .stream_id = stream_id,
+                    .offset = offset,
+                    .data = chunk,
+                    .fin = fin,
+                    .has_length = true,
+                };
+                var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const flen = sf.serialize(&frame_buf) catch {
+                    i += 1;
+                    continue;
+                };
+                if (!self.conn.ld.hasCapacity()) {
+                    maybeLogPendingStreamStall(&self.conn, "client");
+                    return;
+                }
+                var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const pkt_len = build1RttPacketFull(
+                    &send_buf,
+                    self.conn.remote_cid,
+                    frame_buf[0..flen],
+                    self.conn.app_pn,
+                    &self.conn.app_client_km,
+                    self.conn.key_phase_bit,
+                    self.conn.packet_cipher,
+                    self.conn.peer_grease_quic_bit,
+                ) catch {
+                    i += 1;
+                    continue;
+                };
+                const pn = self.conn.app_pn;
+                self.conn.app_pn += 1;
+                // Batched 1-RTT send (sendmmsg at the next flush). This is the
+                // deferred-stream / retransmit drain — the hottest client send path
+                // when forwarding gossip under backpressure.
+                self.batchSend(send_buf[0..pkt_len]);
+                self.conn.fc_bytes_sent +|= chunk_len;
+                self.conn.note1RttSent();
+                drained += 1;
+                self.conn.sends_this_drive += 1; // shared per-drive budget accounting
+                // FIN-only entries (chunk_len == 0) carry no retransmittable bytes.
+                // Never dupe an empty chunk: `dupe(u8, &.{})` returns the
+                // allocator's zero-length sentinel slice, which freeing on ack/loss
+                // corrupts the heap. Track with no stream_data; a lost bare FIN is
+                // re-emitted by the FIN-only loss-recovery arm.
+                const rtx_buf: ?[]u8 = if (chunk_len == 0) null else (self.allocator.dupe(u8, chunk) catch {
+                    i += 1;
+                    continue;
+                });
+                const recorded = self.conn.ld.onPacketSent(.{
+                    .pn = pn,
+                    .send_time_ms = @intCast(compat.milliTimestamp()),
+                    .size = pkt_len,
+                    .ack_eliciting = true,
+                    .in_flight = true,
+                    .has_stream_data = rtx_buf != null,
+                    .stream_id = stream_id,
+                    .stream_offset = offset,
+                    .stream_data = rtx_buf,
+                    .stream_fin = fin,
+                    .space = .application,
+                });
+                if (recorded) {
+                    self.conn.cc.onPacketSent(@intCast(pkt_len));
+                    self.conn.pacerConsume(@intCast(pkt_len));
+                } else if (rtx_buf) |b| {
+                    self.allocator.free(b);
+                }
+                p.sent_in_buf += chunk_len;
+                p.offset += chunk_len;
+                self.conn.pending_stream_send_bytes -|= chunk_len;
+                if (p.sent_in_buf == p.data.len) {
+                    const buf = p.data;
+                    _ = self.conn.pending_stream_sends.orderedRemove(i);
+                    if (buf.len > 0) self.allocator.free(buf);
+                } else {
+                    i += 1;
+                }
             }
         }
     }
@@ -12918,12 +12997,12 @@ test "pending stream send: priority stream keeps headroom under a full non-prior
     const a = std.testing.allocator;
     var conn = makeConnForStreamTest();
     defer freePendingStreamSends(&conn, a);
-    defer conn.priority_stream_ids.deinit(a);
+    defer conn.stream_priorities.deinit(a);
 
     const gossip_stream: u64 = 4; // marked priority below
     const reqresp_stream: u64 = 8; // bulk blocks_by_range response
 
-    try conn.priority_stream_ids.put(a, gossip_stream, {});
+    try conn.stream_priorities.put(a, gossip_stream, 1);
 
     const reqresp_cap = pending_stream_send_bytes_cap - pending_priority_reserve_bytes;
     try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), reqresp_cap);
@@ -14703,4 +14782,82 @@ test "ack-frequency: reorder trigger honors reordering_threshold" {
     });
     conn.noteAppAckPacketObserved(20, 1003, 6, true);
     try std.testing.expect(conn.ack_immediate);
+}
+
+test "stream priority: setStreamPriority set/clear + shims + budget headroom (#191)" {
+    const a = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer conn.stream_priorities.deinit(a);
+
+    // Default 0 when unset.
+    try std.testing.expectEqual(@as(i32, 0), conn.streamPriority(4));
+
+    // Direct map semantics (Server/Client setStreamPriority wrap this with
+    // remove-on-zero; exercised via the shims in the loopback test below).
+    try conn.stream_priorities.put(a, 4, 7);
+    try std.testing.expectEqual(@as(i32, 7), conn.streamPriority(4));
+    // Positive priority grants the full pending byte budget (#236 semantics).
+    try std.testing.expectEqual(pending_stream_send_bytes_cap, pendingBytesCapForStream(&conn, 4));
+    try std.testing.expectEqual(pending_stream_send_bytes_cap - pending_priority_reserve_bytes, pendingBytesCapForStream(&conn, 8));
+    // Negative priority orders below default but does NOT get the headroom.
+    try conn.stream_priorities.put(a, 8, -3);
+    try std.testing.expectEqual(@as(i32, -3), conn.streamPriority(8));
+    try std.testing.expectEqual(pending_stream_send_bytes_cap - pending_priority_reserve_bytes, pendingBytesCapForStream(&conn, 8));
+}
+
+test "stream priority: nextPriorityTierBelow walks tiers descending (#191)" {
+    const a = std.testing.allocator;
+    var conn = makeConnForStreamTest();
+    defer freePendingStreamSends(&conn, a);
+    defer conn.stream_priorities.deinit(a);
+
+    // Queue entries for four streams: prio 0 (default), 5, -2, 5.
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, 0, 0, "aa", false));
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, 4, 0, "bb", false));
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, 8, 0, "cc", false));
+    try std.testing.expect(enqueuePendingStreamSend(&conn, a, 12, 0, "dd", false));
+    try conn.stream_priorities.put(a, 4, 5);
+    try conn.stream_priorities.put(a, 12, 5);
+    try conn.stream_priorities.put(a, 8, -2);
+
+    try std.testing.expectEqual(@as(?i32, 5), conn.nextPriorityTierBelow(std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(?i32, 0), conn.nextPriorityTierBelow(5));
+    try std.testing.expectEqual(@as(?i32, -2), conn.nextPriorityTierBelow(0));
+    try std.testing.expectEqual(@as(?i32, null), conn.nextPriorityTierBelow(-2));
+}
+
+test "stream priority: drain serves higher-priority stream first (#191)" {
+    // Loopback: enqueue a low-prio entry FIRST (arrival order would favor it),
+    // then a high-prio entry.  Cap the drain to exactly one send via the
+    // per-drive budget and verify the high-prio entry went out first.
+    const allocator = std.testing.allocator;
+    const client = try allocator.create(Client);
+    defer allocator.destroy(client);
+
+    const lb = try rawSetupLoopback(allocator, client);
+    defer lb.server.deinit();
+    defer lb.client.deinit();
+
+    const conn = rawServerConnectedConn(lb.server).?;
+    const low_sid = try lb.server.openRawAppStream(conn);
+    const high_sid = try lb.server.openRawAppStream(conn);
+    lb.server.setStreamPriority(conn, high_sid, 10);
+
+    // Block the wire path so both writes queue instead of sending inline:
+    // exhaust this drive's send budget.
+    conn.sends_this_drive = max_sends_per_drive;
+    try std.testing.expect(enqueuePendingStreamSend(conn, allocator, low_sid, 0, "LOW-PRIO-PAYLOAD", false));
+    try std.testing.expect(enqueuePendingStreamSend(conn, allocator, high_sid, 0, "HIGH-PRIO-PAYLOAD", false));
+    try std.testing.expectEqual(@as(usize, 2), conn.pending_stream_sends.items.len);
+
+    // Allow exactly ONE send this drive; the strict-priority drain must pick
+    // the high-prio entry even though the low-prio entry arrived first.
+    conn.sends_this_drive = max_sends_per_drive - 1;
+    lb.server.drainPendingStreamSends(conn);
+    try std.testing.expectEqual(@as(usize, 1), conn.pending_stream_sends.items.len);
+    try std.testing.expectEqual(low_sid, conn.pending_stream_sends.items[0].stream_id);
+
+    // Clearing priority (shim path) restores arrival order for the remainder.
+    lb.server.unmarkStreamPriority(conn, high_sid);
+    try std.testing.expectEqual(@as(i32, 0), conn.streamPriority(high_sid));
 }
