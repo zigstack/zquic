@@ -11440,7 +11440,7 @@ pub const Client = struct {
             // would create a never-released zombie slot (see `raw_app_released_max`).
             const t = sf.stream_id & 3;
             if (sf.stream_id + 1 <= self.conn.raw_app_released_max[t]) {
-                dbg("io: raw app client frame for retired stream_id={} dropped\n", .{sf.stream_id});
+                std.debug.print("io: CHURNDBG client raw-app frame RETIRED stream_id={} released_max[{}]={} (dropped)\n", .{ sf.stream_id, t, self.conn.raw_app_released_max[t] });
                 return;
             }
             for (&self.raw_app_recv) |*slot| {
@@ -11457,7 +11457,11 @@ pub const Client = struct {
             }
         }
         const slot = slot_ptr orelse {
-            dbg("io: raw app client recv slots full (stream_id={})\n", .{sf.stream_id});
+            var active_n: usize = 0;
+            for (&self.raw_app_recv) |*s| {
+                if (s.active) active_n += 1;
+            }
+            std.debug.print("io: CHURNDBG client raw_app_recv SLOTS FULL stream_id={} active={}/{} (dropped)\n", .{ sf.stream_id, active_n, self.raw_app_recv.len });
             return;
         };
 
