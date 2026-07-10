@@ -4295,6 +4295,13 @@ pub const Server = struct {
                 }
                 break :blk buf.len;
             };
+            if (lh.header.packet_type == .handshake or lh.header.packet_type == .initial) {
+                dbgq("srv recv {s} shard={} dcid[0]=0x{x:0>2} dcid_len={} len={} src_port={}", .{
+                    @tagName(lh.header.packet_type),                              self.shard_index,
+                    if (lh.header.dcid.len > 0) lh.header.dcid.slice()[0] else 0, lh.header.dcid.len,
+                    buf.len,                                                      src.getPort(),
+                });
+            }
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf[0..pkt_end], src),
                 .handshake => self.processHandshakePacket(buf[0..pkt_end], src),
@@ -5370,11 +5377,25 @@ pub const Server = struct {
         src: compat.Address,
     ) void {
         // Re-parse long header to get DCID and consumed bytes
-        const lh = header_mod.parseLong(buf) catch return;
+        const lh = header_mod.parseLong(buf) catch |err| {
+            dbgq("srv hs-pkt parseLong FAILED: {s} len={} src_port={}", .{ @errorName(err), buf.len, src.getPort() });
+            return;
+        };
 
         // Find connection by DCID
-        const conn = self.findConn(lh.header.dcid) orelse return;
-        if (!conn.has_hs_keys) return;
+        const conn = self.findConn(lh.header.dcid) orelse {
+            dbgq("srv hs-pkt findConn MISS dcid[0]=0x{x:0>2} dcid_len={} shard={} src_port={}", .{
+                if (lh.header.dcid.len > 0) lh.header.dcid.slice()[0] else 0,
+                lh.header.dcid.len,
+                self.shard_index,
+                src.getPort(),
+            });
+            return;
+        };
+        if (!conn.has_hs_keys) {
+            dbgq("srv hs-pkt no hs_keys yet phase={s} src_port={}", .{ @tagName(conn.phase), src.getPort() });
+            return;
+        }
 
         // Anti-amplification: track Handshake bytes received (RFC 9000 §8.1).
         conn.migration.anti_amp.onRecv(buf.len);
@@ -5386,7 +5407,11 @@ pub const Server = struct {
             self.sendHandshakeDone(conn, src);
             return;
         }
-        if (conn.phase != .waiting_finished) return;
+        if (conn.phase != .waiting_finished) {
+            dbgq("srv hs-pkt unexpected phase={s} src_port={}", .{ @tagName(conn.phase), src.getPort() });
+            return;
+        }
+        dbgq("srv hs-pkt accepted phase=waiting_finished len={} src_port={}", .{ buf.len, src.getPort() });
 
         // Parse the Handshake packet: after Long Header = length(varint) + pn + payload
         var pos = lh.consumed;
