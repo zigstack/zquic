@@ -61,6 +61,33 @@ inline fn dbg(comptime fmt: []const u8, args: anytype) void {
     if (build_options.verbose) log.debug(fmt, args);
 }
 
+/// `DEBUG_QUIC=1` state: 0 = not probed, 1 = disabled, 2 = enabled. Probed
+/// lazily once; the benign multi-thread init race computes the same value.
+var debug_quic_state = std.atomic.Value(u8).init(0);
+
+/// Runtime-gated diagnostic logger (production builds included). Enabled by
+/// setting `DEBUG_QUIC=1` in the environment — no rebuild/release needed to
+/// turn handshake diagnostics on for a deployment (the zeam<->lantern saga
+/// burned several release cycles on compiled-out `dbg()` sites). Prints to
+/// stderr so container logs / Loki pick it up. Cost when disabled: one
+/// relaxed atomic load per call site.
+fn dbgq(comptime fmt: []const u8, args: anytype) void {
+    var st = debug_quic_state.load(.monotonic);
+    if (st == 0) {
+        // Mirror `effectiveQlogDir`: libc getenv (std.posix.getenv is gone in
+        // Zig 0.16), comptime-guarded so libc-free artifacts still compile.
+        const enabled = blk: {
+            if (!@import("builtin").link_libc) break :blk false;
+            const raw = std.c.getenv("DEBUG_QUIC") orelse break :blk false;
+            const v = std.mem.span(raw);
+            break :blk v.len > 0 and !std.mem.eql(u8, v, "0");
+        };
+        st = if (enabled) 2 else 1;
+        debug_quic_state.store(st, .monotonic);
+    }
+    if (st == 2) std.debug.print("quicdbg: " ++ fmt ++ "\n", args);
+}
+
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
 const InitialSecrets = keys_mod.InitialSecrets;
@@ -4067,6 +4094,7 @@ pub const Server = struct {
                     dbg("io: reaping drained connection (deadline passed)\n", .{});
                 } else if (handshake_expired) {
                     dbg("io: handshake deadline — reaping conn stuck in {s}\n", .{@tagName(conn.phase)});
+                    dbgq("srv handshake-deadline REAP phase={s} age_ms={}", .{ @tagName(conn.phase), now - conn.created_ms });
                     // The peer may have completed ITS side (app keys exist —
                     // derived with the server flight — so the frame is
                     // decryptable). Without this CONNECTION_CLOSE the peer
@@ -4488,6 +4516,7 @@ pub const Server = struct {
             conn.init_recv_pn,
         ) catch |err| {
             dbg("io: inbound Initial AEAD/header-protection failed: {} dcid_len={} payload_len={}\n", .{ err, ip.dcid.len, ip.payload_len });
+            dbgq("srv Initial AEAD FAILED: {s} src_port={}", .{ @errorName(err), src.getPort() });
             return;
         };
         const pt_len = dec.pt_len;
@@ -5118,6 +5147,7 @@ pub const Server = struct {
 
             if (!conn.canSendAntiAmp(pkt_len)) {
                 dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+                dbgq("srv ServerHello ANTI-AMP deferred", .{});
                 conn.anti_amp_deferred = true;
                 return;
             }
@@ -5246,6 +5276,7 @@ pub const Server = struct {
         // Anti-amplification (RFC 9000 §8.1): do not exceed 3× received bytes.
         if (!conn.canSendAntiAmp(pkt_len)) {
             dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+            dbgq("srv ServerHello ANTI-AMP deferred", .{});
             conn.anti_amp_deferred = true;
             return;
         }
@@ -5379,7 +5410,10 @@ pub const Server = struct {
             &conn.hs_client_km,
             conn.hs_recv_pn,
             conn.packet_cipher,
-        ) catch return;
+        ) catch |err| {
+            dbgq("srv hs-pkt decrypt FAILED: {s} len={} phase={s} src_port={}", .{ @errorName(err), buf.len, @tagName(conn.phase), src.getPort() });
+            return;
+        };
         const pt_len = dec.pt_len;
         conn.hs_ecn_ect0_recv += 1;
         if (conn.hs_recv_pn == null or dec.pn > conn.hs_recv_pn.?)
@@ -5496,6 +5530,7 @@ pub const Server = struct {
         // consuming the bytes and wedging the connection in `.waiting_finished`.
         if (conn.hs_cli_flight_len + data.len > conn.hs_cli_flight_buf.len) {
             dbg("io: client Handshake flight overflow ({} + {})\n", .{ conn.hs_cli_flight_len, data.len });
+            dbgq("srv hs-flight OVERFLOW acc={} +{}", .{ conn.hs_cli_flight_len, data.len });
             conn.hs_cli_flight_len = 0; // malformed / oversized — re-sync
             return;
         }
@@ -5513,16 +5548,19 @@ pub const Server = struct {
                 if (acc[p] == tls_hs.MSG_FINISHED) break :blk mend;
                 p = mend;
             }
+            dbgq("srv hs-flight incomplete acc={} (waiting for Finished)", .{acc.len});
             return; // flight incomplete — wait for more CRYPTO data
         };
 
         conn.tls.processClientHandshakeInbound(acc[0..fin_end]) catch |err| {
             dbg("io: client post-handshake TLS failed: {}\n", .{err});
+            dbgq("srv client-flight TLS FAILED: {s} flight_len={}", .{ @errorName(err), fin_end });
             return;
         };
         conn.hs_cli_flight_len = 0;
 
         dbg("io: handshake complete for connection\n", .{});
+        dbgq("srv handshake COMPLETE src_port={}", .{src.getPort()});
         conn.phase = .connected;
         abandonEarlyPnSpaces(conn, self.allocator);
         // Handshake complete → peer address is validated (RFC 9000 §8.1).
