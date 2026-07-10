@@ -864,17 +864,25 @@ pub const CryptoReorderBuf = struct {
                 return;
             }
         }
-        // Buffer full — evict the segment with the smallest offset (oldest).
-        var oldest: usize = 0;
+        // Buffer full — evict the segment with the LARGEST offset (furthest
+        // from the contiguity frontier, so the least useful to `take`). The
+        // previous policy evicted the SMALLEST offset — exactly the segment
+        // the next drain needs — so a fragment storm (ngtcp2 retransmitting a
+        // fragmented flight with new boundaries each round fills the slots
+        // with distinct offsets) starved the frontier and wedged reassembly.
+        // Only evict for a segment that is nearer the frontier than the
+        // victim; an incoming far-future segment is dropped instead.
+        var victim: usize = 0;
         for (1..REORDER_SLOTS) |i| {
-            if (self.slots[i].used and self.slots[i].offset < self.slots[oldest].offset) {
-                oldest = i;
+            if (self.slots[i].used and self.slots[i].offset > self.slots[victim].offset) {
+                victim = i;
             }
         }
-        self.slots[oldest].offset = offset;
-        self.slots[oldest].len = data.len;
-        self.slots[oldest].used = true;
-        @memcpy(self.slots[oldest].data[0..data.len], data);
+        if (offset >= self.slots[victim].offset) return;
+        self.slots[victim].offset = offset;
+        self.slots[victim].len = data.len;
+        self.slots[victim].used = true;
+        @memcpy(self.slots[victim].data[0..data.len], data);
     }
 
     /// Return the buffered bytes that continue the contiguous stream at
@@ -1018,6 +1026,32 @@ test "crypto_reorder_buf: take yields tail of a straddling slot" {
     try testing.expectEqualSlices(u8, "456789", out[0..n]);
     // Slot consumed.
     try testing.expectEqual(@as(usize, 0), rb.take(10, &out));
+}
+
+test "crypto_reorder_buf: overflow evicts the FARTHEST segment, keeps near-frontier ones" {
+    const testing = std.testing;
+    var rb = CryptoReorderBuf{};
+
+    // Fill every slot: offsets 10, 20, 30, ... (frontier is at 0).
+    for (0..REORDER_SLOTS) |i| {
+        rb.insert(@intCast((i + 1) * 10), "x");
+    }
+    // Buffer full. A NEAR-frontier segment must displace the farthest one,
+    // not the nearest (the old policy evicted offset 10 — the very segment
+    // the next drain needed — wedging fragmented-flight reassembly).
+    rb.insert(5, "nn");
+    var out: [32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), rb.take(5, &out));
+    try testing.expectEqualSlices(u8, "nn", out[0..2]);
+    // And the near-frontier original (offset 10) survived the eviction.
+    try testing.expectEqual(@as(usize, 1), rb.take(10, &out));
+
+    // A far-future segment must NOT evict anything when full: refill the two
+    // freed slots, then insert past the maximum — it is dropped.
+    rb.insert(10, "a");
+    rb.insert(15, "b");
+    rb.insert(999_999, "z");
+    try testing.expectEqual(@as(usize, 0), rb.take(999_999, &out));
 }
 
 test "crypto_reorder_buf: take reclaims fully-consumed stale slots" {

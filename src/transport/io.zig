@@ -2264,6 +2264,12 @@ pub const ConnState = struct {
     draining_deadline_ms: i64 = 0,
     // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
     last_recv_ms: i64 = 0,
+    /// Wall-clock creation time (ms). Bounds the handshake: a server conn that
+    /// has not reached `.connected` within `handshake_deadline_ms` is reaped
+    /// even while packets still arrive — otherwise a wedged handshake (peer
+    /// keeps ACKing our PTO probes forever) lives as an app-invisible zombie
+    /// that the peer counts as a healthy connection (the zeam<->lantern flap).
+    created_ms: i64 = 0,
     // PTO (Probe Timeout) state per packet-number space (RFC 9002 §6.2.3).
     // last_ack_ms: wall-clock time of the most recent ACK in any space (idle timeout).
     // last_ack_ms_by_space / pto_count / last_pto_ms: per-space PTO accounting.
@@ -3989,6 +3995,10 @@ pub const Server = struct {
         return false;
     }
 
+    /// Max time a server connection may stay in a pre-`.connected` phase
+    /// before being reaped (see `handshake_expired` below).
+    const handshake_deadline_ms: i64 = 15_000;
+
     fn reapDrainedConnections(self: *Server) void {
         const now = compat.milliTimestamp();
         const local_idle_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
@@ -4007,7 +4017,19 @@ pub const Server = struct {
                 const idle_expired = conn.phase == .connected and conn.last_recv_ms > 0 and
                     now - conn.last_recv_ms > idle_timeout_ms;
 
-                if (!draining_expired and !idle_expired) continue;
+                // Handshake deadline: a conn that never reaches `.connected`
+                // must not live forever. `idle_expired` requires `.connected`,
+                // and a wedged peer keeps ACKing our PTO probes (fresh
+                // last_recv_ms), so without this clause a stuck handshake is
+                // immortal — an app-invisible zombie the peer counts as a
+                // healthy connection and dedups fresh dials against (the
+                // zeam<->lantern flap). 15s is far beyond any sane handshake
+                // (several seconds of retransmit rounds) and well under the
+                // peer-side damage window.
+                const handshake_expired = conn.phase != .connected and !conn.draining and
+                    conn.created_ms > 0 and now - conn.created_ms > handshake_deadline_ms;
+
+                if (!draining_expired and !idle_expired and !handshake_expired) continue;
 
                 // UAF guard: pin the conn alive while an embedder raw-app stream
                 // still references it (see connHasActiveRawAppStreams). Mark it
@@ -4025,6 +4047,8 @@ pub const Server = struct {
 
                 if (draining_expired) {
                     dbg("io: reaping drained connection (deadline passed)\n", .{});
+                } else if (handshake_expired) {
+                    dbg("io: handshake deadline — reaping conn stuck in {s}\n", .{@tagName(conn.phase)});
                 } else {
                     dbg("io: idle timeout — closing connection\n", .{});
                 }
@@ -4281,6 +4305,7 @@ pub const Server = struct {
                     .use_v2 = is_v2,
                     .next_local_uni_stream_id = 3,
                     .next_local_bidi_stream_id = 1,
+                    .created_ms = compat.milliTimestamp(),
                 };
                 // Heap-allocate the loss detector's in-flight deque (#233). On
                 // OOM, free the half-built ConnState and refuse the connection
