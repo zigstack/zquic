@@ -4067,6 +4067,14 @@ pub const Server = struct {
                     dbg("io: reaping drained connection (deadline passed)\n", .{});
                 } else if (handshake_expired) {
                     dbg("io: handshake deadline — reaping conn stuck in {s}\n", .{@tagName(conn.phase)});
+                    // The peer may have completed ITS side (app keys exist —
+                    // derived with the server flight — so the frame is
+                    // decryptable). Without this CONNECTION_CLOSE the peer
+                    // keeps a half-open carcass it counts as a live connection
+                    // and dedups fresh dials against.
+                    if (conn.phase == .waiting_finished) {
+                        self.sendConnectionClose(conn, 0, "handshake timeout", conn.peer);
+                    }
                 } else {
                     dbg("io: idle timeout — closing connection\n", .{});
                 }
